@@ -133,10 +133,33 @@ const UNL_KW = 'This is a security problem.';
   });
   await t('qa-gate: non-allowlisted labeler (e.g. PR author) fails', async () => {
     const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], events: [ev('pr-author')], allowed: 'qianhaoq' });
-    assert.ok(c.failed && /not applied by an allowed labeler/.test(c.failed), c.failed);
+    assert.ok(c.failed && /not an allowed labeler/.test(c.failed), c.failed);
   });
   await t('qa-gate: empty allowlist keeps legacy behaviour', async () => {
     const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], events: [ev('anyone')] });
+    assert.strictEqual(c.failed, null, c.failed);
+  });
+
+  const at = (event, login, ts) => ({ event, label: { name: 'qa-passed' }, actor: { login }, created_at: ts });
+  for (const bad of [' ', ',', ' , ']) {
+    await t(`qa-gate: allowed_labelers set but empty (${JSON.stringify(bad)}) fails`, async () => {
+      const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], events: [ev('qianhaoq')], allowed: bad });
+      assert.ok(c.failed && /contains no logins/.test(c.failed), c.failed);
+    });
+  }
+  await t('qa-gate: last labeled event decides (allowed then non-allowed) fails', async () => {
+    const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], allowed: 'qianhaoq',
+      events: [at('labeled', 'qianhaoq', '2026-02-01T00:00:00Z'), at('unlabeled', 'x', '2026-02-02T00:00:00Z'), at('labeled', 'author', '2026-02-03T00:00:00Z')] });
+    assert.ok(c.failed && /last applied by "author"/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: later unlabeled counts as no label', async () => {
+    const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], allowed: 'qianhaoq',
+      events: [at('labeled', 'qianhaoq', '2026-02-01T00:00:00Z'), at('unlabeled', 'qianhaoq', '2026-02-02T00:00:00Z')] });
+    assert.ok(c.failed && /removed after/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: last labeled by allowlisted user passes', async () => {
+    const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], allowed: 'qianhaoq',
+      events: [at('labeled', 'author', '2026-02-01T00:00:00Z'), at('unlabeled', 'qianhaoq', '2026-02-02T00:00:00Z'), at('labeled', 'qianhaoq', '2026-02-03T00:00:00Z')] });
     assert.strictEqual(c.failed, null, c.failed);
   });
 
