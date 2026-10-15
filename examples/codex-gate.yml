@@ -66,6 +66,9 @@ jobs:
     uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@main
     with:
       wait_minutes: 20
+      # Default true (policy: unlabeled Codex threads block). Set false to
+      # opt out to keyword-only matching for unlabeled threads.
+      block_unlabeled: true
 
   # Schedule path only — see the header note. actions: write is scoped to
   # this job so the evaluator above never holds it.

@@ -100,6 +100,7 @@ Job：
 | 输入 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `wait_minutes` | number | `20` | 等待 Codex 发布/更新 Review Summary 的超时分钟数 |
+| `block_unlabeled` | boolean | `true` | 未标级 Codex 线程阻断（既定策略）；`false` = opt-out，仅关键词匹配时阻断 |
 
 调用方触发事件（完整列表见 [examples/codex-gate.yml](examples/codex-gate.yml)）：
 `pull_request_target` [opened, synchronize, reopened, ready_for_review,
@@ -150,15 +151,19 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
 
 - 阻断（blocking）= 显式 **P0/P1**（识别的头部形式：`**P1**: ...`、
   `**P1** text`、`P1:`、`[P1]`、`P1 Badge`、`badge/P1`，只看正文前 600 个
-  字符的头部/徽章区），或**未标级**线程正文包含安全/正确性关键词
-  （不区分大小写；`xss`/`csrf`/`rce` 按单词边界 `\b` 匹配——已确认——其余
-  子串匹配）：
+  字符的头部/徽章区），或**未标级**线程。
+- 输入 `block_unlabeled`（boolean，默认 **`true`**，即既定策略）：所有未标级
+  Codex 线程都阻断。设为 `false` 为 opt-out：未标级线程仅在正文包含安全/
+  正确性关键词时阻断（不区分大小写；`xss`/`csrf`/`rce` 按 `\b` 单词边界，
+  其余子串匹配）：
   `security`、`vulnerab`、`injection`、`xss`、`csrf`、`rce`、`secret`、
   `token leak`、`credential`、`auth bypass`、`privilege`、`data loss`、
   `corrupt`、`race condition`、`deadlock`、`crash`、`incorrect result`、
   `wrong result`、`regression`。
-- 未标级且无关键词 = 非阻断 **P2**；显式 **P2 永不阻断**；后续 P0/P1 升级
-  仍阻断，后续 P2 不能把未标级的开场降级。
+- 显式 **P2 永不阻断**（开场为 P2 时，后续未标级回复也不会把它升级）；
+  后续 P0/P1 升级仍阻断；后续 P2 不能把未标级的开场降级。
+- `auto-merge.yml` 使用相同规则与同名输入 `block_unlabeled`；Copilot / 人工
+  发起的线程：开场显式 P2 → 不阻断，其余（P0/P1、未标级）一律阻断。
 - GraphQL 线程查询失败且有 Codex 评审评论 → fail-closed 失败。
 
 权限：评估 job 只读（`contents: read`、`pull-requests: read`、
@@ -182,7 +187,7 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
    标签早于最后推送 → 失败（`label predates the latest push`）。
 3. **新的 push（synchronize）→ 自动移除 `qa-passed` 标签并失败**
    （`new push invalidated QA`），需重新验收、重新打标。
-4. 草稿 PR → 失败；非 PR 上下文 / 已关闭 PR → info 跳过（成功）。
+4. 草稿 PR → 失败（在第 3 步移除标签**之后**才检查草稿，草稿 PR 收到新 push 同样会被移除 `qa-passed`）；非 PR 上下文 / 已关闭 PR → info 跳过（成功）。
 5. **`workflow_dispatch` 传入非法/非数字 `pr_number` → 失败**（与 Codex
    Gate 一致，操作错误必须显式报错）。
 
@@ -208,6 +213,7 @@ workflow_dispatch 的结论不挂 PR 检查，所以定时路径只重跑：对�
 | `required_checks` | string | **必填** | 换行分隔的必需检查名（head SHA 上必须为 success，按名取最新一次） |
 | `merge_method` | string | `'squash'` | `squash` / `merge` / `rebase` |
 | `require_copilot` | boolean | `false` | 是否要求 Copilot 评审 |
+| `block_unlabeled` | boolean | `true` | 未标级 Codex 线程阻断（`false` = 仅关键词）；Copilot/人工显式 P2 不阻断 |
 
 调用方触发：`workflow_run`（对本仓库的 CI / Codex Review Gate / QA Gate
 等 `completed`）、`pull_request_review` [submitted]、
