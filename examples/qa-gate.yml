@@ -56,6 +56,7 @@ jobs:
     uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@main
     with:
       qa_label: 'qa-passed'
+      # allowed_labelers: 'alice, bob'   # optional: only these users' label counts
 
   # Schedule path only — see the header note. actions: write is scoped to
   # this job; it re-runs failing pull_request_target gate runs.
