@@ -11,7 +11,8 @@
 # Semantics:
 #   - Manual QA signs off by applying the `qa_label` (default
 #     "qa-passed") AFTER verifying the PR head, per templates/QA.md.
-#   - On synchronize (new push) the gate REMOVES the label if present and
+#   - On synchronize (new push) the gate REMOVES the label if present
+#     (unless its last 'labeled' event is AFTER the push — race guard) and
 #     FAILS with "new push invalidated QA" — QA must re-run on the new
 #     head and re-apply the label.
 #   - Otherwise the gate passes only if the label is present AND its most
@@ -139,7 +140,34 @@ jobs:
             // stale sign-off can never satisfy this gate or auto-merge,
             // then fail. Removing an issue label needs issues:write /
             // pull-requests:write granted by the CALLER.
-            if (context.eventName === 'pull_request_target' && context.payload.action === 'synchronize') {
+            // Race guard: a reviewer may apply the label seconds AFTER the
+            // push but BEFORE this synchronize run executes. Only strip a
+            // label whose last 'labeled' event predates the push. Push time =
+            // the synchronize event's own timestamp (payload
+            // pull_request.updated_at, captured when the push happened),
+            // falling back to the head commit's committer date.
+            let freshLabel = false;
+            if (context.eventName === 'pull_request_target' && context.payload.action === 'synchronize' && hasLabel
+                && context.payload.pull_request?.head?.sha === sha) {
+              let syncTime = Date.parse(context.payload.pull_request?.updated_at || '');
+              if (!Number.isFinite(syncTime)) {
+                const { data: hc } = await github.rest.repos.getCommit({ owner, repo, ref: sha });
+                syncTime = Date.parse(hc.commit?.committer?.date || '');
+              }
+              const evs = await github.paginate(github.rest.issues.listEvents, {
+                owner, repo, issue_number: prNumber, per_page: 100,
+              });
+              const lastLabeled = evs
+                .filter((e) => e.event === 'labeled' && e.label?.name === QA_LABEL && e.created_at)
+                .map((e) => Date.parse(e.created_at))
+                .reduce((a, b) => Math.max(a, b), -Infinity);
+              freshLabel = Number.isFinite(syncTime) && lastLabeled > syncTime;
+              if (freshLabel) {
+                core.info(`"${QA_LABEL}" was applied after this push (${new Date(lastLabeled).toISOString()} > ${new Date(syncTime).toISOString()}) — keeping it and evaluating normally`);
+              }
+            }
+
+            if (context.eventName === 'pull_request_target' && context.payload.action === 'synchronize' && !freshLabel) {
               if (hasLabel) {
                 try {
                   await github.rest.issues.removeLabel({
