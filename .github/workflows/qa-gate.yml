@@ -57,7 +57,9 @@ on:
       allowed_labelers:
         description: >-
           Optional comma/space-separated GitHub logins whose 'labeled' event
-          counts as sign-off. Empty (default) = any user with label rights.
+          counts as sign-off (only the LAST labeled event for the label counts;
+          a later unlabeled = no sign-off). Empty string (default/unset) = any
+          user with label rights; set but no logins (e.g. " " or ",") = FAIL.
           When set, a label applied by anyone else (incl. the PR author, unless
           listed) is ignored and the gate fails.
         required: false
@@ -181,18 +183,31 @@ jobs:
               issue_number: prNumber,
               per_page: 100,
             });
-            const labeledTimes = issueEvents
-              .filter((e) => e.event === 'labeled' && e.label?.name === QA_LABEL && e.created_at)
-              .filter((e) => ALLOWED.length === 0 || ALLOWED.includes(String(e.actor?.login || '').toLowerCase()))
-              .map((e) => new Date(e.created_at).getTime());
-            if (labeledTimes.length === 0) {
-              const msg = ALLOWED.length
-                ? `Label "${QA_LABEL}" was not applied by an allowed labeler (${ALLOWED.join(', ')}) — sign-off by other users (incl. the PR author) does not count`
-                : `Label "${QA_LABEL}" is present but no 'labeled' event was found — cannot verify it postdates the latest push`;
-              core.setFailed(msg);
+            // allowed_labelers: '' (unset) = legacy, anyone with label rights.
+            // Set but parsing to an empty list (" ", ",") = misconfiguration → FAIL.
+            const ALLOWED_RAW = process.env.ALLOWED_LABELERS ?? '';
+            if (ALLOWED_RAW !== '' && ALLOWED.length === 0) {
+              core.setFailed(`allowed_labelers is set (${JSON.stringify(ALLOWED_RAW)}) but contains no logins — refusing to accept any "${QA_LABEL}" sign-off`);
               return;
             }
-            const labeledTime = Math.max(...labeledTimes);
+            // Only the LAST 'labeled' event for QA_LABEL decides; a later
+            // 'unlabeled' event for it means the label is not applied.
+            const labelEvents = issueEvents
+              .filter((e) => (e.event === 'labeled' || e.event === 'unlabeled') && e.label?.name === QA_LABEL && e.created_at)
+              .sort((a, b) => new Date(a.created_at) - new Date(b.created_at) || (a.id || 0) - (b.id || 0));
+            const last = labelEvents[labelEvents.length - 1];
+            if (!last || last.event !== 'labeled') {
+              core.setFailed(last
+                ? `Label "${QA_LABEL}" was removed after it was last applied — treat as not signed off`
+                : `Label "${QA_LABEL}" is present but no 'labeled' event was found — cannot verify it postdates the latest push`);
+              return;
+            }
+            const labeler = String(last.actor?.login || '').toLowerCase();
+            if (ALLOWED.length && !ALLOWED.includes(labeler)) {
+              core.setFailed(`Label "${QA_LABEL}" was last applied by "${last.actor?.login || 'unknown'}", not an allowed labeler (${ALLOWED.join(', ')}) — sign-off by other users (incl. the PR author) does not count`);
+              return;
+            }
+            const labeledTime = new Date(last.created_at).getTime();
 
             // Latest push time for the head SHA: max of the head commit's
             // committer date, 'committed' timeline events for that SHA,
