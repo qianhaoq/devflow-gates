@@ -1,0 +1,46 @@
+# Example caller for the reusable Post-deploy Smoke — copy to
+# YOUR_REPO/.github/workflows/smoke.yml.
+#
+# Check name produced by this example (job id `smoke`):
+#   - "smoke / Post-deploy Smoke"
+#
+# Dispatch by hand after a deploy, or call the reusable workflow directly
+# from your deploy job as a final step:
+#
+#   smoke:
+#     uses: qianhaoq/devflow-gates/.github/workflows/post-deploy-smoke.yml@main
+#     with:
+#       base_url: https://your-site.example.com
+#       protected_path: /admin
+#       required_headers: strict-transport-security,x-content-type-options,x-frame-options|content-security-policy
+
+name: Post-deploy Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'Deployed origin to smoke test (no trailing slash needed)'
+        required: true
+        type: string
+      protected_path:
+        description: 'Path that must return 401 (empty skips the check)'
+        required: false
+        type: string
+        default: ''
+      required_headers:
+        description: 'Comma-separated header groups; "|" within a group = any-of'
+        required: false
+        type: string
+        default: 'strict-transport-security,x-content-type-options,x-frame-options|content-security-policy'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    uses: qianhaoq/devflow-gates/.github/workflows/post-deploy-smoke.yml@main
+    with:
+      base_url: ${{ inputs.base_url }}
+      protected_path: ${{ inputs.protected_path }}
+      required_headers: ${{ inputs.required_headers }}

@@ -1,0 +1,519 @@
+# Codex Review Gate — reusable, read-only status check for
+# chatgpt-codex-connector.
+#
+# Called from a repo's own gate workflow (see examples/codex-gate.yml):
+#   uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@main
+#
+# Check name on a PR is "<caller job name> / <called job name>"; with the
+# example caller (job id `codex`) this produces "codex / Codex Review Gate".
+# Use that exact string in branch protection / Rulesets and in
+# auto-merge.yml's `required_checks` input.
+#
+# Codex is comment-based. It does NOT register a check on its own, so this
+# gate converts Codex state into a job conclusion.
+#
+# Heuristic (fail-closed), ported from the reviewed per-repo version:
+#   - Label skip-codex-gate → FAIL (documents a manual/admin escape hatch
+#     only; never reports success that would satisfy Auto Merge)
+#   - Draft PR → FAIL ("draft: AI review runs only when ready")
+#   - No Codex Review Summary comment yet:
+#       * head commit younger than wait_minutes → fail (still waiting)
+#       * otherwise → fail (timeout; comment @codex review)
+#   - Summary still Running / in progress / queued → fail
+#   - Summary Failed / cancelled / error (and not Completed) → fail
+#   - Summary does not positively show Completed or 👍 no-findings → fail
+#   - Summary completed but does not mention the current head SHA (stale
+#     review of an older commit after synchronize) → fail
+#   - Summary completed but unresolved blocking Codex threads remain → fail.
+#     Severity rule — blocking is: explicit P0/P1 (recognized header forms:
+#     "**P1":", "**P1** text", "P1:", "[P1]", "P1 Badge", "badge/P1"), or an
+#     unlabeled thread whose body (case-insensitive) contains a
+#     security/correctness keyword (xss/csrf/rce as \b-words, confirmed;
+#     the rest as substrings). Unlabeled without a keyword counts as
+#     non-blocking P2; explicit P2 never blocks.
+#   - Summary completed for this head SHA (or 👍 no-findings) and zero
+#     unresolved blocking Codex threads → success
+#   - GraphQL thread lookup failed + any Codex review comments exist → fail
+#
+# Non-PR contexts — no resolvable PR (issue comment not on a PR), or a
+# closed/merged PR — core.info and return success: nothing to gate, not a
+# failure. workflow_dispatch with an invalid/nonnumeric pr_number FAILS
+# (operator error must be loud, not a silent green skip).
+#
+# Scheduled refresh (Codex Gate Refresh job, schedule-path only):
+#   - A scheduled run's job conclusion does NOT attach to any PR head
+#     check, and neither does a workflow_dispatch run. So the schedule
+#     path does not evaluate anything itself: for each open non-draft PR
+#     whose latest pull_request_target-originated Gate run for that head
+#     SHA completed with conclusion failure, it re-runs that run's failed
+#     jobs (actions.reRunWorkflowFailedJobs). A re-run preserves the
+#     original pull_request_target event, so the fresh conclusion DOES
+#     re-attach to the PR head check. If Codex has since completed /
+#     threads were resolved, the re-run turns the required check green
+#     and Auto Merge picks it up via workflow_run.
+#   - This needs `actions: write` — the CALLER must grant it on the
+#     schedule-path job only (see examples/codex-gate.yml, job
+#     `codex-refresh`); the evaluator job stays read-only.
+#
+# Security (trusted evaluator):
+#   - Trigger is pull_request_target (plus comment/review/dispatch), so the
+#     workflow YAML always comes from the PR base / default branch — never
+#     from the untrusted PR head.
+#   - Gate logic uses ONLY actions/github-script + the GitHub API. It must
+#     NEVER actions/checkout the PR head, NEVER run PR-controlled shell,
+#     and NEVER execute code from the PR tree.
+#   - The evaluator job stays read-only (contents / pull-requests / issues)
+#     — no checks:write or actions:write; success is the job conclusion
+#     only. Only the schedule-only refresh job needs actions:write.
+#
+# Concurrency is the caller's job (see examples/codex-gate.yml:
+# per-PR group, cancel-in-progress: true).
+
+name: Reusable Codex Review Gate
+
+on:
+  workflow_call:
+    inputs:
+      wait_minutes:
+        description: 'Minutes to wait for Codex to post/refresh its Review Summary before treating it as a timeout'
+        required: false
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  codex-review-gate:
+    name: Codex Review Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Schedule never evaluates directly (a scheduled conclusion does not
+    # attach to the PR head check) — the refresh job below handles it.
+    # pull_request_review_thread is NOT listed: it is a webhook-only event
+    # and can never be github.event_name in Actions.
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request_review' ||
+      github.event_name == 'pull_request_review_comment' ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request)
+    steps:
+      - name: Evaluate Codex review
+        uses: actions/github-script@v7
+        env:
+          WAIT_MINUTES: ${{ inputs.wait_minutes }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const CODEX_LOGINS = new Set([
+              'chatgpt-codex-connector[bot]',
+              'chatgpt-codex-connector',
+            ]);
+            const WAIT_MINUTES = (() => {
+              const n = Number(process.env.WAIT_MINUTES || '20');
+              return Number.isFinite(n) && n > 0 ? n : 20;
+            })();
+            const WAIT_MS = WAIT_MINUTES * 60 * 1000;
+            const SUMMARY_MARKERS = [
+              '<!-- codex-pull-request-review-summary -->',
+              '## Codex Review Summary',
+            ];
+
+            function isCodexLogin(login) {
+              return CODEX_LOGINS.has(login || '');
+            }
+
+            async function resolvePrNumber() {
+              if (context.payload.pull_request?.number) return context.payload.pull_request.number;
+              // issue_comment on a PR carries the PR number on the issue.
+              if (context.payload.issue?.number && context.payload.issue.pull_request) {
+                return context.payload.issue.number;
+              }
+              if (context.eventName === 'workflow_dispatch') {
+                const n = Number(context.payload.inputs?.pr_number);
+                return Number.isInteger(n) && n > 0 ? n : null;
+              }
+              return null;
+            }
+
+            function summaryLooksRunning(body) {
+              const text = body || '';
+              if (/\*\*(?:Running|In progress|In-progress|Queued|Pending)\*\*/i.test(text)) return true;
+              // Emoji have no word boundaries; do not wrap them in \b.
+              if (/(?:⏳|🏃)/.test(text) && !/\*\*Completed\*\*/i.test(text)) return true;
+              if (/\|\s*[^|\n]*(?:Running|In progress|Queued|Pending)[^|\n]*\|/i.test(text)
+                && !/\*\*Completed\*\*/i.test(text)) {
+                return true;
+              }
+              return false;
+            }
+
+            function summaryLooksFailed(body) {
+              const text = body || '';
+              return /\*\*(?:Failed|Failure|Cancelled|Canceled|Error|Errored|Timed out|Timeout)\*\*/i.test(text);
+            }
+
+            // Fail closed: Running-not-true is not success. Require Completed or 👍.
+            function summaryLooksCompleted(body) {
+              const text = body || '';
+              if (summaryLooksRunning(text) || summaryLooksFailed(text)) return false;
+              if (/\*\*Completed\*\*/i.test(text)) return true;
+              if (/👍/.test(text)) return true;
+              return false;
+            }
+
+            function isCodexSummary(comment) {
+              const login = comment.user?.login || '';
+              if (!isCodexLogin(login)) return false;
+              const body = comment.body || '';
+              return SUMMARY_MARKERS.some((m) => body.includes(m));
+            }
+
+            // Codex edits one Summary comment across pushes. A Completed
+            // table for an older SHA must not pass a newer head.
+            // Match backticks, plain text, and commit URLs — not only `sha`.
+            function summaryCoversHead(body, headSha) {
+              const head = (headSha || '').toLowerCase();
+              const text = (body || '').toLowerCase();
+              if (head.length < 7) return false;
+              if (text.includes(head)) return true;
+              const short = head.slice(0, 7);
+              return new RegExp(`(?:^|[^0-9a-f])${short}(?![0-9a-f])`).test(text);
+            }
+
+            function severityMarker(bodyText) {
+              // Only the finding header / badge region — not later prose/quotes.
+              const text = (bodyText || '').slice(0, 600);
+              const markers = [];
+              const add = (m) => markers.push(m.toUpperCase());
+              // badge/P1 (shields-style badge paths)
+              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) add(m[1]);
+              // [P1]
+              for (const m of text.matchAll(/\[(P[012])\]/gi)) add(m[1]);
+              // **P1**: ... and **P1** text — bold label, colon optional
+              for (const m of text.matchAll(/\*\*(P[012])\*\*/gi)) add(m[1]);
+              // P1: at start of text or a line (optional list marker,
+              // unclosed bold tolerated)
+              for (const m of text.matchAll(/(?:^|\n)[ \t]*(?:[-*+] )?(?:\*\*)?(P[012])\b[ \t]*:/gi)) {
+                add(m[1]);
+              }
+              // P1 Badge / P1 badge / P1-Badge header form
+              for (const m of text.matchAll(/\b(P[012])\b[ \t-]*badge/gi)) add(m[1]);
+              if (markers.some((m) => m === 'P0' || m === 'P1')) return 'P0P1';
+              if (markers.some((m) => m === 'P2')) return 'P2';
+              return null; // unlabeled
+            }
+
+            // Security / correctness keywords promote an unlabeled Codex
+            // thread from non-blocking P2 to blocking. Case-insensitive;
+            // xss/csrf/rce match on word boundaries, the rest as
+            // substrings. Must stay in sync with auto-merge.yml.
+            const BLOCKING_KEYWORDS = [
+              'security', 'vulnerab', 'injection', 'secret', 'token leak',
+              'credential', 'auth bypass', 'privilege', 'data loss',
+              'corrupt', 'race condition', 'deadlock', 'crash',
+              'incorrect result', 'wrong result', 'regression',
+            ];
+            const BLOCKING_KEYWORD_RES = [/\bxss\b/i, /\bcsrf\b/i, /\brce\b/i];
+
+            function bodyHasBlockingKeyword(bodyText) {
+              const text = (bodyText || '').toLowerCase();
+              if (BLOCKING_KEYWORDS.some((k) => text.includes(k))) return true;
+              return BLOCKING_KEYWORD_RES.some((re) => re.test(text));
+            }
+
+            // Blocking = explicit P0/P1, or an unlabeled body carrying a
+            // security/correctness keyword. Unlabeled without a keyword is
+            // non-blocking P2; explicit P2 never blocks. Later P0/P1
+            // escalations still block; later P2 cannot downgrade an
+            // unlabeled opener.
+            function isBlockingSeverity(bodyText) {
+              const m = severityMarker(bodyText);
+              if (m === 'P0P1') return true;
+              if (m === 'P2') return false;
+              return bodyHasBlockingKeyword(bodyText);
+            }
+
+            function isBlockingCodexBodies(bodies) {
+              return bodies.some((body) => isBlockingSeverity(body));
+            }
+
+            async function countUnresolvedCodexThreads(prNumber) {
+              let unresolved = 0;
+              let after = null;
+              let hasNextPage = true;
+              while (hasNextPage) {
+                const result = await github.graphql(
+                  `query($owner: String!, $name: String!, $number: Int!, $after: String) {
+                    repository(owner: $owner, name: $name) {
+                      pullRequest(number: $number) {
+                        reviewThreads(first: 100, after: $after) {
+                          nodes {
+                            isResolved
+                            comments(first: 100) {
+                              nodes { author { login } body }
+                              pageInfo { hasNextPage }
+                            }
+                          }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }`,
+                  { owner, name: repo, number: prNumber, after }
+                );
+                const conn = result.repository?.pullRequest?.reviewThreads;
+                if (!conn) throw new Error('GraphQL returned no reviewThreads');
+                for (const thread of conn.nodes) {
+                  if (thread.isResolved) continue;
+                  // Codex may reply in a human-started thread; do not only
+                  // look at comments(first: 1).
+                  const comments = thread.comments?.nodes || [];
+                  if (thread.comments?.pageInfo?.hasNextPage) {
+                    // Fail closed: escalation beyond first 100 comments unseen.
+                    unresolved += 1;
+                    continue;
+                  }
+                  const hasCodex = comments.some((c) => isCodexLogin(c.author?.login));
+                  if (!hasCodex) continue;
+                  const codexBodies = comments
+                    .filter((c) => isCodexLogin(c.author?.login))
+                    .map((c) => c.body || '');
+                  const bodies = codexBodies.length ? codexBodies : comments.map((c) => c.body || '');
+                  if (isBlockingCodexBodies(bodies)) unresolved += 1;
+                }
+                hasNextPage = conn.pageInfo.hasNextPage;
+                after = conn.pageInfo.endCursor;
+              }
+              return unresolved;
+            }
+
+            async function countCodexReviewComments(prNumber) {
+              const comments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner,
+                repo,
+                pull_number: prNumber,
+                per_page: 100,
+              });
+              return comments.filter((c) => isCodexLogin(c.user?.login)).length;
+            }
+
+            const prNumber = await resolvePrNumber();
+            if (!prNumber) {
+              if (context.eventName === 'workflow_dispatch') {
+                // Operator-typed input must be validated loudly: a silent
+                // green skip would look like a passing gate.
+                const raw = context.payload.inputs?.pr_number;
+                core.setFailed(`workflow_dispatch pr_number is invalid or missing: ${JSON.stringify(raw ?? '')}`);
+                return;
+              }
+              // Non-PR context (no resolvable PR — push / default-branch style
+              // event, or an issue comment that is not on a PR): nothing to
+              // gate, and not a failure of any PR's check.
+              core.info('No PR number resolved for this event — nothing to gate');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.merged || pr.state !== 'open') {
+              core.info(`PR #${prNumber} is ${pr.merged ? 'merged' : pr.state} — nothing to gate`);
+              return;
+            }
+
+            const sha = pr.head.sha;
+
+            if (pr.labels.some((l) => l.name === 'skip-codex-gate')) {
+              // Escape hatch for humans/admin only: never report success + dispatch.
+              // pull_request_target-attached Gate checks become the job conclusion, so we
+              // must setFailed — a bare return would mark Gate success and Auto Merge.
+              const msg = 'skip-codex-gate present — Gate fails closed (no Auto Merge). Remove the label and clear Codex threads for auto-merge, or admin-merge manually if policy allows.';
+              core.info(`PR #${prNumber}: ${msg}`);
+              core.setFailed(msg);
+              return;
+            }
+
+            if (pr.draft) {
+              // Draft PRs must not report success — a green Gate on a draft
+              // would over-permissively satisfy branch protection later.
+              const msg = 'draft: AI review runs only when ready';
+              core.info(`PR #${prNumber}: ${msg}`);
+              core.setFailed(msg);
+              return;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const summaries = comments.filter(isCodexSummary);
+            const latestSummary = summaries.sort(
+              (a, b) => new Date(b.updated_at) - new Date(a.updated_at)
+            )[0];
+
+            if (!latestSummary) {
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: sha,
+              });
+              const headTime = new Date(commit.commit.committer.date).getTime();
+              const elapsed = Date.now() - headTime;
+              const waitedMin = Math.max(0, Math.round(elapsed / 60000));
+              const msg =
+                elapsed < WAIT_MS
+                  ? `Codex Review Summary not posted yet (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until chatgpt-codex-connector comments; job re-runs on that comment.`
+                  : `Codex never posted a Review Summary within ${WAIT_MINUTES} minutes of head ${sha.slice(0, 7)}. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).`;
+              core.setFailed(msg);
+              return;
+            }
+
+            if (summaryLooksRunning(latestSummary.body)) {
+              const msg = 'Codex Review Summary is still Running / in progress — fail until Completed';
+              core.setFailed(msg);
+              return;
+            }
+
+            if (summaryLooksFailed(latestSummary.body)) {
+              const msg = 'Codex Review Summary is Failed / cancelled / error — fail until Completed';
+              core.setFailed(msg);
+              return;
+            }
+
+            if (!summaryLooksCompleted(latestSummary.body)) {
+              const msg = 'Codex Review Summary does not show Completed (or 👍 no-findings) — fail closed';
+              core.setFailed(msg);
+              return;
+            }
+
+            if (!summaryCoversHead(latestSummary.body, sha)) {
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner,
+                repo,
+                ref: sha,
+              });
+              const headTime = new Date(commit.commit.committer.date).getTime();
+              const elapsed = Date.now() - headTime;
+              const waitedMin = Math.max(0, Math.round(elapsed / 60000));
+              const msg =
+                elapsed < WAIT_MS
+                  ? `Codex Review Summary does not mention head ${sha.slice(0, 7)} (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until Codex re-reviews this SHA.`
+                  : `Codex Review Summary still does not mention head ${sha.slice(0, 7)} after ${WAIT_MINUTES} minutes. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).`;
+              core.setFailed(msg);
+              return;
+            }
+
+            let unresolvedCodex;
+            try {
+              unresolvedCodex = await countUnresolvedCodexThreads(prNumber);
+            } catch (err) {
+              core.warning(`GraphQL reviewThreads failed (${err.message}); REST fail-closed`);
+              const n = await countCodexReviewComments(prNumber);
+              if (n > 0) {
+                const msg = `Cannot confirm Codex thread resolution and ${n} Codex review comment(s) exist`;
+                core.setFailed(msg);
+                return;
+              }
+              unresolvedCodex = 0;
+            }
+
+            if (unresolvedCodex > 0) {
+              const msg = `${unresolvedCodex} unresolved blocking Codex thread(s) — P0/P1, or unlabeled containing a security/correctness keyword (security, vulnerab, injection, xss, csrf, rce, secret, token leak, credential, auth bypass, privilege, data loss, corrupt, race condition, deadlock, crash, incorrect result, wrong result, regression). Resolve them — the scheduled Codex Gate Refresh re-runs failed gates every 15 minutes, or workflow_dispatch with the PR number / re-run a pull_request_target-originated Gate job manually (thread resolution is a webhook-only event and does not re-trigger Actions by itself).`;
+              core.setFailed(msg);
+              return;
+            }
+
+            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved blocking Codex threads (P0/P1 or keyword-flagged unlabeled; plain unlabeled counts as non-blocking P2)`;
+            core.info(ok);
+            // Success = job conclusion. pull_request_target attaches
+            // "<caller job> / Codex Review Gate" to the PR head check.
+            // Auto Merge listens via workflow_run — no dispatch here.
+
+  # Schedule-path only. A scheduled run's conclusion does not attach to
+  # any PR head check, and neither does a workflow_dispatch run — so this
+  # job never evaluates. It re-runs the most recent FAILED
+  # pull_request_target-originated Gate run for every open non-draft PR
+  # (actions.reRunWorkflowFailedJobs); a re-run keeps the original
+  # pull_request_target event, so the fresh conclusion re-attaches to the
+  # PR head check. Needs actions:write granted by the CALLER on its
+  # schedule-path job (see examples/codex-gate.yml, job `codex-refresh`).
+  codex-gate-refresh:
+    name: Codex Gate Refresh
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
+    steps:
+      - name: Refresh failing gate checks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // The run belongs to the CALLER workflow; identify it so we
+            // re-run its (not some other workflow's) failed gate runs.
+            const { data: thisRun } = await github.rest.actions.getWorkflowRun({
+              owner,
+              repo,
+              run_id: context.runId,
+            });
+            const workflowId = thisRun.workflow_id;
+            core.info(`Refreshing gate checks for workflow "${thisRun.name}" (id ${workflowId})`);
+
+            const prs = await github.paginate(github.rest.pulls.list, {
+              owner,
+              repo,
+              state: 'open',
+              per_page: 100,
+            });
+            let scanned = 0;
+            let rerun = 0;
+            for (const pr of prs) {
+              if (pr.draft) continue;
+              scanned += 1;
+              const sha = pr.head.sha;
+              const { data: runsData } = await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: workflowId,
+                head_sha: sha,
+                event: 'pull_request_target',
+                status: 'completed',
+                per_page: 20,
+              });
+              const runs = (runsData.workflow_runs || [])
+                .filter((r) => r.head_sha === sha)
+                .sort((a, b) => (b.run_number - a.run_number) || ((b.id || 0) - (a.id || 0)));
+              const latest = runs[0];
+              // Only re-run when the gate check on this head is failing:
+              // the latest completed pull_request_target run's conclusion
+              // IS that check. Success/missing/still-running → nothing to
+              // refresh.
+              if (!latest || latest.conclusion !== 'failure') continue;
+              await github.rest.actions.reRunWorkflowFailedJobs({
+                owner,
+                repo,
+                run_id: latest.id,
+              });
+              rerun += 1;
+              core.info(
+                `PR #${pr.number}: re-running failed jobs of run ${latest.id} (pull_request_target, head ${sha.slice(0, 7)})`
+              );
+            }
+            core.info(
+              `Codex Gate Refresh done: ${scanned} open non-draft PR(s) scanned, ${rerun} failing gate run(s) re-run`
+            );

@@ -1,0 +1,37 @@
+# Self-lint for this repo — actionlint over every workflow (reusable +
+# examples) on push and pull_request. Catches broken expressions, invalid
+# input types, and shellcheck issues in run blocks before callers copy
+# anything.
+
+name: Self Lint
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: '1.7.12'
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" -o /tmp/actionlint.tar.gz
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          sudo mv /tmp/actionlint /usr/local/bin/actionlint
+          actionlint --version
+
+      # shellcheck runs automatically when installed (it is on
+      # ubuntu-latest), so run blocks are linted too.
+      - name: Lint workflows
+        run: actionlint .github/workflows/*.yml examples/*.yml

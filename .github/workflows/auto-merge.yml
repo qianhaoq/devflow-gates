@@ -1,0 +1,583 @@
+# Auto Merge — reusable squash/merge/rebase bot for green PRs.
+#
+# Called from a repo's own auto-merge workflow (see examples/auto-merge.yml):
+#   uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@main
+#
+# The caller MUST set concurrency (a reusable workflow cannot own it for
+# the caller's event stream). Per-PR group where the PR is known
+# (pull_request_review / workflow_dispatch / workflow_run whose
+# triggering event was `pull_request` — the head SHA identifies one PR);
+# every other workflow_run shares one `auto-merge-sweep` group:
+#
+#   concurrency:
+#     group: ${{ (github.event_name == 'workflow_dispatch' && format('auto-merge-pr-{0}', github.event.inputs.pr_number)) || (github.event_name == 'pull_request_review' && format('auto-merge-pr-{0}', github.event.pull_request.number)) || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' && format('auto-merge-pr-{0}', github.event.workflow_run.head_sha)) || 'auto-merge-sweep' }}
+#     cancel-in-progress: false
+#
+# (cancel-in-progress: false — events QUEUE behind an in-flight
+# evaluation; a merge in progress must never be cancelled, and one sweep
+# must not cancel another.)
+#
+# Gate (all required — ported from the reviewed per-repo version):
+#   - PR is open, not draft, base is the repo's DEFAULT branch, and has no
+#     "no-auto-merge" or "skip-codex-gate" label
+#   - Every name in `required_checks` exists as a check run on the head SHA
+#     and its LATEST attempt completed with conclusion success. Missing,
+#     pending, or failed → skip (fail closed; no combined-status fallback).
+#   - Optional Copilot requirement (`require_copilot: true`): the
+#     "copilot-pull-request-reviewer" check must exist and succeed on the
+#     head SHA; the latest Copilot review for the head SHA must be APPROVED
+#     or COMMENTED (Copilot often submits COMMENTED — do NOT require
+#     APPROVED). Soft-path: if the official check is missing but the head
+#     already has Copilot APPROVED/COMMENTED (quota death), treat the
+#     Copilot gate as satisfied; still fail-closed with no Copilot review.
+#     TODO(2026-10-29): remove Copilot COMMENTED/quota soft-path after
+#     stable Copilot Pro+ quota.
+#   - GraphQL reviewThreads: every non-Codex thread resolved; Codex threads
+#     resolved or non-blocking (explicit P2 / keyword-free unlabeled may
+#     stay open — same severity rule as codex-gate.yml). REST fallback:
+#     fail closed if any review comments exist and resolution is unknown.
+#
+# Blocks: draft, non-default-branch base, no-auto-merge, skip-codex-gate,
+# required check missing/not-success, CHANGES_REQUESTED, unresolved
+# non-Codex threads, unresolved blocking Codex threads (P0/P1 or
+# unlabeled-with-security/correctness-keyword).
+#
+# PR resolution (which PR(s) to evaluate):
+#   - pull_request_review / workflow_dispatch → that exact PR (invalid
+#     dispatch pr_number FAILS the job).
+#   - workflow_run whose triggering event was `pull_request` → the run's
+#     head_sha IS a PR head: verify each workflow_run.pull_requests
+#     candidate via pulls.get (those entries carry NO `state` — check
+#     state open + head sha there), then fall back to listing open PRs
+#     filtered by head SHA.
+#   - workflow_run triggered by anything else (pull_request_target,
+#     issue_comment, pull_request_review, pull_request_review_comment,
+#     schedule, workflow_dispatch) → head_sha/head_branch are the BASE /
+#     default branch, so matching by head sha can NEVER find the PR.
+#     Instead SWEEP: evaluate every open, non-draft PR targeting the
+#     default branch (cap 30) and merge those that pass all checks.
+#   - workflow_run with event == 'push' is the ONLY job-level skip (no
+#     runs on the default branch).
+# Note: workflow_run only fires from the caller's default branch once the
+# caller file is merged.
+#
+# Security: evaluation uses ONLY actions/github-script + the GitHub API;
+# it never checks out the PR head and never runs PR-controlled code.
+
+name: Reusable Auto Merge
+
+on:
+  workflow_call:
+    inputs:
+      required_checks:
+        description: >-
+          Newline-separated check-run names that must be 'success' on the
+          PR head SHA (latest attempt per name), e.g.
+          "ci / Build & Test\ncodex / Codex Review Gate\nqa / QA Gate"
+        required: true
+        type: string
+      merge_method:
+        description: 'Merge method: squash | merge | rebase'
+        required: false
+        type: string
+        default: 'squash'
+      require_copilot:
+        description: 'Require a successful copilot-pull-request-reviewer check + Copilot review on the head SHA'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+
+jobs:
+  auto-merge:
+    name: Auto Merge
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # workflow_run runs whose event is 'push' are the ONLY skip (they have
+    # no resolvable PR). Any submitted review re-evaluates (the script's
+    # own gates decide; runs from non-Copilot reviewers are harmless
+    # re-checks).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request_review' ||
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event != 'push')
+    steps:
+      - name: Resolve PR(s) and decide merge
+        uses: actions/github-script@v7
+        env:
+          REQUIRED_CHECKS: ${{ inputs.required_checks }}
+          MERGE_METHOD: ${{ inputs.merge_method }}
+          REQUIRE_COPILOT: ${{ inputs.require_copilot }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const COPILOT_LOGINS = new Set([
+              'copilot-pull-request-reviewer[bot]',
+              'copilot-pull-request-reviewer',
+            ]);
+            const COPILOT_CHECK_RE = /copilot-pull-request-reviewer/i;
+            const REQUIRE_COPILOT = process.env.REQUIRE_COPILOT === 'true';
+            const MERGE_METHOD = ['squash', 'merge', 'rebase'].includes(process.env.MERGE_METHOD)
+              ? process.env.MERGE_METHOD
+              : 'squash';
+            const REQUIRED_CHECK_NAMES = (process.env.REQUIRED_CHECKS || '')
+              .split('\n')
+              .map((s) => s.trim())
+              .filter((s) => s.length > 0);
+
+            const CODEX_LOGINS = new Set([
+              'chatgpt-codex-connector[bot]',
+              'chatgpt-codex-connector',
+            ]);
+
+            // workflow_run triggered by anything other than `pull_request`
+            // (pull_request_target, issue_comment, pull_request_review,
+            // pull_request_review_comment, schedule, workflow_dispatch, ...)
+            // carries the BASE (default) branch as head_sha/head_branch —
+            // head-sha matching would silently never find the PR. Sweep
+            // those instead (see candidatePrNumbers below).
+            const SWEEP_CAP = 30;
+
+            const { data: repoInfo } = await github.rest.repos.get({ owner, repo });
+            const defaultBranch = repoInfo.default_branch || 'main';
+
+            function isCodexLogin(login) {
+              return CODEX_LOGINS.has(login || '');
+            }
+
+            // This workflow's own check runs (e.g. "auto-merge / Auto Merge")
+            // are pending while it evaluates and must never gate themselves.
+            function isIgnoredCheck(name) {
+              const n = (name || '').toLowerCase();
+              return n.includes('auto merge') || n.includes('squash merge');
+            }
+
+            // Rank by created_at (not completed_at): an older run can finish
+            // after a newer attempt and must not mask the newer result.
+            function checkRunTime(c) {
+              const t = c.created_at || '';
+              return t ? new Date(t).getTime() : 0;
+            }
+
+            // listForRef can return multiple runs per name (Actions re-runs).
+            // Only the latest attempt should gate merge.
+            function latestPerName(runs) {
+              const byName = new Map();
+              for (const c of runs) {
+                const key = c.name || '';
+                const prev = byName.get(key);
+                if (
+                  !prev ||
+                  checkRunTime(c) > checkRunTime(prev) ||
+                  (checkRunTime(c) === checkRunTime(prev) && (c.id || 0) > (prev.id || 0))
+                ) {
+                  byName.set(key, c);
+                }
+              }
+              return [...byName.values()];
+            }
+
+            function copilotReviewAllowsMerge(review) {
+              const state = review.state;
+              if (state === 'CHANGES_REQUESTED') {
+                return { ok: false, reason: 'CHANGES_REQUESTED' };
+              }
+              if (state === 'APPROVED' || state === 'COMMENTED') {
+                return { ok: true, reason: state };
+              }
+              return { ok: false, reason: state };
+            }
+
+            async function candidatePrNumbers() {
+              if (context.eventName === 'pull_request_review') {
+                return [context.payload.pull_request.number];
+              }
+              if (context.eventName === 'workflow_dispatch') {
+                const raw = context.payload.inputs?.pr_number;
+                const n = Number(String(raw ?? '').trim());
+                if (!Number.isInteger(n) || n <= 0) {
+                  throw new Error(`Invalid workflow_dispatch pr_number: ${JSON.stringify(raw)}`);
+                }
+                return [n];
+              }
+              const run = context.payload.workflow_run;
+              if (run.event === 'pull_request') {
+                // Only pull_request-originated runs carry the PR head as
+                // head_sha. run.pull_requests entries have NO `state` —
+                // verify each candidate via pulls.get: open PR whose
+                // head.sha == workflow_run.head_sha.
+                for (const cand of run.pull_requests || []) {
+                  const { data: candPr } = await github.rest.pulls.get({
+                    owner,
+                    repo,
+                    pull_number: cand.number,
+                  });
+                  if (candPr.state === 'open' && candPr.head.sha === run.head_sha) {
+                    return [candPr.number];
+                  }
+                }
+                // Fallback: list open PRs filtered by head SHA (branch-name
+                // lookup misses renames and fork heads).
+                const openPrs = await github.paginate(github.rest.pulls.list, {
+                  owner,
+                  repo,
+                  state: 'open',
+                  per_page: 100,
+                });
+                const match = openPrs.find((p) => p.head.sha === run.head_sha);
+                return match ? [match.number] : [];
+              }
+              // Sweep mode: for every other triggering event the run's
+              // head_sha/head_branch are the BASE branch — evaluate every
+              // open, non-draft PR targeting the default branch (capped).
+              const openPrs = await github.paginate(github.rest.pulls.list, {
+                owner,
+                repo,
+                state: 'open',
+                base: defaultBranch,
+                per_page: 100,
+              });
+              const candidates = openPrs
+                .filter((p) => !p.draft)
+                .slice(0, SWEEP_CAP)
+                .map((p) => p.number);
+              core.info(
+                `workflow_run event "${run.event}" carries the base branch as head_sha — sweep mode: ${candidates.length} open non-draft PR(s) targeting ${defaultBranch}`
+              );
+              return candidates;
+            }
+
+            function severityMarker(bodyText) {
+              // Only the finding header / badge region — not later prose/quotes.
+              const text = (bodyText || '').slice(0, 600);
+              const markers = [];
+              const add = (m) => markers.push(m.toUpperCase());
+              // badge/P1 (shields-style badge paths)
+              for (const m of text.matchAll(/badge\/(P[012])\b/gi)) add(m[1]);
+              // [P1]
+              for (const m of text.matchAll(/\[(P[012])\]/gi)) add(m[1]);
+              // **P1**: ... and **P1** text — bold label, colon optional
+              for (const m of text.matchAll(/\*\*(P[012])\*\*/gi)) add(m[1]);
+              // P1: at start of text or a line (optional list marker,
+              // unclosed bold tolerated)
+              for (const m of text.matchAll(/(?:^|\n)[ \t]*(?:[-*+] )?(?:\*\*)?(P[012])\b[ \t]*:/gi)) {
+                add(m[1]);
+              }
+              // P1 Badge / P1 badge / P1-Badge header form
+              for (const m of text.matchAll(/\b(P[012])\b[ \t-]*badge/gi)) add(m[1]);
+              if (markers.some((m) => m === 'P0' || m === 'P1')) return 'P0P1';
+              if (markers.some((m) => m === 'P2')) return 'P2';
+              return null; // unlabeled
+            }
+
+            // Security / correctness keywords promote an unlabeled Codex
+            // thread from non-blocking P2 to blocking. Case-insensitive;
+            // xss/csrf/rce match on word boundaries (confirmed \b), the
+            // rest as substrings. Must stay in sync with codex-gate.yml.
+            const BLOCKING_KEYWORDS = [
+              'security', 'vulnerab', 'injection', 'secret', 'token leak',
+              'credential', 'auth bypass', 'privilege', 'data loss',
+              'corrupt', 'race condition', 'deadlock', 'crash',
+              'incorrect result', 'wrong result', 'regression',
+            ];
+            const BLOCKING_KEYWORD_RES = [/\bxss\b/i, /\bcsrf\b/i, /\brce\b/i];
+
+            function bodyHasBlockingKeyword(bodyText) {
+              const text = (bodyText || '').toLowerCase();
+              if (BLOCKING_KEYWORDS.some((k) => text.includes(k))) return true;
+              return BLOCKING_KEYWORD_RES.some((re) => re.test(text));
+            }
+
+            // Blocking = explicit P0/P1, or an unlabeled body carrying a
+            // security/correctness keyword. Unlabeled without a keyword is
+            // non-blocking P2; explicit P2 never blocks.
+            function isBlockingSeverity(bodyText) {
+              const m = severityMarker(bodyText);
+              if (m === 'P0P1') return true;
+              if (m === 'P2') return false;
+              return bodyHasBlockingKeyword(bodyText);
+            }
+
+            function isBlockingCodexBodies(bodies) {
+              return bodies.some((body) => isBlockingSeverity(body));
+            }
+
+            // Ownership = opening comment. Non-Codex origin always blocks.
+            // Codex-origin threads block only on P0/P1 or unlabeled with a
+            // security/correctness keyword (plain unlabeled and pure P2 OK).
+            async function countUnresolvedThreads(prNumber) {
+              let unresolved = 0;
+              let after = null;
+              let hasNextPage = true;
+              while (hasNextPage) {
+                const result = await github.graphql(
+                  `query($owner: String!, $name: String!, $number: Int!, $after: String) {
+                    repository(owner: $owner, name: $name) {
+                      pullRequest(number: $number) {
+                        reviewThreads(first: 100, after: $after) {
+                          nodes {
+                            isResolved
+                            comments(first: 100) {
+                              nodes { author { login } body }
+                              pageInfo { hasNextPage }
+                            }
+                          }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }`,
+                  { owner, name: repo, number: prNumber, after }
+                );
+                const conn = result.repository?.pullRequest?.reviewThreads;
+                if (!conn) {
+                  throw new Error('GraphQL returned no reviewThreads connection');
+                }
+                for (const thread of conn.nodes) {
+                  if (thread.isResolved) continue;
+                  const comments = thread.comments?.nodes || [];
+                  if (thread.comments?.pageInfo?.hasNextPage) {
+                    unresolved += 1;
+                    continue;
+                  }
+                  const originLogin = comments[0]?.author?.login || '';
+                  if (!isCodexLogin(originLogin)) {
+                    unresolved += 1;
+                    continue;
+                  }
+                  const codexBodies = comments
+                    .filter((c) => isCodexLogin(c.author?.login))
+                    .map((c) => c.body || '');
+                  // Codex-origin: all Codex bodies — P0/P1 escalations and
+                  // keyword-flagged unlabeled bodies block; P2 replies cannot
+                  // downgrade an unlabeled opener.
+                  if (isBlockingCodexBodies(codexBodies.length ? codexBodies : [comments[0]?.body || ''])) {
+                    unresolved += 1;
+                  }
+                }
+                hasNextPage = conn.pageInfo.hasNextPage;
+                after = conn.pageInfo.endCursor;
+              }
+              return unresolved;
+            }
+
+            async function countReviewComments(prNumber) {
+              const comments = await github.paginate(github.rest.pulls.listReviewComments, {
+                owner,
+                repo,
+                pull_number: prNumber,
+                per_page: 100,
+              });
+              return comments.length;
+            }
+
+            async function evaluateAndMerge(prNumber) {
+              const { data: pr } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: prNumber,
+              });
+
+              if (pr.draft) {
+                core.info(`PR #${prNumber} is draft — skip`);
+                return;
+              }
+              if (pr.merged || pr.state !== 'open') {
+                core.info(`PR #${prNumber} not open — skip`);
+                return;
+              }
+              if (pr.base.ref !== defaultBranch) {
+                core.info(`PR #${prNumber} base is ${pr.base.ref}, not ${defaultBranch} — skip`);
+                return;
+              }
+              if (pr.labels.some((l) => l.name === 'no-auto-merge')) {
+                core.info(`PR #${prNumber} has no-auto-merge — skip`);
+                return;
+              }
+              if (pr.labels.some((l) => l.name === 'skip-codex-gate')) {
+                // Belt-and-suspenders: the Gate must not report success for this
+                // label, but refuse here too so a stale successful Gate cannot
+                // auto-merge.
+                core.info(`PR #${prNumber} has skip-codex-gate — skip auto-merge`);
+                return;
+              }
+
+              const sha = pr.head.sha;
+
+              // Octokit paginate may unwrap listForRef so response.data is already the CheckRun array (not {check_runs}).
+              const checkRuns = await github.paginate(
+                github.rest.checks.listForRef,
+                { owner, repo, ref: sha, per_page: 100 },
+                (response) => response.data.check_runs ?? (Array.isArray(response.data) ? response.data : [])
+              );
+
+              const latestChecks = latestPerName(checkRuns);
+              const relevantChecks = latestChecks.filter((c) => !isIgnoredCheck(c.name));
+
+              // Required named gates: every configured check-run name must
+              // exist on the head SHA and its latest attempt must be success.
+              // Missing is fail-closed (not optional).
+              const missingChecks = [];
+              const badChecks = [];
+              for (const name of REQUIRED_CHECK_NAMES) {
+                const runs = relevantChecks.filter((c) => (c.name || '') === name);
+                if (runs.length === 0) {
+                  missingChecks.push(name);
+                  continue;
+                }
+                const pending = runs.filter((c) => c.status !== 'completed');
+                if (pending.length > 0) {
+                  badChecks.push(`${name} (pending: ${pending.map((c) => c.status).join(', ')})`);
+                  continue;
+                }
+                const notSuccess = runs.filter((c) => c.conclusion !== 'success');
+                if (notSuccess.length > 0) {
+                  badChecks.push(`${name} (${notSuccess.map((c) => c.conclusion).join(', ')})`);
+                }
+              }
+              if (missingChecks.length > 0) {
+                core.info(`Required check(s) missing on head SHA: ${missingChecks.join(', ')} — skip`);
+                return;
+              }
+              if (badChecks.length > 0) {
+                core.info(`Required check(s) missing/not success: ${badChecks.join(', ')} — skip`);
+                return;
+              }
+
+              // Optional Copilot requirement.
+              if (REQUIRE_COPILOT) {
+                const reviews = await github.paginate(github.rest.pulls.listReviews, {
+                  owner,
+                  repo,
+                  pull_number: prNumber,
+                  per_page: 100,
+                });
+
+                const copilotReviews = reviews.filter(
+                  (r) => COPILOT_LOGINS.has(r.user?.login || '') && r.state !== 'DISMISSED' && r.state !== 'PENDING'
+                );
+                const withCommit = copilotReviews.filter((r) => r.commit_id);
+                const forHead = withCommit.length
+                  ? withCommit.filter((r) => r.commit_id === sha)
+                  : copilotReviews;
+                const latest = forHead.length
+                  ? forHead.sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at))[0]
+                  : null;
+                const copilotGate = latest
+                  ? copilotReviewAllowsMerge(latest)
+                  : { ok: false, reason: 'missing' };
+
+                const copilotChecks = relevantChecks.filter((c) => COPILOT_CHECK_RE.test(c.name || ''));
+                if (copilotChecks.length === 0) {
+                  // Soft-path: Copilot quota death — official check never appears, but a head
+                  // review that is APPROVED/COMMENTED still satisfies the Copilot gate.
+                  // TODO(2026-10-29): remove Copilot COMMENTED/quota soft-path after 1-2
+                  // weeks of stable Copilot Pro+ quota.
+                  if (!latest || !copilotGate.ok) {
+                    core.info('copilot-pull-request-reviewer missing on head SHA — skip');
+                    return;
+                  }
+                  core.info(`copilot official check missing; head review ${copilotGate.reason} allows merge`);
+                } else {
+                  const pending = copilotChecks.filter((c) => c.status !== 'completed');
+                  const bad = copilotChecks.filter(
+                    (c) => c.status === 'completed' && c.conclusion !== 'success'
+                  );
+                  if (pending.length > 0) {
+                    core.info(`copilot-pull-request-reviewer pending: ${pending.map((c) => c.status).join(', ')} — skip`);
+                    return;
+                  }
+                  if (bad.length > 0) {
+                    core.info(`copilot-pull-request-reviewer not successful: ${bad.map((c) => c.conclusion).join(', ')} — skip`);
+                    return;
+                  }
+                }
+
+                if (copilotReviews.length === 0) {
+                  core.info(`PR #${prNumber}: no Copilot review yet — skip (will retry when review lands)`);
+                  return;
+                }
+                if (!latest) {
+                  core.info(`PR #${prNumber}: no Copilot review for head ${sha.slice(0, 7)} — skip`);
+                  return;
+                }
+                if (!copilotGate.ok) {
+                  core.info(
+                    `PR #${prNumber}: latest Copilot review for head is ${latest.state} (${copilotGate.reason}) — skip`
+                  );
+                  return;
+                }
+              }
+
+              let unresolved;
+              try {
+                unresolved = await countUnresolvedThreads(prNumber);
+              } catch (err) {
+                core.warning(`GraphQL reviewThreads failed (${err.message}); REST fail-closed fallback`);
+                const commentCount = await countReviewComments(prNumber);
+                if (commentCount > 0) {
+                  core.info(
+                    `PR #${prNumber}: cannot confirm thread resolution and ${commentCount} review comment(s) exist — skip`
+                  );
+                  return;
+                }
+                unresolved = 0;
+              }
+
+              if (unresolved > 0) {
+                core.info(`PR #${prNumber}: ${unresolved} unresolved review thread(s) — skip`);
+                return;
+              }
+
+              core.info(
+                `Merging PR #${prNumber} at ${sha.slice(0, 7)} (${MERGE_METHOD}: required checks green on head SHA + no blocking unresolved threads)`
+              );
+              await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: prNumber,
+                sha,
+                merge_method: MERGE_METHOD,
+                commit_title: `${pr.title} (#${prNumber})`,
+                commit_message:
+                  'Auto-merged: required checks green on head SHA + no blocking unresolved review threads (Codex P2 may stay open).',
+              });
+              core.info(`${MERGE_METHOD}-merged PR #${prNumber}`);
+            }
+
+            let candidates;
+            try {
+              candidates = await candidatePrNumbers();
+            } catch (err) {
+              // Invalid workflow_dispatch input (or a listing failure) must
+              // FAIL the job — a silent green skip would look like a merge
+              // decision.
+              core.setFailed(`Could not resolve PR(s) for this event: ${err.message}`);
+              return;
+            }
+            if (candidates.length === 0) {
+              if (context.eventName === 'workflow_dispatch') {
+                core.setFailed('workflow_dispatch pr_number did not resolve to a PR');
+                return;
+              }
+              core.info('No open PR matches this event — skip');
+              return;
+            }
+
+            core.info(`Evaluating PR(s): ${candidates.join(', ')}`);
+            for (const n of candidates) {
+              try {
+                await evaluateAndMerge(n);
+              } catch (err) {
+                // One bad PR must not abort the sweep.
+                core.warning(`PR #${n}: evaluation error (${err.message}) — continuing`);
+              }
+            }

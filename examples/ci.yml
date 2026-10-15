@@ -1,0 +1,30 @@
+# Example caller for the reusable CI — copy to YOUR_REPO/.github/workflows/ci.yml
+# and adjust the inputs. Trigger on `pull_request` (NOT pull_request_target):
+# "Build & Test" executes the PR's code and must not see secrets.
+#
+# Required-check names produced by this example (job id `ci`, no `name:`):
+#   - "ci / Build & Test"
+#   - "ci / Secret Scan"
+# If you rename the job id (or add a `name:`), the check names change to
+# "<your job name> / <called job name>" — update branch protection AND
+# auto-merge.yml's required_checks to match.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@main
+    with:
+      node_version: '22'          # '' skips setup-node
+      python_version: ''          # '' skips setup-python
+      setup_command: 'npm ci'     # '' skips the setup step
+      test_command: 'npm test'    # required
+      working_directory: '.'      # e.g. 'web' for a monorepo subdir

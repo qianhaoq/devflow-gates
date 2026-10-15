@@ -1,0 +1,105 @@
+# CI — reusable build/test + secret scan.
+#
+# Called from a repo's own CI workflow:
+#   uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@main
+#
+# Check names on a PR are "<caller job name> / <called job name>".
+# With the example caller (job id `ci`) this produces:
+#   - "ci / Build & Test"
+#   - "ci / Secret Scan"
+#
+# "Build & Test" runs the caller's PR code (trigger the caller on
+# `pull_request`, NOT pull_request_target — this job executes untrusted
+# code and must not see secrets). "Secret Scan" only reads the checkout
+# with a downloaded gitleaks binary — no third-party action that would
+# require a license key.
+
+name: Reusable CI
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        description: 'Node.js version for setup-node ("" skips setup-node)'
+        required: false
+        type: string
+        default: ''
+      python_version:
+        description: 'Python version for setup-python ("" skips setup-python)'
+        required: false
+        type: string
+        default: ''
+      setup_command:
+        description: 'Dependency setup command run before tests, e.g. "npm ci" ("" skips)'
+        required: false
+        type: string
+        default: ''
+      test_command:
+        description: 'Test command (required), e.g. "npm test"'
+        required: true
+        type: string
+      working_directory:
+        description: 'Working directory for setup/test commands'
+        required: false
+        type: string
+        default: '.'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        if: inputs.node_version != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Set up Python
+        if: inputs.python_version != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Setup dependencies
+        if: inputs.setup_command != ''
+        run: ${{ inputs.setup_command }}
+        working-directory: ${{ inputs.working_directory }}
+
+      - name: Run tests
+        run: ${{ inputs.test_command }}
+        working-directory: ${{ inputs.working_directory }}
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Download the official gitleaks v8 release binary directly — the
+      # gitleaks GitHub Action requires a license key for organizations.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: '8.30.1'
+        run: |
+          set -euo pipefail
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      # gitleaks auto-detects a .gitleaks.toml in the repo root (the
+      # checkout above is the CALLER repo), so a caller's custom allowlist
+      # / rules are respected without extra wiring. Any finding exits 1
+      # and fails the job.
+      - name: gitleaks detect (full history)
+        run: gitleaks detect --redact --no-banner --exit-code 1

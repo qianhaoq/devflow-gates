@@ -1,0 +1,147 @@
+# Post-deploy Smoke — reusable black-box checks for a deployed site.
+#
+# Called from a repo's own smoke workflow (see examples/smoke.yml) or
+# directly from a deploy workflow:
+#   uses: qianhaoq/devflow-gates/.github/workflows/post-deploy-smoke.yml@main
+#
+# Check name is "<caller job name> / <called job name>"; with the example
+# caller (job id `smoke`) this produces "smoke / Post-deploy Smoke".
+#
+# Checks (plain curl against inputs.base_url):
+#   - GET /.git/HEAD and GET /.env must return 404. A 403 is ALSO
+#     accepted (a WAF/ACL block is as good as "not found" — what must
+#     never happen is a 2xx/redirect leak). Anything else fails.
+#   - GET inputs.protected_path must return 401 (skipped when empty).
+#   - Every comma-separated group in inputs.required_headers must be
+#     present on the response headers of GET base_url. Within a group,
+#     "|" means any-of: "x-frame-options|content-security-policy" passes
+#     if EITHER header is present. Groups are AND-ed.
+# Any failure fails the job and writes a summary table to
+# $GITHUB_STEP_SUMMARY.
+
+name: Reusable Post-deploy Smoke
+
+on:
+  workflow_call:
+    inputs:
+      base_url:
+        description: 'Deployed origin to smoke test, e.g. "https://example.com"'
+        required: true
+        type: string
+      protected_path:
+        description: 'Path that must return 401 when set, e.g. "/admin" ("" skips the check)'
+        required: false
+        type: string
+        default: ''
+      required_headers:
+        description: >-
+          Comma-separated required response-header groups on base_url;
+          "|" inside a group = any-of. Default requires HSTS AND
+          x-content-type-options AND (x-frame-options OR
+          content-security-policy).
+        required: false
+        type: string
+        default: 'strict-transport-security,x-content-type-options,x-frame-options|content-security-policy'
+
+permissions:
+  contents: read
+
+jobs:
+  post-deploy-smoke:
+    name: Post-deploy Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Smoke test
+        env:
+          BASE_URL: ${{ inputs.base_url }}
+          PROTECTED_PATH: ${{ inputs.protected_path }}
+          REQUIRED_HEADERS: ${{ inputs.required_headers }}
+        run: |
+          set -uo pipefail
+
+          base="${BASE_URL%/}"
+          results="$(mktemp)"
+          fail=0
+
+          printf '| 检查项 Check | 期望 Expected | 实际 Actual | 结果 Result |\n' >> "$results"
+          printf '| --- | --- | --- | --- |\n' >> "$results"
+
+          row() {
+            printf '| %s | %s | %s | %s |\n' "$1" "$2" "$3" "$4" >> "$results"
+            printf '%s | expected %s | actual %s | %s\n' "$1" "$2" "$3" "$4"
+          }
+
+          get_status() {
+            local url="$1" code
+            code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$url" 2>/dev/null)" || code="000"
+            printf '%s' "${code:-000}"
+          }
+
+          # 1) Sensitive paths must not be served. 404 = gone; 403 =
+          #    WAF/ACL block — accepted as "not leaked". 2xx/redirect/5xx
+          #    (or connection failure 000) fails.
+          for path in "/.git/HEAD" "/.env"; do
+            status="$(get_status "$base$path")"
+            if [ "$status" = "404" ] || [ "$status" = "403" ]; then
+              row "\`GET $path\`" '404 (403 accepted)' "$status" '✅'
+            else
+              row "\`GET $path\`" '404 (403 accepted)' "$status" '❌'
+              fail=$((fail + 1))
+            fi
+          done
+
+          # 2) Protected path must demand authentication.
+          if [ -n "${PROTECTED_PATH:-}" ]; then
+            protected="/${PROTECTED_PATH#/}"
+            status="$(get_status "$base$protected")"
+            if [ "$status" = "401" ]; then
+              row "\`GET $protected\`" '401' "$status" '✅'
+            else
+              row "\`GET $protected\`" '401' "$status" '❌'
+              fail=$((fail + 1))
+            fi
+          fi
+
+          # 3) Security response headers on base_url. Groups are
+          #    comma-separated (all required); "|" within a group is
+          #    any-of. Matching is case-insensitive on the header name.
+          headers="$(curl -sS -o /dev/null -D - --max-time 30 "$base" 2>/dev/null | tr -d '\r')" || headers=""
+          if [ -z "$headers" ]; then
+            row '响应头 header groups' 'any-of groups present' 'no response headers' '❌'
+            fail=$((fail + 1))
+          else
+            IFS=',' read -r -a groups <<< "${REQUIRED_HEADERS:-}"
+            for group in "${groups[@]}"; do
+              group_trimmed="$(printf '%s' "$group" | xargs)"
+              [ -z "$group_trimmed" ] && continue
+              found=""
+              IFS='|' read -r -a alternatives <<< "$group_trimmed"
+              for alt in "${alternatives[@]}"; do
+                name="$(printf '%s' "$alt" | xargs)"
+                [ -z "$name" ] && continue
+                if printf '%s\n' "$headers" | grep -qi "^${name}:"; then
+                  found="$name"
+                  break
+                fi
+              done
+              if [ -n "$found" ]; then
+                row "响应头 \`$group_trimmed\` (any-of)" 'any present' "$found" '✅'
+              else
+                row "响应头 \`$group_trimmed\` (any-of)" 'any present' 'none present' '❌'
+                fail=$((fail + 1))
+              fi
+            done
+          fi
+
+          {
+            printf '## Post-deploy Smoke 结果 / Results\n\n'
+            printf -- "- base_url: \`%s\`\n\n" "$base"
+            cat "$results"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$fail" -gt 0 ]; then
+            printf '::error::%s smoke check(s) failed — see the job summary table\n' "$fail"
+            exit 1
+          fi
+          printf 'All smoke checks passed for %s\n' "$base"
