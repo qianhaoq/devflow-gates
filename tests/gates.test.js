@@ -100,7 +100,7 @@ const UNL_KW = 'This is a security problem.';
 
   // QA gate dry-run.
   const qa = scripts('qa-gate.yml')[0];
-  async function runQa({ draft, action, labels, events = [], allowed = '' }) {
+  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt }) {
     const calls = { removed: [], failed: null };
     const github = {
       rest: {
@@ -111,7 +111,7 @@ const UNL_KW = 'This is a security problem.';
       paginate: async (fn) => (fn === github.rest.issues.listEvents ? events : []),
     };
     const core = { info() {}, warning() {}, setFailed: (m) => { calls.failed = m; } };
-    const context = { eventName: 'pull_request_target', payload: { action, pull_request: { number: 1 } }, repo: { owner: 'o', repo: 'r' } };
+    const context = { eventName: 'pull_request_target', payload: { action, pull_request: { number: 1, head: { sha: 'abcdef1234567' }, updated_at: updatedAt } }, repo: { owner: 'o', repo: 'r' } };
     await new AsyncFunction('github', 'context', 'core', 'process', qa)(github, context, core, { env: { QA_LABEL: 'qa-passed', ALLOWED_LABELERS: allowed } });
     return calls;
   }
@@ -161,6 +161,19 @@ const UNL_KW = 'This is a security problem.';
     const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], allowed: 'qianhaoq',
       events: [at('labeled', 'author', '2026-02-01T00:00:00Z'), at('unlabeled', 'qianhaoq', '2026-02-02T00:00:00Z'), at('labeled', 'qianhaoq', '2026-02-03T00:00:00Z')] });
     assert.strictEqual(c.failed, null, c.failed);
+  });
+
+  await t('qa-gate: label applied after the push survives synchronize (race)', async () => {
+    const c = await runQa({ draft: false, action: 'synchronize', labels: ['qa-passed'], allowed: 'qianhaoq',
+      updatedAt: '2026-02-01T16:57:25Z', events: [at('labeled', 'qianhaoq', '2026-02-01T16:57:34Z')] });
+    assert.deepStrictEqual(c.removed, []);
+    assert.strictEqual(c.failed, null, c.failed);
+  });
+  await t('qa-gate: label applied before the push is stripped on synchronize', async () => {
+    const c = await runQa({ draft: false, action: 'synchronize', labels: ['qa-passed'],
+      updatedAt: '2026-02-01T16:57:25Z', events: [at('labeled', 'qianhaoq', '2026-02-01T16:50:00Z')] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
   });
 
   if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
