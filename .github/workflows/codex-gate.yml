@@ -27,10 +27,12 @@
 #   - Summary completed but unresolved blocking Codex threads remain → fail.
 #     Severity rule — blocking is: explicit P0/P1 (recognized header forms:
 #     "**P1":", "**P1** text", "P1:", "[P1]", "P1 Badge", "badge/P1"), or an
-#     unlabeled thread whose body (case-insensitive) contains a
-#     security/correctness keyword (xss/csrf/rce as \b-words, confirmed;
-#     the rest as substrings). Unlabeled without a keyword counts as
-#     non-blocking P2; explicit P2 never blocks.
+#     unlabeled thread. Default `block_unlabeled: true` (established
+#     policy): every unlabeled thread blocks. Opt-out
+#     `block_unlabeled: false`: unlabeled blocks only when its body
+#     (case-insensitive) contains a security/correctness keyword
+#     (xss/csrf/rce as \b-words, the rest as substrings). Explicit P2
+#     never blocks.
 #   - Summary completed for this head SHA (or 👍 no-findings) and zero
 #     unresolved blocking Codex threads → success
 #   - GraphQL thread lookup failed + any Codex review comments exist → fail
@@ -79,6 +81,11 @@ on:
         required: false
         type: number
         default: 20
+      block_unlabeled:
+        description: 'Unresolved unlabeled Codex threads block (default true, fail-closed policy). false = opt-out: unlabeled blocks only with a security/correctness keyword. Explicit P0/P1 always block; explicit P2 never blocks.'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -105,6 +112,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           WAIT_MINUTES: ${{ inputs.wait_minutes }}
+          BLOCK_UNLABELED: ${{ inputs.block_unlabeled }}
         with:
           script: |
             const owner = context.repo.owner;
@@ -118,6 +126,8 @@ jobs:
               return Number.isFinite(n) && n > 0 ? n : 20;
             })();
             const WAIT_MS = WAIT_MINUTES * 60 * 1000;
+            // Fail closed: only an explicit 'false' opts out.
+            const BLOCK_UNLABELED = process.env.BLOCK_UNLABELED !== 'false';
             const SUMMARY_MARKERS = [
               '<!-- codex-pull-request-review-summary -->',
               '## Codex Review Summary',
@@ -226,20 +236,31 @@ jobs:
               return BLOCKING_KEYWORD_RES.some((re) => re.test(text));
             }
 
-            // Blocking = explicit P0/P1, or an unlabeled body carrying a
-            // security/correctness keyword. Unlabeled without a keyword is
-            // non-blocking P2; explicit P2 never blocks. Later P0/P1
-            // escalations still block; later P2 cannot downgrade an
-            // unlabeled opener.
+            // Blocking = explicit P0/P1, or an unlabeled body. Unlabeled
+            // blocks by default (BLOCK_UNLABELED, input block_unlabeled:
+            // true — established fail-closed policy); with
+            // block_unlabeled: false (opt-out) only unlabeled bodies
+            // carrying a security/correctness keyword block. Explicit P2
+            // never blocks. Must stay in sync with auto-merge.yml.
             function isBlockingSeverity(bodyText) {
               const m = severityMarker(bodyText);
               if (m === 'P0P1') return true;
               if (m === 'P2') return false;
-              return bodyHasBlockingKeyword(bodyText);
+              return BLOCK_UNLABELED || bodyHasBlockingKeyword(bodyText);
             }
 
-            function isBlockingCodexBodies(bodies) {
-              return bodies.some((body) => isBlockingSeverity(body));
+            // Thread severity from its relevant bodies (oldest first):
+            //   - any body with explicit P0/P1 → blocking (escalation);
+            //   - otherwise an opener explicitly labeled P2 → non-blocking
+            //     (unlabeled follow-ups such as "fixed in abc" cannot
+            //     promote it);
+            //   - otherwise unlabeled → isBlockingSeverity per body (a later
+            //     P2 reply cannot downgrade an unlabeled opener).
+            function isBlockingThreadBodies(bodies) {
+              const list = bodies.length ? bodies : [''];
+              if (list.some((b) => severityMarker(b) === 'P0P1')) return true;
+              if (severityMarker(list[0]) === 'P2') return false;
+              return list.some((b) => severityMarker(b) !== 'P2' && isBlockingSeverity(b));
             }
 
             async function countUnresolvedCodexThreads(prNumber) {
@@ -284,7 +305,7 @@ jobs:
                     .filter((c) => isCodexLogin(c.author?.login))
                     .map((c) => c.body || '');
                   const bodies = codexBodies.length ? codexBodies : comments.map((c) => c.body || '');
-                  if (isBlockingCodexBodies(bodies)) unresolved += 1;
+                  if (isBlockingThreadBodies(bodies)) unresolved += 1;
                 }
                 hasNextPage = conn.pageInfo.hasNextPage;
                 after = conn.pageInfo.endCursor;
@@ -428,12 +449,12 @@ jobs:
             }
 
             if (unresolvedCodex > 0) {
-              const msg = `${unresolvedCodex} unresolved blocking Codex thread(s) — P0/P1, or unlabeled containing a security/correctness keyword (security, vulnerab, injection, xss, csrf, rce, secret, token leak, credential, auth bypass, privilege, data loss, corrupt, race condition, deadlock, crash, incorrect result, wrong result, regression). Resolve them — the scheduled Codex Gate Refresh re-runs failed gates every 15 minutes, or workflow_dispatch with the PR number / re-run a pull_request_target-originated Gate job manually (thread resolution is a webhook-only event and does not re-trigger Actions by itself).`;
+              const msg = `${unresolvedCodex} unresolved blocking Codex thread(s) — P0/P1, or unlabeled${BLOCK_UNLABELED ? ' (block_unlabeled: true)' : ' containing a security/correctness keyword (security, vulnerab, injection, xss, csrf, rce, secret, token leak, credential, auth bypass, privilege, data loss, corrupt, race condition, deadlock, crash, incorrect result, wrong result, regression)'}. Resolve them — the scheduled Codex Gate Refresh re-runs failed gates every 15 minutes, or workflow_dispatch with the PR number / re-run a pull_request_target-originated Gate job manually (thread resolution is a webhook-only event and does not re-trigger Actions by itself).`;
               core.setFailed(msg);
               return;
             }
 
-            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved blocking Codex threads (P0/P1 or keyword-flagged unlabeled; plain unlabeled counts as non-blocking P2)`;
+            const ok = `Codex review finished for ${sha.slice(0, 7)} with no unresolved blocking Codex threads (P0/P1${BLOCK_UNLABELED ? ' or unlabeled' : ' or keyword-flagged unlabeled'}; explicit P2 never blocks)`;
             core.info(ok);
             // Success = job conclusion. pull_request_target attaches
             // "<caller job> / Codex Review Gate" to the PR head check.

@@ -19,7 +19,8 @@
 #     time. Push time = max(head commit committer date, 'committed'
 #     timeline events for the head SHA, 'head_ref_force_pushed' timeline
 #     events). A label that predates the last push is stale → fail.
-#   - Draft PR → fail. Non-PR contexts (no resolvable PR / closed PR) →
+#   - Draft PR → fail (checked after the synchronize label removal, so a
+#     push to a draft still strips the label). Non-PR contexts (no resolvable PR / closed PR) →
 #     info + success (nothing to gate). workflow_dispatch with an
 #     invalid/nonnumeric pr_number FAILS (operator error must be loud).
 #
@@ -116,13 +117,6 @@ jobs:
               return;
             }
 
-            if (pr.draft) {
-              const msg = 'PR is draft — QA gate fails until ready_for_review';
-              core.info(`PR #${prNumber}: ${msg}`);
-              core.setFailed(msg);
-              return;
-            }
-
             const sha = pr.head.sha;
             const hasLabel = pr.labels.some((l) => l.name === QA_LABEL);
 
@@ -147,6 +141,15 @@ jobs:
                 }
               }
               const msg = `new push invalidated QA — head is now ${sha.slice(0, 7)}; re-run manual QA (templates/QA.md) and re-apply "${QA_LABEL}"`;
+              core.info(`PR #${prNumber}: ${msg}`);
+              core.setFailed(msg);
+              return;
+            }
+
+            // Draft check runs AFTER the synchronize invalidation so a
+            // draft PR cannot keep a stale QA label across a push.
+            if (pr.draft) {
+              const msg = 'PR is draft — QA gate fails until ready_for_review';
               core.info(`PR #${prNumber}: ${msg}`);
               core.setFailed(msg);
               return;

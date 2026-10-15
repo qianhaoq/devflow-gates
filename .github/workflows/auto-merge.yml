@@ -32,15 +32,17 @@
 #     Copilot gate as satisfied; still fail-closed with no Copilot review.
 #     TODO(2026-10-29): remove Copilot COMMENTED/quota soft-path after
 #     stable Copilot Pro+ quota.
-#   - GraphQL reviewThreads: every non-Codex thread resolved; Codex threads
-#     resolved or non-blocking (explicit P2 / keyword-free unlabeled may
-#     stay open — same severity rule as codex-gate.yml). REST fallback:
+#   - GraphQL reviewThreads: non-Codex (Copilot/human) threads resolved
+#     unless explicitly P2; Codex threads resolved or non-blocking
+#     (explicit P2 may stay open; unlabeled blocks unless
+#     `block_unlabeled: false`, then keyword-free unlabeled may stay open —
+#     same severity rule as codex-gate.yml). REST fallback:
 #     fail closed if any review comments exist and resolution is unknown.
 #
 # Blocks: draft, non-default-branch base, no-auto-merge, skip-codex-gate,
 # required check missing/not-success, CHANGES_REQUESTED, unresolved
-# non-Codex threads, unresolved blocking Codex threads (P0/P1 or
-# unlabeled-with-security/correctness-keyword).
+# non-Codex threads not explicitly P2, unresolved blocking Codex threads
+# (P0/P1 or unlabeled; keyword-only when block_unlabeled: false).
 #
 # PR resolution (which PR(s) to evaluate):
 #   - pull_request_review / workflow_dispatch → that exact PR (invalid
@@ -86,6 +88,11 @@ on:
         required: false
         type: boolean
         default: false
+      block_unlabeled:
+        description: 'Unresolved unlabeled Codex threads block (default true, fail-closed policy; same rule as codex-gate.yml). false = opt-out: keyword-only. Non-Codex unlabeled threads always block; explicit P2 never blocks.'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -115,6 +122,7 @@ jobs:
           REQUIRED_CHECKS: ${{ inputs.required_checks }}
           MERGE_METHOD: ${{ inputs.merge_method }}
           REQUIRE_COPILOT: ${{ inputs.require_copilot }}
+          BLOCK_UNLABELED: ${{ inputs.block_unlabeled }}
         with:
           script: |
             const owner = context.repo.owner;
@@ -125,6 +133,8 @@ jobs:
             ]);
             const COPILOT_CHECK_RE = /copilot-pull-request-reviewer/i;
             const REQUIRE_COPILOT = process.env.REQUIRE_COPILOT === 'true';
+            // Fail closed: only an explicit 'false' opts out.
+            const BLOCK_UNLABELED = process.env.BLOCK_UNLABELED !== 'false';
             const MERGE_METHOD = ['squash', 'merge', 'rebase'].includes(process.env.MERGE_METHOD)
               ? process.env.MERGE_METHOD
               : 'squash';
@@ -296,23 +306,44 @@ jobs:
               return BLOCKING_KEYWORD_RES.some((re) => re.test(text));
             }
 
-            // Blocking = explicit P0/P1, or an unlabeled body carrying a
-            // security/correctness keyword. Unlabeled without a keyword is
-            // non-blocking P2; explicit P2 never blocks.
+            // Blocking = explicit P0/P1, or an unlabeled body. Unlabeled
+            // blocks by default (BLOCK_UNLABELED, input block_unlabeled:
+            // true — established fail-closed policy); with
+            // block_unlabeled: false (opt-out) only unlabeled bodies
+            // carrying a security/correctness keyword block. Explicit P2
+            // never blocks. Must stay in sync with codex-gate.yml.
             function isBlockingSeverity(bodyText) {
               const m = severityMarker(bodyText);
               if (m === 'P0P1') return true;
               if (m === 'P2') return false;
-              return bodyHasBlockingKeyword(bodyText);
+              return BLOCK_UNLABELED || bodyHasBlockingKeyword(bodyText);
             }
 
-            function isBlockingCodexBodies(bodies) {
-              return bodies.some((body) => isBlockingSeverity(body));
+            // Thread severity from its relevant bodies (oldest first):
+            //   - any body with explicit P0/P1 → blocking (escalation);
+            //   - otherwise an opener explicitly labeled P2 → non-blocking
+            //     (unlabeled follow-ups such as "fixed in abc" cannot
+            //     promote it);
+            //   - otherwise unlabeled → isBlockingSeverity per body (a later
+            //     P2 reply cannot downgrade an unlabeled opener).
+            function isBlockingThreadBodies(bodies) {
+              const list = bodies.length ? bodies : [''];
+              if (list.some((b) => severityMarker(b) === 'P0P1')) return true;
+              if (severityMarker(list[0]) === 'P2') return false;
+              return list.some((b) => severityMarker(b) !== 'P2' && isBlockingSeverity(b));
             }
 
-            // Ownership = opening comment. Non-Codex origin always blocks.
-            // Codex-origin threads block only on P0/P1 or unlabeled with a
-            // security/correctness keyword (plain unlabeled and pure P2 OK).
+            // Non-Codex (Copilot / human) thread: blocks unless its opener is
+            // explicitly P2 and no comment escalates to P0/P1.
+            function isBlockingNonCodexThread(bodies) {
+              const list = bodies.length ? bodies : [''];
+              if (list.some((b) => severityMarker(b) === 'P0P1')) return true;
+              return severityMarker(list[0]) !== 'P2';
+            }
+
+            // Ownership = opening comment. Non-Codex origin blocks unless
+            // explicitly P2. Codex-origin threads use isBlockingThreadBodies
+            // (P0/P1 and, by default, unlabeled block; explicit P2 does not).
             async function countUnresolvedThreads(prNumber) {
               let unresolved = 0;
               let after = null;
@@ -350,7 +381,11 @@ jobs:
                   }
                   const originLogin = comments[0]?.author?.login || '';
                   if (!isCodexLogin(originLogin)) {
-                    unresolved += 1;
+                    // Copilot / human origin: explicit P2 opener does not
+                    // block (unless a later P0/P1 escalation); P0/P1 and
+                    // unlabeled always block (fail closed, independent of
+                    // block_unlabeled).
+                    if (isBlockingNonCodexThread(comments.map((c) => c.body || ''))) unresolved += 1;
                     continue;
                   }
                   const codexBodies = comments
@@ -359,7 +394,7 @@ jobs:
                   // Codex-origin: all Codex bodies — P0/P1 escalations and
                   // keyword-flagged unlabeled bodies block; P2 replies cannot
                   // downgrade an unlabeled opener.
-                  if (isBlockingCodexBodies(codexBodies.length ? codexBodies : [comments[0]?.body || ''])) {
+                  if (isBlockingThreadBodies(codexBodies.length ? codexBodies : [comments[0]?.body || ''])) {
                     unresolved += 1;
                   }
                 }
@@ -548,7 +583,7 @@ jobs:
                 merge_method: MERGE_METHOD,
                 commit_title: `${pr.title} (#${prNumber})`,
                 commit_message:
-                  'Auto-merged: required checks green on head SHA + no blocking unresolved review threads (Codex P2 may stay open).',
+                  'Auto-merged: required checks green on head SHA + no blocking unresolved review threads (explicit P2 may stay open).',
               });
               core.info(`${MERGE_METHOD}-merged PR #${prNumber}`);
             }
