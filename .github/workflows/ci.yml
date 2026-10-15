@@ -43,6 +43,49 @@ on:
         required: false
         type: string
         default: '.'
+      timeout_minutes:
+        description: 'Per-job timeout in minutes for Build & Test and Secret Scan'
+        required: false
+        type: number
+        default: 10
+  # Manual runs (Actions tab / gh workflow run) take the same inputs.
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: 'Node.js version for setup-node ("" skips setup-node)'
+        required: false
+        type: string
+        default: ''
+      python_version:
+        description: 'Python version for setup-python ("" skips setup-python)'
+        required: false
+        type: string
+        default: ''
+      setup_command:
+        description: 'Dependency setup command run before tests, e.g. "npm ci" ("" skips)'
+        required: false
+        type: string
+        default: ''
+      test_command:
+        description: 'Test command (required), e.g. "npm test"'
+        required: true
+        type: string
+      working_directory:
+        description: 'Working directory for setup/test commands'
+        required: false
+        type: string
+        default: '.'
+      timeout_minutes:
+        description: 'Per-job timeout in minutes for Build & Test and Secret Scan'
+        required: false
+        type: number
+        default: 10
+
+# One CI run per workflow + ref: a newer push/dispatch cancels the older
+# in-flight run. In a called workflow github.workflow is the CALLER's name.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-reusable-ci
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -51,6 +94,7 @@ jobs:
   build-and-test:
     name: Build & Test
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -79,6 +123,7 @@ jobs:
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     steps:
       - name: Check out full history
         uses: actions/checkout@v4
