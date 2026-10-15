@@ -100,7 +100,7 @@ const UNL_KW = 'This is a security problem.';
 
   // QA gate dry-run.
   const qa = scripts('qa-gate.yml')[0];
-  async function runQa({ draft, action, labels }) {
+  async function runQa({ draft, action, labels, events = [], allowed = '' }) {
     const calls = { removed: [], failed: null };
     const github = {
       rest: {
@@ -108,11 +108,11 @@ const UNL_KW = 'This is a security problem.';
         issues: { removeLabel: async (a) => { calls.removed.push(a.name); }, listEvents: async () => ({}), listEventsForTimeline: async () => ({}) },
         repos: { getCommit: async () => ({ data: { commit: { committer: { date: '2026-01-01T00:00:00Z' } } } }) },
       },
-      paginate: async () => [],
+      paginate: async (fn) => (fn === github.rest.issues.listEvents ? events : []),
     };
     const core = { info() {}, warning() {}, setFailed: (m) => { calls.failed = m; } };
     const context = { eventName: 'pull_request_target', payload: { action, pull_request: { number: 1 } }, repo: { owner: 'o', repo: 'r' } };
-    await new AsyncFunction('github', 'context', 'core', 'process', qa)(github, context, core, { env: { QA_LABEL: 'qa-passed' } });
+    await new AsyncFunction('github', 'context', 'core', 'process', qa)(github, context, core, { env: { QA_LABEL: 'qa-passed', ALLOWED_LABELERS: allowed } });
     return calls;
   }
   await t('qa-gate: push to draft PR removes qa-passed and fails', async () => {
@@ -124,6 +124,20 @@ const UNL_KW = 'This is a security problem.';
     const c = await runQa({ draft: true, action: 'labeled', labels: ['qa-passed'] });
     assert.deepStrictEqual(c.removed, []);
     assert.ok(c.failed && /draft/.test(c.failed));
+  });
+
+  const ev = (login) => ({ event: 'labeled', label: { name: 'qa-passed' }, actor: { login }, created_at: '2026-02-01T00:00:00Z' });
+  await t('qa-gate: allowlisted labeler passes', async () => {
+    const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], events: [ev('QianHaoQ')], allowed: 'qianhaoq, other' });
+    assert.strictEqual(c.failed, null, c.failed);
+  });
+  await t('qa-gate: non-allowlisted labeler (e.g. PR author) fails', async () => {
+    const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], events: [ev('pr-author')], allowed: 'qianhaoq' });
+    assert.ok(c.failed && /not applied by an allowed labeler/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: empty allowlist keeps legacy behaviour', async () => {
+    const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], events: [ev('anyone')] });
+    assert.strictEqual(c.failed, null, c.failed);
   });
 
   if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
