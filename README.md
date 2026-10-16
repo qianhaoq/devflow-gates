@@ -2,7 +2,7 @@
 
 qianhaoq 各仓库共用的可复用 GitHub Actions 门禁（reusable workflows，
 `on: workflow_call`）：CI 构建/测试、密钥扫描、Codex 评审门禁、人工 QA
-门禁、自动合并、部署后冒烟。本仓库为 PUBLIC，各仓库通过
+门禁、自动合并、部署后冒烟、AI 代码验收报告。本仓库为 PUBLIC，各仓库通过
 
 ```yaml
 uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
@@ -30,6 +30,7 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 | `examples/qa-gate.yml` | `qa-refresh` | `qa-refresh / QA Gate Refresh`（仅 schedule 运行，**不**挂在 PR 检查上） |
 | `examples/auto-merge.yml` | `auto-merge` | `auto-merge / Auto Merge` |
 | `examples/smoke.yml` | `smoke` | `smoke / Post-deploy Smoke` |
+| `examples/acceptance.yml` | `acceptance` | `acceptance / Acceptance Gate`（另有辅助检查 `Acceptance Config` / `Acceptance Measure`；M1 仅观察，**不要**加入分支保护） |
 
 这两个地方必须使用**完全一致**的名字：
 
@@ -282,6 +283,57 @@ concurrency:
 （检查项 / 期望 / 实际 / 结果）。见 [examples/smoke.yml](examples/smoke.yml)
 （手动 dispatch 传参，或在自己的部署工作流里直接 `uses:` 调用）。
 
+### 6. `.github/workflows/acceptance.yml` — AI 代码验收门禁（M1：仅观察）
+
+调用方：[examples/acceptance.yml](examples/acceptance.yml)，触发器**必须**是
+`pull_request`（Measure job 会执行 PR 代码），job 授予 `contents: read`、
+`pull-requests: write`（置顶评论）、`checks: read`（读取 Codex 门禁结果）。
+每个仓库用 `.github/acceptance.yml` 配置（模板与默认值：
+[templates/acceptance.yml](templates/acceptance.yml)）；配置优先从 PR **base**
+提交读取（PR 不能放宽自己的门禁），base 没有时读 PR head，都没有用默认值。
+
+| 输入 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `config_path` | string | `.github/acceptance.yml` | 配置文件路径 |
+| `timeout_minutes` | number | `10` | 每个 job 的超时 |
+
+三个 job：`Acceptance Config`（解析配置，只调 API）→ `Acceptance Measure`
+（检出 PR head、`persist-credentials: false`、只读权限，运行 setup / 测试 /
+lint 命令，结果写入 artifact）→ `Acceptance Gate`（不执行 PR 代码：汇总、
+dependency review、写置顶评论与 JSON 报告，给出结论）。
+
+| # | 指标 id | 判定 | 默认 |
+| --- | --- | --- | --- |
+| 1 | `tests` | 测试命令通过，且**变更行覆盖率** ≥ 阈值（lcov / cobertura）；未配置命令或没有覆盖率报告 → n/a | 阈值 70%，未配置命令 |
+| 2 | `tests_changed` | 改了源码就必须改测试；`no-test-needed` 标签**且** PR 正文写明理由（`reason_regex`，如 `无需测试：…`）才豁免 | 常见语言源码/测试正则 |
+| 3 | `lint` | 配置的 lint / 类型检查命令：head 的问题数不得多于 merge base（输出行数或 `count_regex` 匹配数；尽力而为） | 未配置 → n/a |
+| 4 | `size` | 变更行数（排除锁文件、`.min.*`、快照）超过阈值即告警 | 600 行 |
+| 5 | `dependencies` | 依赖清单（含 `.github/workflows/*`）有变更时跑 `actions/dependency-review-action`：已知漏洞 ≥ `fail_on_severity`、`deny_licenses` | high；依赖图不可用 → n/a |
+| 6 | `evidence` | PR 正文必须有标题匹配 `heading_regex` 且内容非空的验收/自测小节（`#` 标题或单独一行 `**粗体**`） | `自测\|验收\|Test plan\|QA` |
+| 7 | `ai_review` | 读取 head SHA 上最新的 `codex / Codex Review Gate` 检查结论，**不**重复实现 Codex 逻辑；尚无结论 → pending | `check_name` 可配 |
+
+模式：全局 `mode` 与每个指标的 `mode` 覆盖，取值 `observe`（默认：只报告，
+job 退出 0）或 `enforce`（被 enforce 的指标为 fail / error / pending 时 Gate
+失败）。n/a、disabled 永不失败。
+
+输出：
+
+- **一条置顶 PR 评论**（标记 `<!-- devflow-gates:acceptance-report -->`，
+  每次原地更新，不刷屏），表格列出每个指标的模式 / 结果 / 数值 / 说明；
+  fork PR 拿不到写权限时跳过评论，结果仍在 job summary。
+- **artifact `acceptance-report`** 内含 `acceptance-report.json`
+  （`schema_version: 1`、repo、pr、head/base SHA、overall、每个指标的
+  status/value/detail），保留 90 天，供周报汇总。
+
+与其他门禁的关系：不加/不摘任何标签；用 `GITHUB_TOKEN` 写的评论不会触发其他
+工作流（不会引起 Codex 门禁的 issue_comment 重跑）；独立的 concurrency 组
+（`acceptance-<repo>-<PR>`，cancel-in-progress）；不依赖 Copilot。
+
+已知局限（M2 前需评估）：`ai_review` 是 Acceptance 运行那一刻的快照——Codex
+门禁之后变绿不会自动刷新本报告（下一次 push / 编辑正文 / 打标签时刷新，或手动
+re-run）；Measure 的结果来自 PR 代码，enforce 时与该 PR 的 CI 同等可信；
+Config 解析失败时 Gate 被跳过（跳过 = 通过）。
+
 ## 从单仓库版本迁移
 
 1. 把 [examples/](examples/) 里的 5 个文件复制到目标仓库的
@@ -306,7 +358,8 @@ concurrency:
 
 `self-lint.yml` 在 push / pull_request 时下载 actionlint 二进制并对
 `.github/workflows/` 与 `examples/` 全量静态检查（表达式、输入类型、
-shellcheck）。
+shellcheck），并运行 `node tests/gates.test.js` 与
+`python3 tests/acceptance_test.py`（门禁内联脚本的离线测试）。
 
 ## 许可证
 

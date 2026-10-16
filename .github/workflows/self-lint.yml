@@ -49,3 +49,8 @@ jobs:
       # mocked GitHub API — no network, no tokens.
       - name: Run gate logic tests
         run: node tests/gates.test.js
+
+      # Acceptance Gate inline Python (config resolution, diff/coverage
+      # parsing, metric evaluation, sticky-comment rendering).
+      - name: Run acceptance gate tests
+        run: python3 tests/acceptance_test.py

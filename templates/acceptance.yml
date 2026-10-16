@@ -1,0 +1,56 @@
+# Per-repo Acceptance Gate config — copy to YOUR_REPO/.github/acceptance.yml.
+# Every key is optional; omitted keys use the defaults shown here.
+# The gate reads this file from the PR BASE commit when it exists there
+# (a PR cannot loosen its own gate), else from the PR head, else defaults.
+
+mode: observe            # observe (report only, exit 0) | enforce
+
+setup:                   # used by tests and lint (runs PR code, no secrets)
+  node_version: ''       # e.g. '20' → actions/setup-node
+  python_version: ''     # e.g. '3.12' → actions/setup-python
+  command: ''            # e.g. 'npm ci' / 'pip install -r requirements.txt'
+  working_directory: '.'
+  timeout_seconds: 240
+
+metrics:
+  tests:                 # 1. tests pass + changed-line coverage
+    enabled: true
+    # mode: enforce      # per-metric override of the global mode
+    command: ''          # '' → n/a. e.g. 'npx jest --coverage --coverageReporters=lcov'
+                         #        or 'pytest --cov --cov-report=xml'
+    coverage_file: ''    # '' → auto: coverage/lcov.info, lcov.info, coverage.lcov,
+                         #       coverage/cobertura-coverage.xml, coverage.xml, cobertura.xml
+    threshold: 70        # % of coverable changed lines; no report → n/a
+    timeout_seconds: 300
+
+  tests_changed:         # 2. source changed ⇒ tests changed
+    enabled: true
+    source_regex: '\.(py|js|jsx|ts|tsx|mjs|cjs|go|rb|java|kt|kts|rs|cs|php|swift|c|cc|cpp|h|hpp|vue|svelte|dart|scala|lua|sh)$'
+    test_regex: '(^|/)(tests?|__tests__|spec|specs|e2e)/|(^|/)test_[^/]*\.py$|_test\.(py|go|rb)$|\.(test|spec)\.[cm]?[jt]sx?$|Tests?\.(java|kt|cs|swift)$'
+    exempt_label: no-test-needed   # exempts ONLY if reason_regex matches the PR body
+    reason_regex: '(no[-_ ]test[-_ ]needed|无需测试|免测|不需要测试)[^\n]*?[:：]\s*\S[^\n]{5,}'
+
+  lint:                  # 3. no new lint/type errors vs merge base (best-effort)
+    enabled: true
+    commands: []         # e.g. ['npx eslint -f unix .', {run: 'npx tsc --noEmit --pretty false', count_regex: 'error TS'}]
+                         # count = lines of output, or matches of count_regex
+    compare_base: true   # also run on the merge base (setup.command runs there too)
+    timeout_seconds: 120
+
+  size:                  # 4. changed lines
+    enabled: true
+    threshold: 600
+    exclude_regex: '(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock|uv\.lock|Cargo\.lock|go\.sum|Gemfile\.lock|composer\.lock)$|\.min\.(js|css)$|\.snap$'
+
+  dependencies:          # 5. actions/dependency-review-action on manifest changes
+    enabled: true
+    fail_on_severity: high   # low | moderate | high | critical
+    deny_licenses: []        # SPDX ids, e.g. [GPL-3.0, AGPL-3.0]
+
+  evidence:              # 6. PR body has a non-empty acceptance / self-test section
+    enabled: true
+    heading_regex: '自测|验收|Test plan|QA'
+
+  ai_review:             # 7. latest result of the Codex gate check on the head SHA
+    enabled: true
+    check_name: 'codex / Codex Review Gate'

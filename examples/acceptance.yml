@@ -1,0 +1,35 @@
+# Example caller for the reusable Acceptance Gate — copy to
+# YOUR_REPO/.github/workflows/acceptance.yml and (optionally) add
+# YOUR_REPO/.github/acceptance.yml (see templates/acceptance.yml; defaults
+# apply when it is missing).
+#
+# Check names produced (job id `acceptance`):
+#   - "acceptance / Acceptance Gate"     ← verdict
+#   - "acceptance / Acceptance Config"   ← helper
+#   - "acceptance / Acceptance Measure"  ← helper (runs PR code)
+# M1: observe-only — do NOT add it to branch protection yet.
+#
+# MUST be `pull_request` (never pull_request_target): the Measure job
+# executes PR code. `edited` re-evaluates after PR body changes
+# (evidence / no-test-needed reason); `labeled`/`unlabeled` pick up
+# `no-test-needed`. The gate never adds or removes labels.
+
+name: Acceptance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited, labeled, unlabeled]
+
+permissions: {}
+
+jobs:
+  acceptance:
+    permissions:
+      contents: read
+      pull-requests: write   # sticky report comment
+      checks: read           # read the Codex gate result
+    # Pin to a reviewed commit SHA of qianhaoq/devflow-gates.
+    uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@main
+    # with:
+    #   config_path: .github/acceptance.yml
+    #   timeout_minutes: 10
