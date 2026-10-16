@@ -104,7 +104,7 @@ jobs:
           python3 -c 'import yaml' 2>/dev/null || pip install --quiet 'pyyaml==6.0.2'
           python3 - <<'PY'
           # >>> acceptance-config-core
-          import base64, copy, json, os, re, urllib.error, urllib.parse, urllib.request
+          import base64, copy, json, math, os, re, urllib.error, urllib.parse, urllib.request
 
           DEFAULT_SOURCE_REGEX = r'\.(py|js|jsx|ts|tsx|mjs|cjs|go|rb|java|kt|kts|rs|cs|php|swift|c|cc|cpp|h|hpp|vue|svelte|dart|scala|lua|sh)$'
           DEFAULT_TEST_REGEX = (r'(^|/)(tests?|__tests__|spec|specs|e2e)/|(^|/)test_[^/]*\.py$|_test\.(py|go|rb)$'
@@ -170,14 +170,24 @@ jobs:
                   if not isinstance(m, dict):
                       warnings.append(f'metrics.{mid} is not a mapping; using defaults')
                       m = cfg['metrics'][mid] = copy.deepcopy(DEFAULTS['metrics'][mid])
-                  m['enabled'] = bool(m.get('enabled', True))
+                  if not isinstance(m.get('enabled', True), bool):
+                      warnings.append(f'metrics.{mid}.enabled must be true/false; using true')
+                      m['enabled'] = True
+                  m['enabled'] = m.get('enabled', True)
                   if 'mode' in m and m['mode'] not in MODES:
                       warnings.append(f"metrics.{mid}.mode {m['mode']!r} invalid; inheriting {cfg['mode']}")
                       del m['mode']
                   m['mode'] = m.get('mode') or cfg['mode']
                   if 'threshold' in DEFAULTS['metrics'][mid]:
                       try:
-                          m['threshold'] = float(m['threshold'])
+                          v = m['threshold']
+                          if isinstance(v, bool):
+                              raise TypeError
+                          v = float(v)
+                          hi = 100.0 if mid == 'tests' else float('inf')
+                          if not (math.isfinite(v) and 0 <= v <= hi):
+                              raise ValueError
+                          m['threshold'] = v
                       except (TypeError, ValueError):
                           warnings.append(f'metrics.{mid}.threshold invalid; using default')
                           m['threshold'] = float(DEFAULTS['metrics'][mid]['threshold'])
@@ -195,9 +205,13 @@ jobs:
               norm = []
               for c in cmds:
                   if isinstance(c, str) and c.strip():
-                      norm.append({'run': c, 'count_regex': ''})
+                      norm.append({'run': c, 'count_regex': '', 'ok_exits': [0, 1]})
                   elif isinstance(c, dict) and str(c.get('run', '')).strip():
-                      norm.append({'run': str(c['run']), 'count_regex': str(c.get('count_regex') or '')})
+                      ok = c.get('ok_exits', [0, 1])
+                      if not (isinstance(ok, list) and ok and all(isinstance(x, int) and not isinstance(x, bool) for x in ok)):
+                          warnings.append('metrics.lint.commands[].ok_exits must be a list of ints; using [0, 1]')
+                          ok = [0, 1]
+                      norm.append({'run': str(c['run']), 'count_regex': str(c.get('count_regex') or ''), 'ok_exits': ok})
                   else:
                       warnings.append('metrics.lint.commands entry ignored (needs a string or {run: ...})')
               cfg['metrics']['lint']['commands'] = norm
@@ -504,7 +518,7 @@ jobs:
               for c in lint['commands']:
                   h = run(c['run'], wd, to)
                   log('lint head: ' + c['run'], h)
-                  entry = {'run': c['run'], 'head': None if h['timed_out'] else count_issues(h['output'], c['count_regex']),
+                  entry = {'run': c['run'], 'ok_exits': c.get('ok_exits', [0, 1]), 'head': None if h['timed_out'] else count_issues(h['output'], c['count_regex']),
                            'head_exit': h['exit'], 'base': None, 'base_exit': None}
                   if base_dir:
                       b = run(c['run'], os.path.join(base_dir, workdir), to)
@@ -573,6 +587,7 @@ jobs:
           DR_VULNERABLE: ${{ steps.depreview.outputs.vulnerable-changes }}
           DR_INVALID_LICENSE: ${{ steps.depreview.outputs.invalid-license-changes }}
           DR_DENIED: ${{ steps.depreview.outputs.denied-changes }}
+          DR_CHANGES: ${{ steps.depreview.outputs.dependency-changes }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           mkdir -p "$RUNNER_TEMP/report"
@@ -588,7 +603,7 @@ jobs:
           MANIFEST_REGEX = (r'(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|'
                             r'requirements[^/]*\.(txt|in)|pyproject\.toml|poetry\.lock|Pipfile(\.lock)?|uv\.lock|setup\.(py|cfg)|'
                             r'go\.(mod|sum)|Gemfile(\.lock)?|Cargo\.(toml|lock)|pom\.xml|build\.gradle(\.kts)?|'
-                            r'composer\.(json|lock)|[^/]+\.csproj|packages\.config)$|(^|/)\.github/workflows/[^/]+\.ya?ml$')
+                            r'composer\.(json|lock)|[^/]+\.csproj|packages\.config|pubspec\.(yaml|lock)|Package\.(swift|resolved)|mix\.(exs|lock))$|(^|/)\.github/workflows/[^/]+\.ya?ml$')
 
           def r(status, value='', detail=''):
               return {'status': status, 'value': value, 'detail': detail}
@@ -650,7 +665,7 @@ jobs:
                   return r('n/a', 'base setup failed', 'setup failed on the merge base; cannot compare')
               if not lt.get('compare_base', True):
                   # Absolute mode: every command must exit 0 on head.
-                  bad = [c for c in lt['commands'] if c.get('head_exit') != 0]
+                  bad = [c for c in lt['commands'] if c.get('head_exit') != 0]  # absolute: only 0 is clean
                   val = ', '.join('timeout' if c.get('head_exit') is None else f"exit {c.get('head_exit')}"
                                   for c in lt['commands'])
                   if bad:
@@ -659,15 +674,18 @@ jobs:
               new, parts, unknown = 0, [], 0
               for c in lt['commands']:
                   h, b = c.get('head'), c.get('base')
-                  # 126/127 = command not executable / not found: the count is a
-                  # shell error, not lint output — never compare it.
-                  if c.get('head_exit') in (126, 127):
+                  # An exit outside ok_exits (default 0/1; e.g. 127 not found, 2 crash)
+                  # means the output is an error, not lint findings — never compare it.
+                  ok = c.get('ok_exits') or [0, 1]
+                  bad_h = c.get('head_exit') is not None and c.get('head_exit') not in ok
+                  bad_b = c.get('base_exit') is not None and c.get('base_exit') not in ok
+                  if bad_h:
                       h = None
-                  if c.get('base_exit') in (126, 127):
+                  if bad_b:
                       b = None
-                  if h is None and c.get('head_exit') in (126, 127):
+                  if bad_h:
                       unknown += 1
-                      parts.append('not runnable')
+                      parts.append(f"head exit {c.get('head_exit')}")
                   elif h is None:
                       unknown += 1
                       parts.append('timeout')
@@ -681,7 +699,7 @@ jobs:
               if new:
                   return r('fail', val, f'{new} new issue(s) vs base')
               if unknown:
-                  return r('n/a', val, 'could not compare with base (command not runnable, timeout or base run unavailable)')
+                  return r('n/a', val, 'could not compare with base (abnormal exit, timeout or base run unavailable)')
               return r('pass', val, 'issue count base→head')
 
           def eval_size(m, files):
@@ -711,11 +729,13 @@ jobs:
               return v if isinstance(v, list) else []
 
           def eval_dependencies(m, files, dr):
+              # Applicability comes from the action (it knows every supported
+              # ecosystem); MANIFEST_REGEX is only used when the action did not run.
               manifests = [f['filename'] for f in files if re.search(MANIFEST_REGEX, f['filename'])]
-              if not manifests:
+              outcome = dr.get('outcome') or ''
+              changes = _jl(dr.get('changes'))
+              if not outcome and not manifests:
                   return r('pass', 'no manifest changes', '')
-              if (dr.get('outcome') or '') == 'success':
-                  return r('pass', f'{len(manifests)} manifest(s)', f"no vulnerabilities ≥ {m['fail_on_severity']}, no license issues")
               vul, lic, den = _jl(dr.get('vulnerable')), _jlic(dr.get('invalid_license')), _jl(dr.get('denied'))
               if vul or lic or den:
                   bits = []
@@ -727,9 +747,10 @@ jobs:
                       bits.append(f'{len(den)} denied')
                   names = sorted({str(x.get('name')) for x in vul + lic + den if isinstance(x, dict)})[:5]
                   return r('fail', ', '.join(bits), ', '.join(names))
-              outcome = dr.get('outcome') or ''
               if outcome == 'success':
-                  return r('pass', f'{len(manifests)} manifest(s)', f"no vulnerabilities ≥ {m['fail_on_severity']}, no license issues")
+                  if not changes and not manifests:
+                      return r('pass', 'no dependency changes', '')
+                  return r('pass', f'{len(changes)} change(s)', f"no vulnerabilities ≥ {m['fail_on_severity']}, no license issues")
               return r('n/a', 'n/a', f'dependency-review-action {outcome or "did not run"} (dependency graph unavailable?)')
 
           HEADING = re.compile(r'^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$|^\s{0,3}\*\*(.+?)\*\*\s*:?\s*$')
@@ -762,7 +783,7 @@ jobs:
               runs = [c for c in check_runs if c.get('name') == name]
               if not runs:
                   return r('pending', 'not found', f'no `{name}` check on this head yet')
-              runs.sort(key=lambda c: (c.get('started_at') or '', c.get('id') or 0))
+              runs.sort(key=lambda c: c.get('id') or 0)  # creation order (queued reruns have no started_at)
               c = runs[-1]
               if c.get('status') != 'completed':
                   return r('pending', c.get('status'), f'`{name}` still running')
@@ -861,7 +882,8 @@ jobs:
                   measure = json.load(f)
           mres = os.environ.get('MEASURE_RESULT', '')
           dr = {'outcome': os.environ.get('DR_OUTCOME'), 'vulnerable': os.environ.get('DR_VULNERABLE'),
-                'invalid_license': os.environ.get('DR_INVALID_LICENSE'), 'denied': os.environ.get('DR_DENIED')}
+                'invalid_license': os.environ.get('DR_INVALID_LICENSE'), 'denied': os.environ.get('DR_DENIED'),
+                'changes': os.environ.get('DR_CHANGES')}
           M = cfg['metrics']
           results = {
               'tests': eval_tests(M['tests'], measure, mres),

@@ -178,7 +178,11 @@ t('gate: size threshold excludes lockfiles', _size)
 def _deps():
     m = cfg()['metrics']['dependencies']
     e = G['eval_dependencies']
-    assert e(m, [F('a.py')], {'outcome': 'failure'})['status'] == 'pass'
+    assert e(m, [F('a.py')], {'outcome': ''})['status'] == 'pass'
+    assert e(m, [F('a.py')], {'outcome': 'success', 'changes': '[]'})['status'] == 'pass'
+    assert e(m, [F('app/pubspec.lock')], {'outcome': ''})['status'] == 'n/a'
+    x = e(m, [F('weird.lockfile')], {'outcome': 'failure', 'vulnerable': '[{"name":"x"}]'})
+    assert x['status'] == 'fail', x
     assert e(m, [F('package.json')], {'outcome': 'success'})['status'] == 'pass'
     assert e(m, [F('package.json')], {'outcome': 'failure'})['status'] == 'n/a'
     assert e(m, [F('.github/workflows/ci.yml')], {'outcome': ''})['status'] == 'n/a'
@@ -224,6 +228,18 @@ def _round2():
     assert G['eval_lint'](m, {'lint': {'compare_base': False, 'commands': [{'head': 0, 'base': None, 'head_exit': 0}]}}, 's')['status'] == 'pass'
     tm = dict(cfg()['metrics']['tests'], command='pytest')
     assert G['eval_tests'](tm, {'tests': {'exit': 0, 'coverage': None, 'coverage_error': 'lcov.info: ValueError'}}, 's')['status'] == 'error'
+    c, w = C['resolve']({'metrics': {'tests': {'threshold': float('nan'), 'enabled': None}, 'size': {'threshold': -1, 'enabled': 'false'}}})
+    assert c['metrics']['tests']['threshold'] == 70 and c['metrics']['size']['threshold'] == 600 and len(w) == 4, w
+    assert c['metrics']['tests']['enabled'] is True
+    assert C['resolve']({'metrics': {'tests': {'threshold': 101}}})[0]['metrics']['tests']['threshold'] == 70
+    assert G['eval_lint'](m, {'lint': {'commands': [{'head': 1, 'base': 1, 'head_exit': 2, 'base_exit': 2}]}}, 's')['status'] == 'n/a'
+    mm = cfg({'metrics': {'lint': {'commands': [{'run': 'tsc', 'ok_exits': [0, 1, 2]}]}}})['metrics']['lint']
+    assert mm['commands'][0]['ok_exits'] == [0, 1, 2]
+    assert G['eval_lint'](mm, {'lint': {'commands': [{'head': 3, 'base': 1, 'head_exit': 2, 'base_exit': 2, 'ok_exits': [0, 1, 2]}]}}, 's')['status'] == 'fail'
+    n = 'codex / Codex Review Gate'
+    q = [{'name': n, 'status': 'completed', 'conclusion': 'success', 'started_at': '2026-01-01', 'id': 5},
+         {'name': n, 'status': 'queued', 'started_at': None, 'id': 9}]
+    assert G['eval_ai_review'](cfg()['metrics']['ai_review'], q)['status'] == 'pending'
 t('round 2: blank regex, lint setup failure, compare_base false, coverage parse error', _round2)
 
 def _ev():

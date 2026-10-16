@@ -32,7 +32,8 @@ metrics:
 
   lint:                  # 3. no new lint/type errors vs merge base (best-effort)
     enabled: true
-    commands: []         # e.g. ['npx eslint -f unix .', {run: 'npx tsc --noEmit --pretty false', count_regex: 'error TS'}]
+    commands: []         # e.g. ['npx eslint -f unix .', {run: 'npx tsc --noEmit --pretty false', count_regex: 'error TS', ok_exits: [0, 1, 2]}]
+                         # an exit outside ok_exits (default [0, 1]) = crashed → not compared (n/a)
                          # count = lines of output, or matches of count_regex
     compare_base: true   # true: count must not grow vs merge base; false: every command must exit 0 on head
     timeout_seconds: 120
