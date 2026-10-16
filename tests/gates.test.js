@@ -176,6 +176,43 @@ const UNL_KW = 'This is a security problem.';
     assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
   });
 
+  // Refresh: dispatch runs on the PR branch count (crawl PRs created with GITHUB_TOKEN).
+  for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
+    const refresh = scripts(file)[1];
+    async function runRefresh(runsByEvent) {
+      const reran = [];
+      const github = {
+        rest: {
+          actions: {
+            getWorkflowRun: async () => ({ data: { workflow_id: 7, name: 'Gate' } }),
+            listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
+            reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
+          },
+          pulls: { list: async () => ({}) },
+        },
+        paginate: async () => [{ number: 9, draft: false, head: { sha: 'h1', ref: 'crawl/auto' } }],
+      };
+      const core = { info() {}, warning() {}, setFailed(m) { throw new Error(m); } };
+      const context = { runId: 1, repo: { owner: 'o', repo: 'r' }, payload: {} };
+      await new AsyncFunction('github', 'context', 'core', 'process', refresh)(github, context, core, { env: {} });
+      return reran;
+    }
+    await t(`${file} refresh: re-runs failed workflow_dispatch run on the PR branch`, async () => {
+      const r = await runRefresh({ workflow_dispatch: [{ id: 5, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'crawl/auto', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }] });
+      assert.deepStrictEqual(r, [5]);
+    });
+    await t(`${file} refresh: ignores dispatch on another branch`, async () => {
+      const r = await runRefresh({ workflow_dispatch: [{ id: 6, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'main', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }] });
+      assert.deepStrictEqual(r, []);
+    });
+    await t(`${file} refresh: newest run decides (later target success wins)`, async () => {
+      const r = await runRefresh({
+        workflow_dispatch: [{ id: 5, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'crawl/auto', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }],
+        pull_request_target: [{ id: 8, event: 'pull_request_target', head_sha: 'h1', conclusion: 'success', created_at: '2026-10-16T02:00:00Z' }] });
+      assert.deepStrictEqual(r, []);
+    });
+  }
+
   if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
   console.log('all passed');
 })();

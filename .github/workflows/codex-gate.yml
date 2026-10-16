@@ -507,18 +507,26 @@ jobs:
               if (pr.draft) continue;
               scanned += 1;
               const sha = pr.head.sha;
-              const { data: runsData } = await github.rest.actions.listWorkflowRuns({
-                owner,
-                repo,
-                workflow_id: workflowId,
-                head_sha: sha,
-                event: 'pull_request_target',
-                status: 'completed',
-                per_page: 20,
-              });
-              const runs = (runsData.workflow_runs || [])
-                .filter((r) => r.head_sha === sha)
-                .sort((a, b) => (b.run_number - a.run_number) || ((b.id || 0) - (a.id || 0)));
+              // Gate runs whose check sits on this PR head: pull_request_target
+              // runs, plus workflow_dispatch runs dispatched ON the PR branch
+              // (e.g. crawl.yml for a GITHUB_TOKEN-created PR, where no
+              // pull_request(_target) event ever fires). A dispatch on another
+              // ref has a different head_sha and is excluded.
+              const runs = [];
+              for (const event of ['pull_request_target', 'workflow_dispatch']) {
+                const { data: runsData } = await github.rest.actions.listWorkflowRuns({
+                  owner,
+                  repo,
+                  workflow_id: workflowId,
+                  head_sha: sha,
+                  event,
+                  status: 'completed',
+                  per_page: 20,
+                });
+                runs.push(...(runsData.workflow_runs || []).filter((r) => r.head_sha === sha
+                  && (event === 'pull_request_target' || r.head_branch === pr.head.ref)));
+              }
+              runs.sort((a, b) => (Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)) || ((b.id || 0) - (a.id || 0)));
               const latest = runs[0];
               // Only re-run when the gate check on this head is failing:
               // the latest completed pull_request_target run's conclusion
@@ -532,7 +540,7 @@ jobs:
               });
               rerun += 1;
               core.info(
-                `PR #${pr.number}: re-running failed jobs of run ${latest.id} (pull_request_target, head ${sha.slice(0, 7)})`
+                `PR #${pr.number}: re-running failed jobs of run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`
               );
             }
             core.info(
