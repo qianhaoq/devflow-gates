@@ -1,0 +1,1007 @@
+# Acceptance Gate — reusable, per-repo-configurable AI code acceptance
+# report (milestone M1: observe-only by default).
+#
+# Called from a repo's own workflow (see examples/acceptance.yml):
+#   uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@<sha>
+#
+# Check names with the example caller (job id `acceptance`):
+#   - "acceptance / Acceptance Gate"     ← the verdict (the one to require, M2+)
+#   - "acceptance / Acceptance Config"   ← helper (resolves config)
+#   - "acceptance / Acceptance Measure"  ← helper (runs PR code: tests/lint)
+#
+# Config: `.github/acceptance.yml` in the caller repo (input config_path).
+# Read from the PR BASE commit when it exists there (a PR cannot loosen its
+# own gate); otherwise from the PR head (first-adoption PR); otherwise the
+# built-in defaults below. See templates/acceptance.yml.
+#
+# Metrics (each: enabled + optional per-metric mode + threshold):
+#   1. tests         test command passes; changed-line coverage >= threshold
+#                    (lcov / cobertura; no command or no report → n/a)
+#   2. tests_changed source files changed ⇒ test files changed; label
+#                    `no-test-needed` exempts only with a reason in the PR body
+#   3. lint          configured lint/type commands: issue count on head must
+#                    not exceed the count on the merge base (best-effort)
+#   4. size          changed lines (excluding lockfiles etc.) <= threshold
+#   5. dependencies  actions/dependency-review-action (vulnerabilities +
+#                    licenses) when a dependency manifest changed
+#   6. evidence      PR body has a non-empty heading matching heading_regex
+#   7. ai_review     reads the latest "codex / Codex Review Gate" check run
+#                    on the head SHA (does NOT re-implement the Codex logic)
+#
+# Modes: `observe` (default, M1) reports and always exits 0; `enforce`
+# fails the Gate job when an enforced metric is fail / error / pending.
+# n/a and disabled never fail.
+#
+# Output: one sticky PR comment (marker below, updated in place) and the
+# artifact `acceptance-report` containing acceptance-report.json.
+#
+# Security:
+#   - Caller MUST trigger on `pull_request` (never pull_request_target):
+#     Acceptance Measure checks out and EXECUTES PR code (setup/test/lint
+#     commands). It runs with contents: read only and
+#     persist-credentials: false, and nothing secret is passed to it.
+#   - Acceptance Config / Gate never execute PR code; they only call the
+#     GitHub API, yaml.safe_load the config and read Measure's JSON
+#     artifact (which is PR-controlled data — it is reported, and in
+#     enforce mode trusted only as much as the PR's own CI is).
+#   - Gate needs pull-requests: write for the sticky comment (fork PRs get
+#     a read-only token: the comment is skipped with a warning, the job
+#     summary still has the table) and checks: read for the Codex result.
+#     It never adds or removes labels. Comments made with GITHUB_TOKEN do
+#     not trigger other workflows (so no issue_comment re-runs of the
+#     Codex gate).
+
+name: Reusable Acceptance Gate
+
+on:
+  workflow_call:
+    inputs:
+      config_path:
+        description: 'Path of the per-repo config file'
+        required: false
+        type: string
+        default: '.github/acceptance.yml'
+      timeout_minutes:
+        description: 'Per-job timeout in minutes'
+        required: false
+        type: number
+        default: 10
+
+# One evaluation per PR; a newer event cancels the in-flight one.
+concurrency:
+  group: acceptance-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  config:
+    name: Acceptance Config
+    if: github.event.pull_request.number
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
+    permissions:
+      contents: read
+    outputs:
+      config: ${{ steps.cfg.outputs.config }}
+      node_version: ${{ steps.cfg.outputs.node_version }}
+      python_version: ${{ steps.cfg.outputs.python_version }}
+      deps_enabled: ${{ steps.cfg.outputs.deps_enabled }}
+      deps_fail_on_severity: ${{ steps.cfg.outputs.deps_fail_on_severity }}
+      deps_deny_licenses: ${{ steps.cfg.outputs.deps_deny_licenses }}
+    steps:
+      - name: Resolve config (base → head → defaults)
+        id: cfg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          CONFIG_PATH: ${{ inputs.config_path }}
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet 'pyyaml==6.0.2'
+          python3 - <<'PY'
+          # >>> acceptance-config-core
+          import base64, copy, json, math, os, re, urllib.error, urllib.parse, urllib.request
+
+          DEFAULT_SOURCE_REGEX = r'\.(py|js|jsx|ts|tsx|mjs|cjs|go|rb|java|kt|kts|rs|cs|php|swift|c|cc|cpp|h|hpp|vue|svelte|dart|scala|lua|sh)$'
+          DEFAULT_TEST_REGEX = (r'(^|/)(tests?|__tests__|spec|specs|e2e)/|(^|/)test_[^/]*\.py$|_test\.(py|go|rb)$'
+                                r'|\.(test|spec)\.[cm]?[jt]sx?$|Tests?\.(java|kt|cs|swift)$')
+          DEFAULTS = {
+              'mode': 'observe',
+              'setup': {'node_version': '', 'python_version': '', 'command': '', 'working_directory': '.',
+                        'timeout_seconds': 240},
+              'metrics': {
+                  'tests': {'enabled': True, 'command': '', 'coverage_file': '', 'threshold': 70,
+                            'timeout_seconds': 300},
+                  'tests_changed': {'enabled': True, 'source_regex': DEFAULT_SOURCE_REGEX,
+                                    'test_regex': DEFAULT_TEST_REGEX, 'exempt_label': 'no-test-needed',
+                                    'reason_regex': r'(no[-_ ]test[-_ ]needed|无需测试|免测|不需要测试)[^\n]*?[:：]\s*\S[^\n]{5,}'},
+                  'lint': {'enabled': True, 'commands': [], 'compare_base': True, 'timeout_seconds': 120},
+                  'size': {'enabled': True, 'threshold': 600,
+                           'exclude_regex': r'(^|/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|poetry\.lock|Pipfile\.lock|uv\.lock|Cargo\.lock|go\.sum|Gemfile\.lock|composer\.lock)$|\.min\.(js|css)$|\.snap$'},
+                  'dependencies': {'enabled': True, 'fail_on_severity': 'high', 'deny_licenses': []},
+                  'evidence': {'enabled': True, 'heading_regex': r'自测|验收|Test plan|QA'},
+                  'ai_review': {'enabled': True, 'check_name': 'codex / Codex Review Gate'},
+              },
+          }
+          METRIC_IDS = list(DEFAULTS['metrics'])
+          MODES = ('observe', 'enforce')
+
+          def deep_merge(base, over):
+              out = copy.deepcopy(base)
+              for k, v in (over or {}).items():
+                  if isinstance(v, dict) and isinstance(out.get(k), dict):
+                      out[k] = deep_merge(out[k], v)
+                  else:
+                      out[k] = v
+              return out
+
+          def resolve(raw):
+              """raw: parsed YAML (or None). Returns (config, warnings)."""
+              warnings = []
+              if raw is None:
+                  raw = {}
+              if not isinstance(raw, dict):
+                  return copy.deepcopy(DEFAULTS), ['config is not a mapping; using defaults']
+              # A blank section (`metrics:` / `setup:` / `metrics.tests:`) loads as
+              # None: treat it as "use defaults", never let it replace a mapping.
+              raw = {k: v for k, v in raw.items() if v is not None}
+              if isinstance(raw.get('metrics'), dict):
+                  raw['metrics'] = {k: v for k, v in raw['metrics'].items() if v is not None}
+              for k in ('setup', 'metrics'):
+                  if k in raw and not isinstance(raw[k], dict):
+                      warnings.append(f'{k} is not a mapping; using defaults')
+                      del raw[k]
+              for k in raw:
+                  if k not in DEFAULTS:
+                      warnings.append(f'unknown top-level key {k!r} ignored')
+              for kk in (raw.get('setup') or {}):
+                  if kk not in DEFAULTS['setup']:
+                      warnings.append(f'unknown key setup.{kk!r} ignored (typo?)')
+              for k, v in (raw.get('metrics') or {}).items():
+                  if k not in DEFAULTS['metrics']:
+                      warnings.append(f'unknown metric {k!r} ignored')
+                  elif isinstance(v, dict):
+                      for kk in v:
+                          if kk not in DEFAULTS['metrics'][k] and kk != 'mode':
+                              warnings.append(f'unknown key metrics.{k}.{kk!r} ignored (typo?)')
+              cfg = deep_merge(DEFAULTS, {k: v for k, v in raw.items() if k in DEFAULTS})
+              cfg['metrics'] = {k: cfg['metrics'][k] for k in METRIC_IDS}
+              if cfg['mode'] not in MODES:
+                  warnings.append(f"mode {cfg['mode']!r} invalid; using observe")
+                  cfg['mode'] = 'observe'
+              for mid, m in cfg['metrics'].items():
+                  if not isinstance(m, dict):
+                      warnings.append(f'metrics.{mid} is not a mapping; using defaults')
+                      m = cfg['metrics'][mid] = copy.deepcopy(DEFAULTS['metrics'][mid])
+                  if not isinstance(m.get('enabled', True), bool):
+                      warnings.append(f'metrics.{mid}.enabled must be true/false; using true')
+                      m['enabled'] = True
+                  m['enabled'] = m.get('enabled', True)
+                  if 'mode' in m and m['mode'] not in MODES:
+                      warnings.append(f"metrics.{mid}.mode {m['mode']!r} invalid; inheriting {cfg['mode']}")
+                      del m['mode']
+                  m['mode'] = m.get('mode') or cfg['mode']
+                  if 'threshold' in DEFAULTS['metrics'][mid]:
+                      try:
+                          v = m['threshold']
+                          if isinstance(v, bool):
+                              raise TypeError
+                          v = float(v)
+                          hi = 100.0 if mid == 'tests' else float('inf')
+                          if not (math.isfinite(v) and 0 <= v <= hi):
+                              raise ValueError
+                          m['threshold'] = v
+                      except (TypeError, ValueError):
+                          warnings.append(f'metrics.{mid}.threshold invalid; using default')
+                          m['threshold'] = float(DEFAULTS['metrics'][mid]['threshold'])
+                  for key in [k for k in DEFAULTS['metrics'][mid] if k.endswith('_regex')]:
+                      try:
+                          if not isinstance(m.get(key), str) or (not m[key] and key != 'exclude_regex'):
+                              raise TypeError(key)
+                          re.compile(m[key])
+                      except (re.error, TypeError):
+                          warnings.append(f'metrics.{mid}.{key} invalid regex; using default')
+                          m[key] = DEFAULTS['metrics'][mid][key]
+              if not isinstance(cfg['metrics']['lint'].get('compare_base', True), bool):
+                  warnings.append('metrics.lint.compare_base must be true/false; using true')
+                  cfg['metrics']['lint']['compare_base'] = True
+              cmds = cfg['metrics']['lint'].get('commands') or []
+              if isinstance(cmds, (str, dict)):
+                  cmds = [cmds]
+              norm = []
+              for c in cmds:
+                  if isinstance(c, str) and c.strip():
+                      norm.append({'run': c, 'count_regex': '', 'ok_exits': [0, 1]})
+                  elif isinstance(c, dict) and str(c.get('run', '')).strip():
+                      cr = str(c.get('count_regex') or '')
+                      try:
+                          re.compile(cr)
+                      except re.error:
+                          warnings.append('metrics.lint.commands[].count_regex invalid; counting output lines')
+                          c = dict(c, count_regex='')
+                      ok = c.get('ok_exits', [0, 1])
+                      if not (isinstance(ok, list) and ok and all(isinstance(x, int) and not isinstance(x, bool) for x in ok)):
+                          warnings.append('metrics.lint.commands[].ok_exits must be a list of ints; using [0, 1]')
+                          ok = [0, 1]
+                      norm.append({'run': str(c['run']), 'count_regex': str(c.get('count_regex') or ''), 'ok_exits': ok})
+                  else:
+                      warnings.append('metrics.lint.commands entry ignored (needs a string or {run: ...})')
+              cfg['metrics']['lint']['commands'] = norm
+              dl = cfg['metrics']['dependencies'].get('deny_licenses') or []
+              cfg['metrics']['dependencies']['deny_licenses'] = [dl] if isinstance(dl, str) else [str(x) for x in dl]
+              sev = str(cfg['metrics']['dependencies'].get('fail_on_severity') or 'high').lower()
+              if sev not in ('low', 'moderate', 'high', 'critical'):
+                  warnings.append('metrics.dependencies.fail_on_severity invalid; using high')
+                  sev = 'high'
+              cfg['metrics']['dependencies']['fail_on_severity'] = sev
+              return cfg, warnings
+          # <<< acceptance-config-core
+
+          def fetch(repo, path, ref):
+              url = (f"{os.environ.get('GITHUB_API_URL', 'https://api.github.com')}/repos/{repo}/contents/"
+                     f"{urllib.parse.quote(path)}?ref={ref}")
+              req = urllib.request.Request(url, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'})
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return base64.b64decode(json.load(r)['content']).decode('utf-8')
+              except urllib.error.HTTPError as e:
+                  if e.code == 404:
+                      return None
+                  raise
+
+          import yaml
+          path = os.environ['CONFIG_PATH']
+          source, raw, warnings = 'defaults', None, []
+          for label, repo, ref in (('base', os.environ['REPO'], os.environ['BASE_SHA']),
+                                   ('head', os.environ['HEAD_REPO'] or os.environ['REPO'], os.environ['HEAD_SHA'])):
+              text = fetch(repo, path, ref)
+              if text is not None:
+                  source = f'{label}:{path}'
+                  try:
+                      raw = yaml.safe_load(text)
+                  except yaml.YAMLError as e:
+                      warnings.append(f'{path} ({label}) is not valid YAML ({e.__class__.__name__}); using defaults')
+                      raw = None
+                  break
+          cfg, w = resolve(raw)
+          cfg['_source'] = source
+          cfg['_warnings'] = warnings + w
+          print(f'config source: {source}')
+          for x in cfg['_warnings']:
+              print(f'::warning::acceptance config: {x}')
+          dep = cfg['metrics']['dependencies']
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write('config<<ACC_EOF_7f3a\n' + json.dumps(cfg, ensure_ascii=False) + '\nACC_EOF_7f3a\n')
+              out.write(f"node_version={str(cfg['setup'].get('node_version') or '')}\n")
+              out.write(f"python_version={str(cfg['setup'].get('python_version') or '')}\n")
+              out.write(f"deps_enabled={'true' if dep['enabled'] else 'false'}\n")
+              out.write(f"deps_fail_on_severity={dep['fail_on_severity']}\n")
+              out.write(f"deps_deny_licenses={','.join(dep['deny_licenses'])}\n")
+          PY
+
+  measure:
+    name: Acceptance Measure
+    needs: config
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out PR head (no credentials kept)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: needs.config.outputs.node_version != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.config.outputs.node_version }}
+
+      - name: Set up Python
+        if: needs.config.outputs.python_version != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.config.outputs.python_version }}
+
+      # Runs the configured (PR-controlled) commands. Never fails the job:
+      # every outcome is recorded in measure.json for the Gate job.
+      - name: Measure tests / coverage / lint
+        env:
+          ACC_CONFIG: ${{ needs.config.outputs.config }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/acceptance"
+          /usr/bin/python3 - <<'PY'
+          # >>> acceptance-measure-core
+          import json, os, re, signal, subprocess, time
+          import xml.etree.ElementTree as ET
+
+          def parse_diff_added_lines(diff_text):
+              """{path: set(new-side line numbers added/modified)} from `git diff -U0`."""
+              files, cur = {}, None
+              for line in diff_text.splitlines():
+                  if line.startswith('+++ '):
+                      p = line[4:].rstrip('\t').strip()
+                      if p == '/dev/null':
+                          cur = None
+                      else:
+                          if p.startswith('"') and p.endswith('"'):
+                              p = p[1:-1]
+                          if p.startswith('b/'):
+                              p = p[2:]
+                          cur = files.setdefault(p, set())
+                  elif line.startswith('@@') and cur is not None:
+                      m = re.match(r'@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@', line)
+                      if m:
+                          start = int(m.group(1))
+                          n = int(m.group(2)) if m.group(2) is not None else 1
+                          cur.update(range(start, start + n))
+              return {k: v for k, v in files.items() if v}
+
+          def norm_path(p, root, workdir='.'):
+              p = p.replace('\\', '/')
+              r = root.rstrip('/') + '/'
+              if p.startswith(r):
+                  p = p[len(r):]
+              while p.startswith('./'):
+                  p = p[2:]
+              if workdir not in ('', '.') and not os.path.isabs(p) and not os.path.exists(os.path.join(root, p)):
+                  cand = os.path.normpath(os.path.join(workdir, p)).replace('\\', '/')
+                  if os.path.exists(os.path.join(root, cand)):
+                      p = cand
+              return p
+
+          def parse_lcov(text, root, workdir='.'):
+              cov, cur, bad, good = {}, None, 0, 0
+              for line in text.splitlines():
+                  line = line.strip()
+                  if line.startswith('SF:'):
+                      cur = cov.setdefault(norm_path(line[3:], root, workdir), {})
+                  elif line.startswith('DA:') and cur is not None:
+                      parts = line[3:].split(',')
+                      try:
+                          ln, hits = int(parts[0]), int(float(parts[1]))
+                      except (ValueError, IndexError):
+                          bad += 1
+                          continue
+                      good += 1
+                      cur[ln] = max(cur.get(ln, 0), hits)
+                  elif line == 'end_of_record':
+                      cur = None
+              if bad and not good:
+                  raise ValueError(f'lcov report has {bad} malformed DA record(s) and no valid line data')
+              return cov
+
+          def parse_cobertura(text, root, workdir='.'):
+              tree = ET.fromstring(text)
+              sources = [s.text.strip() for s in tree.iter('source') if s.text and s.text.strip()]
+              cov, bad, good = {}, 0, 0
+              for cls in tree.iter('class'):
+                  fn = cls.get('filename')
+                  if not fn:
+                      continue
+                  path = None
+                  for c in [fn] + [os.path.join(s, fn) for s in sources]:
+                      c2 = norm_path(c, root, workdir)
+                      if os.path.isfile(os.path.join(root, c2)):
+                          path = c2
+                          break
+                  d = cov.setdefault(path or norm_path(fn, root, workdir), {})
+                  for ln in cls.iter('line'):
+                      try:
+                          n, h = int(ln.get('number')), int(float(ln.get('hits', '0')))
+                      except (TypeError, ValueError):
+                          bad += 1
+                          continue
+                      good += 1
+                      d[n] = max(d.get(n, 0), h)
+              if bad and not good:
+                  raise ValueError(f'cobertura report has {bad} malformed <line> record(s) and no valid line data')
+              return cov
+
+          def changed_line_coverage(added, cov):
+              """(covered, coverable, per_file) over added lines that the report instruments."""
+              covered = total = 0
+              per = {}
+              keys = list(cov)
+              for path, lines in sorted(added.items()):
+                  data = cov.get(path)
+                  if data is None:
+                      m = [k for k in keys if k.endswith('/' + path) or path.endswith('/' + k)]
+                      if len(m) == 1:
+                          data = cov[m[0]]
+                  if not data:
+                      continue
+                  inst = [l for l in lines if l in data]
+                  if not inst:
+                      continue
+                  c = sum(1 for l in inst if data[l] > 0)
+                  per[path] = {'covered': c, 'coverable': len(inst)}
+                  covered += c
+                  total += len(inst)
+              return covered, total, per
+
+          def file_digest(p):
+              import hashlib
+              try:
+                  with open(p, 'rb') as f:
+                      return hashlib.sha256(f.read()).hexdigest()
+              except OSError:
+                  return None
+
+          def count_issues(output, count_regex=''):
+              if count_regex:
+                  return len(re.findall(count_regex, output, re.M))
+              return sum(1 for l in output.splitlines() if l.strip())
+
+          def run(cmd, cwd, timeout):
+              t0 = time.time()
+              p = subprocess.Popen(['bash', '-o', 'pipefail', '-c', cmd], cwd=cwd, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+              try:
+                  out, _ = p.communicate(timeout=timeout)
+                  timed_out = False
+              except subprocess.TimeoutExpired:
+                  os.killpg(p.pid, signal.SIGKILL)
+                  out, _ = p.communicate()
+                  timed_out = True
+              text = (out or b'').decode('utf-8', 'replace')
+              return {'exit': None if timed_out else p.returncode, 'timed_out': timed_out,
+                      'seconds': round(time.time() - t0, 1), 'output': text}
+          # <<< acceptance-measure-core
+
+          def tail(s, n=3000):
+              return s if len(s) <= n else '…' + s[-n:]
+
+          def log(title, r):
+              print(f'::group::{title} (exit={r["exit"]}, {r["seconds"]}s{", TIMEOUT" if r["timed_out"] else ""})')
+              print(tail(r['output'], 20000))
+              print('::endgroup::')
+
+          cfg = json.loads(os.environ['ACC_CONFIG'])
+          root = os.getcwd()
+          base, head = os.environ['BASE_SHA'], os.environ['HEAD_SHA']
+          setup = cfg['setup']
+          workdir = setup.get('working_directory') or '.'
+          wd = os.path.join(root, workdir)
+          res = {'schema': 1, 'setup': None, 'tests': None, 'lint': None, 'errors': []}
+
+          mb = subprocess.run(['git', 'merge-base', base, head], capture_output=True, text=True).stdout.strip() or base
+          res['merge_base'] = mb
+
+          if setup.get('command'):
+              r = run(setup['command'], wd, int(setup.get('timeout_seconds') or 240))
+              log('setup', r)
+              res['setup'] = {k: r[k] for k in ('exit', 'timed_out', 'seconds')} | {'output_tail': tail(r['output'])}
+
+          t = cfg['metrics']['tests']
+          if t['enabled'] and t.get('command'):
+              cands = [t['coverage_file']] if t.get('coverage_file') else [
+                  'coverage/lcov.info', 'lcov.info', 'coverage.lcov', 'coverage/cobertura-coverage.xml',
+                  'coverage.xml', 'cobertura.xml']
+              paths = []
+              for c in cands:
+                  for p in (os.path.join(wd, c), os.path.join(root, c)):
+                      if p not in paths:
+                          paths.append(p)
+              # Only a report written by THIS test run counts: snapshot content
+              # hashes first (mtime is unreliable — checkout sets it).
+              before = {p: file_digest(p) for p in paths}
+              r = run(t['command'], wd, int(t.get('timeout_seconds') or 300))
+              log('tests', r)
+              tr = {k: r[k] for k in ('exit', 'timed_out', 'seconds')} | {'output_tail': tail(r['output']),
+                                                                         'coverage': None}
+              report = None
+              for p in paths:
+                  d = file_digest(p)
+                  if d is not None and d != before[p]:
+                      report = p
+                      break
+              if report:
+                  try:
+                      with open(report, encoding='utf-8', errors='replace') as f:
+                          text = f.read()
+                      cov = (parse_cobertura(text, root, workdir) if report.endswith('.xml')
+                             else parse_lcov(text, root, workdir))
+                      diff = subprocess.run(['git', '-c', 'core.quotePath=false', 'diff', '-U0', '--no-color',
+                                             '--no-ext-diff', mb, head], capture_output=True, text=True,
+                                            errors='replace').stdout
+                      covered, coverable, per = changed_line_coverage(parse_diff_added_lines(diff), cov)
+                      tr['coverage'] = {'report': os.path.relpath(report, root), 'covered': covered,
+                                        'coverable': coverable, 'files': per}
+                  except Exception as e:  # report unreadable → reported as error, never crash
+                      res['errors'].append(f'coverage parse failed: {e.__class__.__name__}: {e}')
+                      tr['coverage_error'] = f'{os.path.relpath(report, root)}: {e.__class__.__name__}'
+              res['tests'] = tr
+
+          lint = cfg['metrics']['lint']
+          if lint['enabled'] and lint['commands']:
+              lt = {'commands': [], 'compare_base': bool(lint.get('compare_base', True))}
+              base_dir = None
+              if lint.get('compare_base', True):
+                  base_dir = os.path.join(os.environ.get('RUNNER_TEMP', '/tmp'), 'acceptance-base')
+                  wt = subprocess.run(['git', 'worktree', 'add', '--detach', base_dir, mb], capture_output=True, text=True)
+                  if wt.returncode != 0:
+                      res['errors'].append('git worktree for base failed: ' + wt.stderr.strip()[:300])
+                      base_dir = None
+                  elif setup.get('command') and os.path.isdir(os.path.join(base_dir, workdir)):
+                      r = run(setup['command'], os.path.join(base_dir, workdir), int(setup.get('timeout_seconds') or 240))
+                      log('setup (base)', r)
+                      lt['base_setup_exit'] = r['exit']
+              to = int(lint.get('timeout_seconds') or 120)
+              for c in lint['commands']:
+                  h = run(c['run'], wd, to)
+                  log('lint head: ' + c['run'], h)
+                  entry = {'run': c['run'], 'ok_exits': c.get('ok_exits', [0, 1]), 'head': None if h['timed_out'] else count_issues(h['output'], c['count_regex']),
+                           'head_exit': h['exit'], 'base': None, 'base_exit': None}
+                  if base_dir and not os.path.isdir(os.path.join(base_dir, workdir)):
+                      res['errors'].append(f'working_directory {workdir!r} missing on the merge base; no base comparison')
+                      base_dir = None
+                  if base_dir:
+                      b = run(c['run'], os.path.join(base_dir, workdir), to)
+                      log('lint base: ' + c['run'], b)
+                      entry['base'] = None if b['timed_out'] else count_issues(b['output'], c['count_regex'])
+                      entry['base_exit'] = b['exit']
+                  lt['commands'].append(entry)
+              res['lint'] = lt
+
+          out = os.path.join(os.environ['RUNNER_TEMP'], 'acceptance', 'measure.json')
+          with open(out, 'w', encoding='utf-8') as f:
+              json.dump(res, f, ensure_ascii=False, indent=2)
+          print('wrote', out)
+          PY
+
+      - name: Upload measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-measure
+          path: ${{ runner.temp }}/acceptance/measure.json
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+  gate:
+    name: Acceptance Gate
+    needs: [config, measure]
+    # !cancelled(): a run superseded by a newer PR event must not publish.
+    if: ${{ !cancelled() && needs.config.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
+    permissions:
+      contents: read
+      pull-requests: write   # sticky comment only
+      checks: read           # read the Codex gate check run
+    steps:
+      - name: Download measurements
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: acceptance-measure
+          path: ${{ runner.temp }}/measure
+
+      # API-only (no PR code). continue-on-error: its findings are read
+      # from outputs and reported by the evaluator below.
+      - name: Dependency review
+        id: depreview
+        if: needs.config.outputs.deps_enabled == 'true'
+        continue-on-error: true
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: ${{ needs.config.outputs.deps_fail_on_severity }}
+          deny-licenses: ${{ needs.config.outputs.deps_deny_licenses }}
+          comment-summary-in-pr: never
+
+      - name: Evaluate, report, comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ACC_CONFIG: ${{ needs.config.outputs.config }}
+          MEASURE_RESULT: ${{ needs.measure.result }}
+          DR_OUTCOME: ${{ steps.depreview.outcome }}
+          DR_VULNERABLE: ${{ steps.depreview.outputs.vulnerable-changes }}
+          DR_INVALID_LICENSE: ${{ steps.depreview.outputs.invalid-license-changes }}
+          DR_DENIED: ${{ steps.depreview.outputs.denied-changes }}
+          DR_CHANGES: ${{ steps.depreview.outputs.dependency-changes }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/report"
+          python3 - <<'PY'
+          # >>> acceptance-gate-core
+          import json, re
+          from datetime import datetime, timezone
+
+          MARKER = '<!-- devflow-gates:acceptance-report -->'
+          NAMES = {'tests': 'Tests & changed-line coverage', 'tests_changed': 'Tests changed with source',
+                   'lint': 'No new lint/type errors', 'size': 'PR size', 'dependencies': 'New dependencies',
+                   'evidence': 'Acceptance evidence', 'ai_review': 'AI review (Codex gate)'}
+          MANIFEST_REGEX = (r'(^|/)(package\.json|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|'
+                            r'requirements[^/]*\.(txt|in)|pyproject\.toml|poetry\.lock|Pipfile(\.lock)?|uv\.lock|setup\.(py|cfg)|'
+                            r'go\.(mod|sum)|Gemfile(\.lock)?|Cargo\.(toml|lock)|pom\.xml|build\.gradle(\.kts)?|'
+                            r'composer\.(json|lock)|[^/]+\.csproj|packages\.config|pubspec\.(yaml|lock)|Package\.(swift|resolved)|mix\.(exs|lock))$|(^|/)\.github/workflows/[^/]+\.ya?ml$')
+
+          def r(status, value='', detail=''):
+              return {'status': status, 'value': value, 'detail': detail}
+
+          def eval_tests(m, measure, measure_result):
+              if not m.get('command'):
+                  return r('n/a', 'n/a', 'no tests.command configured (CI gate still runs the tests)')
+              if measure is None or measure.get('tests') is None:
+                  return r('error', '', f'measurement missing (Acceptance Measure: {measure_result})')
+              setup = measure.get('setup')
+              if setup and setup.get('exit') != 0:
+                  return r('fail', 'setup failed', 'setup command ' + ('timed out' if setup.get('timed_out') else f"exit {setup.get('exit')}"))
+              t = measure['tests']
+              if t.get('timed_out'):
+                  return r('fail', 'timeout', f"tests timed out after {t.get('seconds')}s")
+              if t.get('exit') != 0:
+                  return r('fail', f"exit {t.get('exit')}", 'test command failed')
+              cov = t.get('coverage')
+              thr = m['threshold']
+              if t.get('coverage_error'):
+                  return r('error', 'tests ✓ / coverage ?', 'coverage report unreadable: ' + t['coverage_error'])
+              if not cov:
+                  return r('pass', 'tests ✓ / coverage n/a', 'no coverage report (lcov/cobertura) produced')
+              if not cov.get('coverable'):
+                  return r('pass', 'tests ✓ / coverage n/a', 'no coverable changed lines in the report')
+              pct = 100.0 * cov['covered'] / cov['coverable']
+              val = f"{pct:.1f}% ({cov['covered']}/{cov['coverable']})"
+              if pct + 1e-9 < thr:
+                  return r('fail', val, f'changed-line coverage below {thr:g}%')
+              return r('pass', val, f'threshold {thr:g}%')
+
+          def eval_tests_changed(m, files, labels, body):
+              src_re, test_re = re.compile(m['source_regex']), re.compile(m['test_regex'])
+              live = [f for f in files if f.get('status') != 'removed']
+              tests = [f['filename'] for f in live if test_re.search(f['filename'])]  # deleting tests doesn't count
+              sources = [f['filename'] for f in live if src_re.search(f['filename']) and not test_re.search(f['filename'])]
+              if not sources:
+                  return r('pass', 'no source changes', '')
+              if tests:
+                  return r('pass', f'{len(sources)} src / {len(tests)} test', '')
+              label = m.get('exempt_label') or 'no-test-needed'
+              if label in labels:
+                  visible = re.sub(r'<!--.*?-->', '', body or '', flags=re.S)  # template placeholders don't count
+                  if re.search(m['reason_regex'], visible, re.I):
+                      return r('pass', 'exempt', f'`{label}` with a reason in the PR body')
+                  return r('fail', f'{len(sources)} src / 0 test', f'`{label}` set but the PR body gives no reason')
+              return r('fail', f'{len(sources)} src / 0 test',
+                       f'source changed without tests; add tests or label `{label}` with a reason')
+
+          def eval_lint(m, measure, measure_result):
+              if not m.get('commands'):
+                  return r('n/a', 'n/a', 'no lint.commands configured')
+              if measure is None or measure.get('lint') is None:
+                  return r('error', '', f'measurement missing (Acceptance Measure: {measure_result})')
+              setup = measure.get('setup')
+              if setup and setup.get('exit') != 0:
+                  return r('error', 'setup failed', 'setup command failed; lint not comparable')
+              lt = measure['lint']
+              if lt.get('compare_base', True) and 'base_setup_exit' in lt and lt['base_setup_exit'] != 0:
+                  return r('n/a', 'base setup failed', 'setup failed on the merge base; cannot compare')
+              if not lt.get('compare_base', True):
+                  # Absolute mode: every command must exit 0 on head.
+                  bad = [c for c in lt['commands'] if c.get('head_exit') != 0]  # absolute: only 0 is clean
+                  val = ', '.join('timeout' if c.get('head_exit') is None else f"exit {c.get('head_exit')}"
+                                  for c in lt['commands'])
+                  if bad:
+                      return r('fail', val, f'{len(bad)} lint command(s) not clean on head (compare_base: false)')
+                  return r('pass', val, 'all lint commands exit 0 (compare_base: false)')
+              new, parts, unknown = 0, [], 0
+              for c in lt['commands']:
+                  h, b = c.get('head'), c.get('base')
+                  # An exit outside ok_exits (default 0/1; e.g. 127 not found, 2 crash)
+                  # means the output is an error, not lint findings — never compare it.
+                  ok = c.get('ok_exits') or [0, 1]
+                  bad_h = c.get('head_exit') is not None and c.get('head_exit') not in ok
+                  bad_b = c.get('base_exit') is not None and c.get('base_exit') not in ok
+                  if bad_h:
+                      h = None
+                  if bad_b:
+                      b = None
+                  if bad_h:
+                      unknown += 1
+                      parts.append(f"head exit {c.get('head_exit')}")
+                  elif h is None:
+                      unknown += 1
+                      parts.append('timeout')
+                  elif b is None:
+                      unknown += 1
+                      parts.append(f'{h} (no base)')
+                  else:
+                      new += max(0, h - b)
+                      parts.append(f'{b}→{h}')
+              val = ', '.join(parts)
+              if new:
+                  return r('fail', val, f'{new} new issue(s) vs base')
+              if unknown:
+                  return r('n/a', val, 'could not compare with base (abnormal exit, timeout or base run unavailable)')
+              return r('pass', val, 'issue count base→head')
+
+          def eval_size(m, files):
+              ex = re.compile(m['exclude_regex']) if m.get('exclude_regex') else None
+              n = sum(int(f.get('additions', 0)) + int(f.get('deletions', 0)) for f in files
+                      if not (ex and ex.search(f['filename'])))
+              thr = m['threshold']
+              if n > thr:
+                  return r('fail', f'{n} lines', f'over {thr:g} changed lines; consider splitting')
+              return r('pass', f'{n} lines', f'≤ {thr:g}')
+
+          def _jl(s):
+              try:
+                  v = json.loads(s) if s else []
+                  return v if isinstance(v, list) else []
+              except ValueError:
+                  return []
+
+          def _jlic(s):
+              # dependency-review-action v4: {"forbidden": [...], "unresolved": [...], "unlicensed": [...]}
+              try:
+                  v = json.loads(s) if s else []
+              except ValueError:
+                  return []
+              if isinstance(v, dict):
+                  # `unlicensed` is informational upstream (does not fail the action).
+                  return [x for k in ('forbidden', 'unresolved') for x in (v.get(k) or [])]
+              return v if isinstance(v, list) else []
+
+          def eval_dependencies(m, files, dr):
+              # Applicability comes from the action (it knows every supported
+              # ecosystem); MANIFEST_REGEX is only used when the action did not run.
+              manifests = [f['filename'] for f in files if re.search(MANIFEST_REGEX, f['filename'])]
+              outcome = dr.get('outcome') or ''
+              changes = _jl(dr.get('changes'))
+              if not outcome and not manifests:
+                  return r('pass', 'no manifest changes', '')
+              vul, lic, den = _jl(dr.get('vulnerable')), _jlic(dr.get('invalid_license')), _jl(dr.get('denied'))
+              if vul or lic or den:
+                  bits = []
+                  if vul:
+                      bits.append(f'{len(vul)} vulnerable')
+                  if lic:
+                      bits.append(f'{len(lic)} license issue(s)')
+                  if den:
+                      bits.append(f'{len(den)} denied')
+                  names = sorted({str(x.get('name')) for x in vul + lic + den if isinstance(x, dict)})[:5]
+                  return r('fail', ', '.join(bits), ', '.join(names))
+              if outcome == 'success':
+                  if not changes and not manifests:
+                      return r('pass', 'no dependency changes', '')
+                  return r('pass', f'{len(changes)} change(s)', f"no vulnerabilities ≥ {m['fail_on_severity']}, no license issues")
+              return r('n/a', 'n/a', f'dependency-review-action {outcome or "did not run"} (dependency graph unavailable?)')
+
+          HEADING = re.compile(r'^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$|^\s{0,3}\*\*(.+?)\*\*\s*:?\s*$')
+
+          def eval_evidence(m, body):
+              text = re.sub(r'<!--.*?-->', '', body or '', flags=re.S)
+              want = re.compile(m['heading_regex'], re.I)
+              lines, fence = [], None
+              for line in text.splitlines():  # drop fenced code blocks (``` / ~~~)
+                  fm = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
+                  if fence is None and fm:
+                      fence = fm.group(1)[0] * len(fm.group(1))
+                  elif fence is not None and re.match(r'^\s{0,3}' + re.escape(fence[0]) + '{%d,}\\s*$' % len(fence), line):
+                      fence = None
+                  elif fence is None:
+                      lines.append(line)
+              found_empty = None
+              for i, line in enumerate(lines):
+                  h = HEADING.match(line)
+                  if not h or not want.search(h.group(2) or h.group(3) or ''):
+                      continue
+                  title = (h.group(2) or h.group(3)).strip()
+                  level = len(h.group(1)) if h.group(1) else 7  # bold pseudo-heading: stop at any heading
+                  content = []
+                  for nxt in lines[i + 1:]:
+                      hn = HEADING.match(nxt)
+                      if hn and (len(hn.group(1)) if hn.group(1) else 7) <= level:
+                          break
+                      if hn:
+                          continue  # a child heading alone is not evidence
+                      if nxt.strip():
+                          content.append(nxt)
+                  if content:
+                      return r('pass', title[:40], f'{len(content)} line(s)')
+                  found_empty = title
+              if found_empty:
+                  return r('fail', 'empty section', f'heading "{found_empty[:40]}" has no content')
+              return r('fail', 'missing', f"no heading matching /{m['heading_regex']}/ in the PR body")
+
+          def eval_ai_review(m, check_runs):
+              name = m.get('check_name') or 'codex / Codex Review Gate'
+              runs = [c for c in check_runs if c.get('name') == name]
+              if not runs:
+                  return r('pending', 'not found', f'no `{name}` check on this head yet')
+              runs.sort(key=lambda c: c.get('id') or 0)  # creation order (queued reruns have no started_at)
+              c = runs[-1]
+              if c.get('status') != 'completed':
+                  return r('pending', c.get('status'), f'`{name}` still running')
+              concl = c.get('conclusion')
+              if concl == 'success':
+                  return r('pass', 'success', f'`{name}`: no unresolved P0/P1')
+              if concl in ('skipped', 'neutral'):
+                  return r('n/a', concl, f'`{name}` {concl}')
+              return r('fail', concl or 'unknown', (c.get('output') or {}).get('title') or f'`{name}` not green')
+
+          def finalize(cfg, results):
+              metrics = []
+              for mid in NAMES:
+                  m = cfg['metrics'][mid]
+                  res = results.get(mid) or r('error', '', 'not evaluated')
+                  if not m['enabled']:
+                      res = r('disabled', '', '')
+                  metrics.append({'id': mid, 'name': NAMES[mid], 'enabled': m['enabled'], 'mode': m['mode'],
+                                  'threshold': m.get('threshold'), **res})
+              blocking = [x['id'] for x in metrics if x['mode'] == 'enforce' and x['status'] in ('fail', 'error', 'pending')]
+              observed = [x['id'] for x in metrics if x['mode'] == 'observe' and x['status'] in ('fail', 'error', 'pending')]
+              overall = 'fail' if blocking else ('warn' if observed else 'pass')
+              return metrics, overall, blocking, observed
+
+          ICON = {'pass': '✅', 'fail': '❌', 'pending': '⏳', 'n/a': '➖', 'disabled': '⏭️', 'error': '💥'}
+
+          def icon(x):
+              if x['mode'] == 'observe' and x['status'] in ('fail', 'error', 'pending'):
+                  return '⚠️ ' + x['status']
+              return ICON.get(x['status'], '') + ' ' + x['status']
+
+          def cell(s):
+              return str(s if s is not None else '').replace('|', '\\|').replace('\n', ' ')
+
+          def render(report):
+              head = report['head_sha'][:7]
+              verdict = {'pass': '✅ pass', 'warn': '⚠️ pass (observe-only findings)', 'fail': '❌ fail'}[report['overall']]
+              out = [MARKER, f"### Acceptance Gate — {verdict}", '',
+                     f"Head `{head}` · config `{report['config_source']}` · [run]({report['run_url']})", '',
+                     '| # | Metric | Mode | Result | Value | Detail |', '| --- | --- | --- | --- | --- | --- |']
+              for i, x in enumerate(report['metrics'], 1):
+                  out.append(f"| {i} | {x['name']} | {x['mode']} | {icon(x)} | {cell(x['value'])} | {cell(x['detail'])} |")
+              out.append('')
+              if report['blocking']:
+                  out.append('Blocking (enforce): ' + ', '.join(f'`{b}`' for b in report['blocking']))
+              if report['observed']:
+                  out.append('Observe-only (reported, not blocking): ' + ', '.join(f'`{b}`' for b in report['observed']))
+              for w in report.get('config_warnings') or []:
+                  out.append(f'- config warning: {cell(w)}')
+              out.append('')
+              out.append('<sub>Updated in place on every PR event · JSON: artifact `acceptance-report`</sub>')
+              return '\n'.join(out)
+          # <<< acceptance-gate-core
+
+          import os, sys, urllib.error, urllib.request
+          API = os.environ.get('GITHUB_API_URL', 'https://api.github.com')
+          REPO, N = os.environ['REPO'], int(os.environ['PR_NUMBER'])
+
+          def api(path, method='GET', data=None):
+              req = urllib.request.Request(API + path, method=method,
+                                           data=json.dumps(data).encode() if data is not None else None,
+                                           headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                                                    'Accept': 'application/vnd.github+json',
+                                                    'X-GitHub-Api-Version': '2022-11-28',
+                                                    'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+          def paged(path, key=None, cap=30):
+              out = []
+              for page in range(1, cap + 1):
+                  sep = '&' if '?' in path else '?'
+                  d = api(f'{path}{sep}per_page=100&page={page}')
+                  items = d[key] if key else d
+                  out += items
+                  if len(items) < 100:
+                      break
+              return out
+
+          cfg = json.loads(os.environ['ACC_CONFIG'])
+          head = os.environ['HEAD_SHA']
+          pr = api(f'/repos/{REPO}/pulls/{N}')
+          body = pr.get('body') or ''
+          labels = [l['name'] for l in pr.get('labels', [])]
+          files = paged(f'/repos/{REPO}/pulls/{N}/files')
+          truncated = len(files) < int(pr.get('changed_files') or 0)
+          # The PR's status-check rollup (what the PR page shows) — Codex gate
+          # runs on pull_request_target, whose check suite is on the BASE sha,
+          # so /commits/{head}/check-runs would never find it.
+          Q = ('query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){'
+               'commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{__typename '
+               '... on CheckRun{databaseId name status conclusion startedAt title}}}}}}}}}}')
+          try:
+              o, n = REPO.split('/')
+              g = api('/graphql', 'POST', {'query': Q, 'variables': {'o': o, 'n': n, 'pr': N}})
+              node = ((g.get('data') or {}).get('repository') or {}).get('pullRequest') or {}
+              commit = (node.get('commits') or {}).get('nodes', [{}])[0].get('commit') or {}
+              if g.get('errors') or not node:
+                  raise ValueError(str(g.get('errors'))[:200])
+              if commit.get('oid') != head:
+                  print(f"::warning::PR head moved ({commit.get('oid')}); a newer run will refresh")
+              ctx = ((commit.get('statusCheckRollup') or {}).get('contexts') or {}).get('nodes') or []
+              check_runs = [{'id': c.get('databaseId'), 'name': c.get('name'), 'started_at': c.get('startedAt'),
+                             'status': (c.get('status') or '').lower(), 'conclusion': (c.get('conclusion') or '').lower() or None,
+                             'output': {'title': c.get('title')}} for c in ctx if c.get('__typename') == 'CheckRun']
+          except (urllib.error.HTTPError, ValueError, IndexError, KeyError) as e:
+              print(f'::warning::PR check rollup unreadable ({e})')
+              check_runs = None
+          measure = None
+          mpath = os.path.join(os.environ['RUNNER_TEMP'], 'measure', 'measure.json')
+          if os.path.isfile(mpath):
+              with open(mpath, encoding='utf-8') as f:
+                  measure = json.load(f)
+          mres = os.environ.get('MEASURE_RESULT', '')
+          dr = {'outcome': os.environ.get('DR_OUTCOME'), 'vulnerable': os.environ.get('DR_VULNERABLE'),
+                'invalid_license': os.environ.get('DR_INVALID_LICENSE'), 'denied': os.environ.get('DR_DENIED'),
+                'changes': os.environ.get('DR_CHANGES')}
+          M = cfg['metrics']
+          results = {
+              'tests': eval_tests(M['tests'], measure, mres),
+              'tests_changed': eval_tests_changed(M['tests_changed'], files, labels, body),
+              'lint': eval_lint(M['lint'], measure, mres),
+              'size': eval_size(M['size'], files),
+              'dependencies': eval_dependencies(M['dependencies'], files, dr),
+              'evidence': eval_evidence(M['evidence'], body),
+              'ai_review': (eval_ai_review(M['ai_review'], check_runs) if check_runs is not None
+                            else r('error', '', 'check runs unreadable (grant checks: read)')),
+          }
+          if truncated:
+              # The files API caps at 3000 entries: file-based metrics would be partial.
+              for k in ('tests_changed', 'size', 'dependencies'):
+                  results[k] = r('error', 'partial file list',
+                                 f"API returned {len(files)}/{pr.get('changed_files')} files")
+          metrics, overall, blocking, observed = finalize(cfg, results)
+          report = {'schema_version': 1, 'repo': REPO, 'pr': N, 'title': pr.get('title'),
+                    'author': (pr.get('user') or {}).get('login'), 'base_sha': os.environ['BASE_SHA'],
+                    'head_sha': head, 'generated_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                    'mode': cfg['mode'], 'config_source': cfg.get('_source'),
+                    'config_warnings': cfg.get('_warnings') or [], 'overall': overall, 'blocking': blocking,
+                    'observed': observed, 'metrics': metrics, 'measure_job': mres,
+                    'measure_errors': (measure or {}).get('errors') or [], 'run_url': os.environ['RUN_URL']}
+          rp = os.path.join(os.environ['RUNNER_TEMP'], 'report', 'acceptance-report.json')
+          with open(rp, 'w', encoding='utf-8') as f:
+              json.dump(report, f, ensure_ascii=False, indent=2)
+          md = render(report)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write(md.replace(MARKER, '') + '\n')
+          print(md)
+
+          # Sticky comment: update ours in place, create only if absent.
+          try:
+              mine = [c for c in paged(f'/repos/{REPO}/issues/{N}/comments')
+                      if (c.get('body') or '').startswith(MARKER) and (c.get('user') or {}).get('type') == 'Bot'
+                      and (c.get('user') or {}).get('login') == 'github-actions[bot]']
+              if mine:
+                  api(f"/repos/{REPO}/issues/comments/{mine[0]['id']}", 'PATCH', {'body': md})
+                  print('updated comment', mine[0]['id'])
+              else:
+                  c = api(f'/repos/{REPO}/issues/{N}/comments', 'POST', {'body': md})
+                  print('created comment', c['id'])
+          except urllib.error.HTTPError as e:
+              print(f'::warning::sticky comment not written (HTTP {e.code}; fork PR / missing pull-requests: write). See the job summary.')
+
+          if blocking:
+              print(f"::error::Acceptance Gate: enforced metric(s) not passing: {', '.join(blocking)}")
+              sys.exit(1)
+          if observed:
+              print(f"::notice::Acceptance Gate (observe): would fail on {', '.join(observed)}")
+          PY
+
+      - name: Upload acceptance-report.json
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-report
+          path: ${{ runner.temp }}/report/acceptance-report.json
+          if-no-files-found: warn
+          retention-days: 90
+          overwrite: true
