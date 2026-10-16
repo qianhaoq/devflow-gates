@@ -158,6 +158,9 @@ jobs:
               for k in raw:
                   if k not in DEFAULTS:
                       warnings.append(f'unknown top-level key {k!r} ignored')
+              for kk in (raw.get('setup') or {}):
+                  if kk not in DEFAULTS['setup']:
+                      warnings.append(f'unknown key setup.{kk!r} ignored (typo?)')
               for k, v in (raw.get('metrics') or {}).items():
                   if k not in DEFAULTS['metrics']:
                       warnings.append(f'unknown metric {k!r} ignored')
@@ -203,6 +206,9 @@ jobs:
                       except (re.error, TypeError):
                           warnings.append(f'metrics.{mid}.{key} invalid regex; using default')
                           m[key] = DEFAULTS['metrics'][mid][key]
+              if not isinstance(cfg['metrics']['lint'].get('compare_base', True), bool):
+                  warnings.append('metrics.lint.compare_base must be true/false; using true')
+                  cfg['metrics']['lint']['compare_base'] = True
               cmds = cfg['metrics']['lint'].get('commands') or []
               if isinstance(cmds, (str, dict)):
                   cmds = [cmds]
@@ -777,7 +783,7 @@ jobs:
                   fm = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
                   if fence is None and fm:
                       fence = fm.group(1)[0] * len(fm.group(1))
-                  elif fence is not None and fm and fm.group(1).startswith(fence):
+                  elif fence is not None and re.match(r'^\s{0,3}' + re.escape(fence[0]) + '{%d,}\\s*$' % len(fence), line):
                       fence = None
                   elif fence is None:
                       lines.append(line)
@@ -787,10 +793,14 @@ jobs:
                   if not h or not want.search(h.group(2) or h.group(3) or ''):
                       continue
                   title = (h.group(2) or h.group(3)).strip()
+                  level = len(h.group(1)) if h.group(1) else 7  # bold pseudo-heading: stop at any heading
                   content = []
                   for nxt in lines[i + 1:]:
-                      if HEADING.match(nxt):
+                      hn = HEADING.match(nxt)
+                      if hn and (len(hn.group(1)) if hn.group(1) else 7) <= level:
                           break
+                      if hn:
+                          continue  # a child heading alone is not evidence
                       if nxt.strip():
                           content.append(nxt)
                   if content:
@@ -892,10 +902,27 @@ jobs:
           labels = [l['name'] for l in pr.get('labels', [])]
           files = paged(f'/repos/{REPO}/pulls/{N}/files')
           truncated = len(files) < int(pr.get('changed_files') or 0)
+          # The PR's status-check rollup (what the PR page shows) — Codex gate
+          # runs on pull_request_target, whose check suite is on the BASE sha,
+          # so /commits/{head}/check-runs would never find it.
+          Q = ('query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){'
+               'commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){nodes{__typename '
+               '... on CheckRun{databaseId name status conclusion startedAt title}}}}}}}}}}')
           try:
-              check_runs = paged(f'/repos/{REPO}/commits/{head}/check-runs?filter=all', key='check_runs', cap=5)
-          except urllib.error.HTTPError as e:
-              print(f'::warning::check runs unreadable ({e.code})')
+              o, n = REPO.split('/')
+              g = api('/graphql', 'POST', {'query': Q, 'variables': {'o': o, 'n': n, 'pr': N}})
+              node = ((g.get('data') or {}).get('repository') or {}).get('pullRequest') or {}
+              commit = (node.get('commits') or {}).get('nodes', [{}])[0].get('commit') or {}
+              if g.get('errors') or not node:
+                  raise ValueError(str(g.get('errors'))[:200])
+              if commit.get('oid') != head:
+                  print(f"::warning::PR head moved ({commit.get('oid')}); a newer run will refresh")
+              ctx = ((commit.get('statusCheckRollup') or {}).get('contexts') or {}).get('nodes') or []
+              check_runs = [{'id': c.get('databaseId'), 'name': c.get('name'), 'started_at': c.get('startedAt'),
+                             'status': (c.get('status') or '').lower(), 'conclusion': (c.get('conclusion') or '').lower() or None,
+                             'output': {'title': c.get('title')}} for c in ctx if c.get('__typename') == 'CheckRun']
+          except (urllib.error.HTTPError, ValueError, IndexError, KeyError) as e:
+              print(f'::warning::PR check rollup unreadable ({e})')
               check_runs = None
           measure = None
           mpath = os.path.join(os.environ['RUNNER_TEMP'], 'measure', 'measure.json')

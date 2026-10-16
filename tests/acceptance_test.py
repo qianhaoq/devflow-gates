@@ -257,6 +257,13 @@ def _round2():
     assert G['eval_evidence'](cfg()['metrics']['evidence'], '```\ncode\n```\n## 自测\n通过')['status'] == 'pass'
     dm = cfg()['metrics']['dependencies']
     assert G['eval_dependencies'](dm, [F('package.json')], {'outcome': 'failure', 'invalid_license': '{"forbidden":[],"unresolved":[],"unlicensed":[{"name":"x"}]}'})['status'] == 'n/a'
+    assert any('commmand' in x for x in C['resolve']({'setup': {'commmand': 'npm ci'}})[1])
+    c6, w6 = C['resolve']({'metrics': {'lint': {'compare_base': 'false'}}})
+    assert c6['metrics']['lint']['compare_base'] is True and w6
+    ev = cfg()['metrics']['evidence']
+    assert G['eval_evidence'](ev, '```\n```not-a-close\n## Test plan\nx\n```\n')['status'] == 'fail'
+    assert G['eval_evidence'](ev, '## Test plan\n### Automated\n- pytest ok\n## Other\n')['status'] == 'pass'
+    assert G['eval_evidence'](ev, '## Test plan\n### Automated\n## Other\nx')['status'] == 'fail'
 t('round 2: blank regex, lint setup failure, compare_base false, coverage parse error', _round2)
 
 def _ev():
