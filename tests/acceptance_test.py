@@ -264,6 +264,8 @@ def _round2():
     assert G['eval_evidence'](ev, '```\n```not-a-close\n## Test plan\nx\n```\n')['status'] == 'fail'
     assert G['eval_evidence'](ev, '## Test plan\n### Automated\n- pytest ok\n## Other\n')['status'] == 'pass'
     assert G['eval_evidence'](ev, '## Test plan\n### Automated\n## Other\nx')['status'] == 'fail'
+    c7, w7 = C['resolve']({'metrics': {'lint': {'commands': [{'run': 'x', 'count_regex': '['}]}}})
+    assert c7['metrics']['lint']['commands'][0]['count_regex'] == '' and w7
 t('round 2: blank regex, lint setup failure, compare_base false, coverage parse error', _round2)
 
 def _ev():

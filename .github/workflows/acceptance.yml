@@ -217,6 +217,12 @@ jobs:
                   if isinstance(c, str) and c.strip():
                       norm.append({'run': c, 'count_regex': '', 'ok_exits': [0, 1]})
                   elif isinstance(c, dict) and str(c.get('run', '')).strip():
+                      cr = str(c.get('count_regex') or '')
+                      try:
+                          re.compile(cr)
+                      except re.error:
+                          warnings.append('metrics.lint.commands[].count_regex invalid; counting output lines')
+                          c = dict(c, count_regex='')
                       ok = c.get('ok_exits', [0, 1])
                       if not (isinstance(ok, list) and ok and all(isinstance(x, int) and not isinstance(x, bool) for x in ok)):
                           warnings.append('metrics.lint.commands[].ok_exits must be a list of ints; using [0, 1]')
@@ -528,7 +534,7 @@ jobs:
                   if wt.returncode != 0:
                       res['errors'].append('git worktree for base failed: ' + wt.stderr.strip()[:300])
                       base_dir = None
-                  elif setup.get('command'):
+                  elif setup.get('command') and os.path.isdir(os.path.join(base_dir, workdir)):
                       r = run(setup['command'], os.path.join(base_dir, workdir), int(setup.get('timeout_seconds') or 240))
                       log('setup (base)', r)
                       lt['base_setup_exit'] = r['exit']
@@ -538,6 +544,9 @@ jobs:
                   log('lint head: ' + c['run'], h)
                   entry = {'run': c['run'], 'ok_exits': c.get('ok_exits', [0, 1]), 'head': None if h['timed_out'] else count_issues(h['output'], c['count_regex']),
                            'head_exit': h['exit'], 'base': None, 'base_exit': None}
+                  if base_dir and not os.path.isdir(os.path.join(base_dir, workdir)):
+                      res['errors'].append(f'working_directory {workdir!r} missing on the merge base; no base comparison')
+                      base_dir = None
                   if base_dir:
                       b = run(c['run'], os.path.join(base_dir, workdir), to)
                       log('lint base: ' + c['run'], b)
@@ -565,7 +574,8 @@ jobs:
   gate:
     name: Acceptance Gate
     needs: [config, measure]
-    if: always() && needs.config.result == 'success'
+    # !cancelled(): a run superseded by a newer PR event must not publish.
+    if: ${{ !cancelled() && needs.config.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     permissions:
