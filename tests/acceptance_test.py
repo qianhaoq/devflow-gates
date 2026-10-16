@@ -240,6 +240,13 @@ def _round2():
     q = [{'name': n, 'status': 'completed', 'conclusion': 'success', 'started_at': '2026-01-01', 'id': 5},
          {'name': n, 'status': 'queued', 'started_at': None, 'id': 9}]
     assert G['eval_ai_review'](cfg()['metrics']['ai_review'], q)['status'] == 'pending'
+    assert G['eval_lint'](m, {'lint': {'base_setup_exit': None, 'commands': [{'head': 1, 'base': 1, 'head_exit': 1, 'base_exit': 1}]}}, 's')['status'] == 'n/a'
+    try:
+        M['parse_lcov']('SF:a.py\nDA:12\nend_of_record\n', '/r'); raise AssertionError('no raise')
+    except ValueError:
+        pass
+    tc = cfg()['metrics']['tests_changed']
+    assert G['eval_tests_changed'](tc, [F('src/a.py')], ['no-test-needed'], '<!-- no-test-needed: explain why here -->')['status'] == 'fail'
 t('round 2: blank regex, lint setup failure, compare_base false, coverage parse error', _round2)
 
 def _ev():

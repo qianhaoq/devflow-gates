@@ -346,7 +346,7 @@ jobs:
               return p
 
           def parse_lcov(text, root, workdir='.'):
-              cov, cur = {}, None
+              cov, cur, bad, good = {}, None, 0, 0
               for line in text.splitlines():
                   line = line.strip()
                   if line.startswith('SF:'):
@@ -356,10 +356,14 @@ jobs:
                       try:
                           ln, hits = int(parts[0]), int(float(parts[1]))
                       except (ValueError, IndexError):
+                          bad += 1
                           continue
+                      good += 1
                       cur[ln] = max(cur.get(ln, 0), hits)
                   elif line == 'end_of_record':
                       cur = None
+              if bad and not good:
+                  raise ValueError(f'lcov report has {bad} malformed DA record(s) and no valid line data')
               return cov
 
           def parse_cobertura(text, root, workdir='.'):
@@ -646,7 +650,8 @@ jobs:
                   return r('pass', f'{len(sources)} src / {len(tests)} test', '')
               label = m.get('exempt_label') or 'no-test-needed'
               if label in labels:
-                  if re.search(m['reason_regex'], body or '', re.I):
+                  visible = re.sub(r'<!--.*?-->', '', body or '', flags=re.S)  # template placeholders don't count
+                  if re.search(m['reason_regex'], visible, re.I):
                       return r('pass', 'exempt', f'`{label}` with a reason in the PR body')
                   return r('fail', f'{len(sources)} src / 0 test', f'`{label}` set but the PR body gives no reason')
               return r('fail', f'{len(sources)} src / 0 test',
@@ -661,7 +666,7 @@ jobs:
               if setup and setup.get('exit') != 0:
                   return r('error', 'setup failed', 'setup command failed; lint not comparable')
               lt = measure['lint']
-              if lt.get('compare_base', True) and lt.get('base_setup_exit') not in (None, 0):
+              if lt.get('compare_base', True) and 'base_setup_exit' in lt and lt['base_setup_exit'] != 0:
                   return r('n/a', 'base setup failed', 'setup failed on the merge base; cannot compare')
               if not lt.get('compare_base', True):
                   # Absolute mode: every command must exit 0 on head.
