@@ -306,7 +306,7 @@ dependency review、写置顶评论与 JSON 报告，给出结论）。
 | --- | --- | --- | --- |
 | 1 | `tests` | 测试命令通过，且**变更行覆盖率** ≥ 阈值（lcov / cobertura）；未配置命令或没有覆盖率报告 → n/a | 阈值 70%，未配置命令 |
 | 2 | `tests_changed` | 改了源码就必须改测试；`no-test-needed` 标签**且** PR 正文写明理由（`reason_regex`，如 `无需测试：…`）才豁免 | 常见语言源码/测试正则 |
-| 3 | `lint` | 配置的 lint / 类型检查命令：head 的问题数不得多于 merge base（输出行数或 `count_regex` 匹配数；尽力而为） | 未配置 → n/a |
+| 3 | `lint` | 配置的 lint / 类型检查命令：head 的问题数不得多于 merge base（输出行数或 `count_regex` 匹配数；尽力而为）；`compare_base: false` 时要求每条命令在 head 上退出 0 | 未配置 → n/a |
 | 4 | `size` | 变更行数（排除锁文件、`.min.*`、快照）超过阈值即告警 | 600 行 |
 | 5 | `dependencies` | 依赖清单（含 `.github/workflows/*`）有变更时跑 `actions/dependency-review-action`：已知漏洞 ≥ `fail_on_severity`、`deny_licenses` | high；依赖图不可用 → n/a |
 | 6 | `evidence` | PR 正文必须有标题匹配 `heading_regex` 且内容非空的验收/自测小节（`#` 标题或单独一行 `**粗体**`） | `自测\|验收\|Test plan\|QA` |

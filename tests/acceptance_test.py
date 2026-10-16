@@ -214,6 +214,18 @@ def _digest():
     open(p, 'w').write('b'); assert M['file_digest'](p) != a
 t('measure: coverage report freshness by content hash', _digest)
 
+def _round2():
+    c, w = C['resolve']({'metrics': {'evidence': {'heading_regex': None}, 'tests_changed': {'source_regex': 5}}})
+    assert c['metrics']['evidence']['heading_regex'] == C['DEFAULTS']['metrics']['evidence']['heading_regex'] and len(w) == 2
+    m = cfg({'metrics': {'lint': {'commands': ['x']}}})['metrics']['lint']
+    assert G['eval_lint'](m, {'setup': {'exit': 1}, 'lint': {'commands': [{'head': 1, 'base': 1, 'head_exit': 1, 'base_exit': 1}]}}, 's')['status'] == 'error'
+    assert G['eval_lint'](m, {'lint': {'base_setup_exit': 2, 'commands': [{'head': 1, 'base': 1}]}}, 's')['status'] == 'n/a'
+    assert G['eval_lint'](m, {'lint': {'compare_base': False, 'commands': [{'head': 3, 'base': None, 'head_exit': 1}]}}, 's')['status'] == 'fail'
+    assert G['eval_lint'](m, {'lint': {'compare_base': False, 'commands': [{'head': 0, 'base': None, 'head_exit': 0}]}}, 's')['status'] == 'pass'
+    tm = dict(cfg()['metrics']['tests'], command='pytest')
+    assert G['eval_tests'](tm, {'tests': {'exit': 0, 'coverage': None, 'coverage_error': 'lcov.info: ValueError'}}, 's')['status'] == 'error'
+t('round 2: blank regex, lint setup failure, compare_base false, coverage parse error', _round2)
+
 def _ev():
     m = cfg()['metrics']['evidence']
     e = G['eval_evidence']

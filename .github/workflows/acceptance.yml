@@ -181,9 +181,11 @@ jobs:
                       except (TypeError, ValueError):
                           warnings.append(f'metrics.{mid}.threshold invalid; using default')
                           m['threshold'] = float(DEFAULTS['metrics'][mid]['threshold'])
-                  for key in [k for k in m if k.endswith('_regex')]:
+                  for key in [k for k in DEFAULTS['metrics'][mid] if k.endswith('_regex')]:
                       try:
-                          re.compile(m[key] or '')
+                          if not isinstance(m.get(key), str) or (not m[key] and key != 'exclude_regex'):
+                              raise TypeError(key)
+                          re.compile(m[key])
                       except (re.error, TypeError):
                           warnings.append(f'metrics.{mid}.{key} invalid regex; using default')
                           m[key] = DEFAULTS['metrics'][mid][key]
@@ -479,13 +481,14 @@ jobs:
                       covered, coverable, per = changed_line_coverage(parse_diff_added_lines(diff), cov)
                       tr['coverage'] = {'report': os.path.relpath(report, root), 'covered': covered,
                                         'coverable': coverable, 'files': per}
-                  except Exception as e:  # report unreadable → n/a, never crash
+                  except Exception as e:  # report unreadable → reported as error, never crash
                       res['errors'].append(f'coverage parse failed: {e.__class__.__name__}: {e}')
+                      tr['coverage_error'] = f'{os.path.relpath(report, root)}: {e.__class__.__name__}'
               res['tests'] = tr
 
           lint = cfg['metrics']['lint']
           if lint['enabled'] and lint['commands']:
-              lt = {'commands': []}
+              lt = {'commands': [], 'compare_base': bool(lint.get('compare_base', True))}
               base_dir = None
               if lint.get('compare_base', True):
                   base_dir = os.path.join(os.environ.get('RUNNER_TEMP', '/tmp'), 'acceptance-base')
@@ -496,6 +499,7 @@ jobs:
                   elif setup.get('command'):
                       r = run(setup['command'], os.path.join(base_dir, workdir), int(setup.get('timeout_seconds') or 240))
                       log('setup (base)', r)
+                      lt['base_setup_exit'] = r['exit']
               to = int(lint.get('timeout_seconds') or 120)
               for c in lint['commands']:
                   h = run(c['run'], wd, to)
@@ -604,6 +608,8 @@ jobs:
                   return r('fail', f"exit {t.get('exit')}", 'test command failed')
               cov = t.get('coverage')
               thr = m['threshold']
+              if t.get('coverage_error'):
+                  return r('error', 'tests ✓ / coverage ?', 'coverage report unreadable: ' + t['coverage_error'])
               if not cov:
                   return r('pass', 'tests ✓ / coverage n/a', 'no coverage report (lcov/cobertura) produced')
               if not cov.get('coverable'):
@@ -636,8 +642,22 @@ jobs:
                   return r('n/a', 'n/a', 'no lint.commands configured')
               if measure is None or measure.get('lint') is None:
                   return r('error', '', f'measurement missing (Acceptance Measure: {measure_result})')
+              setup = measure.get('setup')
+              if setup and setup.get('exit') != 0:
+                  return r('error', 'setup failed', 'setup command failed; lint not comparable')
+              lt = measure['lint']
+              if lt.get('compare_base', True) and lt.get('base_setup_exit') not in (None, 0):
+                  return r('n/a', 'base setup failed', 'setup failed on the merge base; cannot compare')
+              if not lt.get('compare_base', True):
+                  # Absolute mode: every command must exit 0 on head.
+                  bad = [c for c in lt['commands'] if c.get('head_exit') != 0]
+                  val = ', '.join('timeout' if c.get('head_exit') is None else f"exit {c.get('head_exit')}"
+                                  for c in lt['commands'])
+                  if bad:
+                      return r('fail', val, f'{len(bad)} lint command(s) not clean on head (compare_base: false)')
+                  return r('pass', val, 'all lint commands exit 0 (compare_base: false)')
               new, parts, unknown = 0, [], 0
-              for c in measure['lint']['commands']:
+              for c in lt['commands']:
                   h, b = c.get('head'), c.get('base')
                   # 126/127 = command not executable / not found: the count is a
                   # shell error, not lint output — never compare it.
@@ -828,6 +848,7 @@ jobs:
           body = pr.get('body') or ''
           labels = [l['name'] for l in pr.get('labels', [])]
           files = paged(f'/repos/{REPO}/pulls/{N}/files')
+          truncated = len(files) < int(pr.get('changed_files') or 0)
           try:
               check_runs = paged(f'/repos/{REPO}/commits/{head}/check-runs?filter=all', key='check_runs', cap=5)
           except urllib.error.HTTPError as e:
@@ -852,6 +873,11 @@ jobs:
               'ai_review': (eval_ai_review(M['ai_review'], check_runs) if check_runs is not None
                             else r('error', '', 'check runs unreadable (grant checks: read)')),
           }
+          if truncated:
+              # The files API caps at 3000 entries: file-based metrics would be partial.
+              for k in ('tests_changed', 'size', 'dependencies'):
+                  results[k] = r('error', 'partial file list',
+                                 f"API returned {len(files)}/{pr.get('changed_files')} files")
           metrics, overall, blocking, observed = finalize(cfg, results)
           report = {'schema_version': 1, 'repo': REPO, 'pr': N, 'title': pr.get('title'),
                     'author': (pr.get('user') or {}).get('login'), 'base_sha': os.environ['BASE_SHA'],

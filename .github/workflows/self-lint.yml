@@ -53,4 +53,6 @@ jobs:
       # Acceptance Gate inline Python (config resolution, diff/coverage
       # parsing, metric evaluation, sticky-comment rendering).
       - name: Run acceptance gate tests
-        run: python3 tests/acceptance_test.py
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || pip install --quiet 'pyyaml==6.0.2'
+          python3 tests/acceptance_test.py

@@ -34,7 +34,7 @@ metrics:
     enabled: true
     commands: []         # e.g. ['npx eslint -f unix .', {run: 'npx tsc --noEmit --pretty false', count_regex: 'error TS'}]
                          # count = lines of output, or matches of count_regex
-    compare_base: true   # also run on the merge base (setup.command runs there too)
+    compare_base: true   # true: count must not grow vs merge base; false: every command must exit 0 on head
     timeout_seconds: 120
 
   size:                  # 4. changed lines
