@@ -146,6 +146,15 @@ jobs:
                   raw = {}
               if not isinstance(raw, dict):
                   return copy.deepcopy(DEFAULTS), ['config is not a mapping; using defaults']
+              # A blank section (`metrics:` / `setup:` / `metrics.tests:`) loads as
+              # None: treat it as "use defaults", never let it replace a mapping.
+              raw = {k: v for k, v in raw.items() if v is not None}
+              if isinstance(raw.get('metrics'), dict):
+                  raw['metrics'] = {k: v for k, v in raw['metrics'].items() if v is not None}
+              for k in ('setup', 'metrics'):
+                  if k in raw and not isinstance(raw[k], dict):
+                      warnings.append(f'{k} is not a mapping; using defaults')
+                      del raw[k]
               for k in raw:
                   if k not in DEFAULTS:
                       warnings.append(f'unknown top-level key {k!r} ignored')
@@ -382,6 +391,14 @@ jobs:
                   total += len(inst)
               return covered, total, per
 
+          def file_digest(p):
+              import hashlib
+              try:
+                  with open(p, 'rb') as f:
+                      return hashlib.sha256(f.read()).hexdigest()
+              except OSError:
+                  return None
+
           def count_issues(output, count_regex=''):
               if count_regex:
                   return len(re.findall(count_regex, output, re.M))
@@ -429,22 +446,26 @@ jobs:
 
           t = cfg['metrics']['tests']
           if t['enabled'] and t.get('command'):
-              started = time.time()
+              cands = [t['coverage_file']] if t.get('coverage_file') else [
+                  'coverage/lcov.info', 'lcov.info', 'coverage.lcov', 'coverage/cobertura-coverage.xml',
+                  'coverage.xml', 'cobertura.xml']
+              paths = []
+              for c in cands:
+                  for p in (os.path.join(wd, c), os.path.join(root, c)):
+                      if p not in paths:
+                          paths.append(p)
+              # Only a report written by THIS test run counts: snapshot content
+              # hashes first (mtime is unreliable — checkout sets it).
+              before = {p: file_digest(p) for p in paths}
               r = run(t['command'], wd, int(t.get('timeout_seconds') or 300))
               log('tests', r)
               tr = {k: r[k] for k in ('exit', 'timed_out', 'seconds')} | {'output_tail': tail(r['output']),
                                                                          'coverage': None}
-              cands = [t['coverage_file']] if t.get('coverage_file') else [
-                  'coverage/lcov.info', 'lcov.info', 'coverage.lcov', 'coverage/cobertura-coverage.xml',
-                  'coverage.xml', 'cobertura.xml']
               report = None
-              for c in cands:
-                  for p in (os.path.join(wd, c), os.path.join(root, c)):
-                      # Only a report produced by THIS run counts (not a committed one).
-                      if os.path.isfile(p) and os.path.getmtime(p) >= started - 1:
-                          report = p
-                          break
-                  if report:
+              for p in paths:
+                  d = file_digest(p)
+                  if d is not None and d != before[p]:
+                      report = p
                       break
               if report:
                   try:
@@ -618,7 +639,16 @@ jobs:
               new, parts, unknown = 0, [], 0
               for c in measure['lint']['commands']:
                   h, b = c.get('head'), c.get('base')
-                  if h is None:
+                  # 126/127 = command not executable / not found: the count is a
+                  # shell error, not lint output — never compare it.
+                  if c.get('head_exit') in (126, 127):
+                      h = None
+                  if c.get('base_exit') in (126, 127):
+                      b = None
+                  if h is None and c.get('head_exit') in (126, 127):
+                      unknown += 1
+                      parts.append('not runnable')
+                  elif h is None:
                       unknown += 1
                       parts.append('timeout')
                   elif b is None:
@@ -631,7 +661,7 @@ jobs:
               if new:
                   return r('fail', val, f'{new} new issue(s) vs base')
               if unknown:
-                  return r('n/a', val, 'could not compare with base (timeout or base run unavailable)')
+                  return r('n/a', val, 'could not compare with base (command not runnable, timeout or base run unavailable)')
               return r('pass', val, 'issue count base→head')
 
           def eval_size(m, files):
@@ -650,11 +680,23 @@ jobs:
               except ValueError:
                   return []
 
+          def _jlic(s):
+              # dependency-review-action v4: {"forbidden": [...], "unresolved": [...], "unlicensed": [...]}
+              try:
+                  v = json.loads(s) if s else []
+              except ValueError:
+                  return []
+              if isinstance(v, dict):
+                  return [x for k in ('forbidden', 'unresolved', 'unlicensed') for x in (v.get(k) or [])]
+              return v if isinstance(v, list) else []
+
           def eval_dependencies(m, files, dr):
               manifests = [f['filename'] for f in files if re.search(MANIFEST_REGEX, f['filename'])]
               if not manifests:
                   return r('pass', 'no manifest changes', '')
-              vul, lic, den = _jl(dr.get('vulnerable')), _jl(dr.get('invalid_license')), _jl(dr.get('denied'))
+              if (dr.get('outcome') or '') == 'success':
+                  return r('pass', f'{len(manifests)} manifest(s)', f"no vulnerabilities ≥ {m['fail_on_severity']}, no license issues")
+              vul, lic, den = _jl(dr.get('vulnerable')), _jlic(dr.get('invalid_license')), _jl(dr.get('denied'))
               if vul or lic or den:
                   bits = []
                   if vul:

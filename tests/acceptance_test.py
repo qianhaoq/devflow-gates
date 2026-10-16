@@ -184,7 +184,35 @@ def _deps():
     assert e(m, [F('.github/workflows/ci.yml')], {'outcome': ''})['status'] == 'n/a'
     x = e(m, [F('requirements.txt')], {'outcome': 'failure', 'vulnerable': '[{"name":"lodash"}]', 'invalid_license': '[]'})
     assert x['status'] == 'fail' and 'lodash' in x['detail']
-t('gate: dependencies (no manifest / clean / unavailable / vulnerable)', _deps)
+    x = e(m, [F('package.json')], {'outcome': 'failure', 'vulnerable': '[]',
+                                   'invalid_license': '{"forbidden":[{"name":"gpl-lib"}],"unresolved":[],"unlicensed":[]}'})
+    assert x['status'] == 'fail' and 'gpl-lib' in x['detail'], x
+t('gate: dependencies (no manifest / clean / unavailable / vulnerable / license object)', _deps)
+
+def _lint127():
+    m = cfg({'metrics': {'lint': {'commands': ['x']}}})['metrics']['lint']
+    x = G['eval_lint'](m, {'lint': {'commands': [{'head': 1, 'base': 1, 'head_exit': 127, 'base_exit': 127}]}}, 's')
+    assert x['status'] == 'n/a', x
+    x = G['eval_lint'](m, {'lint': {'commands': [{'head': 2, 'base': 1, 'head_exit': 1, 'base_exit': 127}]}}, 's')
+    assert x['status'] == 'n/a', x
+    x = G['eval_lint'](m, {'lint': {'commands': [{'head': 2, 'base': 1, 'head_exit': 1, 'base_exit': 1}]}}, 's')
+    assert x['status'] == 'fail', x
+t('gate: lint command not runnable (126/127) is n/a, never a pass', _lint127)
+
+def _blank():
+    import yaml
+    for text in ('metrics:\n', 'setup:\nmetrics:\n  tests:\n', 'metrics: 3\n'):
+        c, w = C['resolve'](yaml.safe_load(text))
+        assert c['metrics']['tests']['threshold'] == 70 and c['setup']['timeout_seconds'] == 240, text
+t('config: blank / scalar sections fall back to defaults', _blank)
+
+def _digest():
+    d = tempfile.mkdtemp(); p = os.path.join(d, 'lcov.info')
+    assert M['file_digest'](p) is None
+    open(p, 'w').write('a'); a = M['file_digest'](p)
+    open(p, 'w').write('a'); assert M['file_digest'](p) == a
+    open(p, 'w').write('b'); assert M['file_digest'](p) != a
+t('measure: coverage report freshness by content hash', _digest)
 
 def _ev():
     m = cfg()['metrics']['evidence']
