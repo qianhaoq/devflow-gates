@@ -247,6 +247,16 @@ def _round2():
         pass
     tc = cfg()['metrics']['tests_changed']
     assert G['eval_tests_changed'](tc, [F('src/a.py')], ['no-test-needed'], '<!-- no-test-needed: explain why here -->')['status'] == 'fail'
+    try:
+        M['parse_cobertura']('<coverage><class filename="a.py"><lines><line number="x"/></lines></class></coverage>', '/r'); raise AssertionError('no raise')
+    except ValueError:
+        pass
+    assert G['eval_tests_changed'](tc, [F('src/a.py'), F('tests/test_a.py', status='removed')], [], '')['status'] == 'fail'
+    assert any('commmand' in x for x in C['resolve']({'metrics': {'tests': {'commmand': 'pytest'}}})[1])
+    assert G['eval_evidence'](cfg()['metrics']['evidence'], '```md\n## Test plan\nsample\n```\n')['status'] == 'fail'
+    assert G['eval_evidence'](cfg()['metrics']['evidence'], '```\ncode\n```\n## 自测\n通过')['status'] == 'pass'
+    dm = cfg()['metrics']['dependencies']
+    assert G['eval_dependencies'](dm, [F('package.json')], {'outcome': 'failure', 'invalid_license': '{"forbidden":[],"unresolved":[],"unlicensed":[{"name":"x"}]}'})['status'] == 'n/a'
 t('round 2: blank regex, lint setup failure, compare_base false, coverage parse error', _round2)
 
 def _ev():

@@ -158,9 +158,13 @@ jobs:
               for k in raw:
                   if k not in DEFAULTS:
                       warnings.append(f'unknown top-level key {k!r} ignored')
-              for k in (raw.get('metrics') or {}):
+              for k, v in (raw.get('metrics') or {}).items():
                   if k not in DEFAULTS['metrics']:
                       warnings.append(f'unknown metric {k!r} ignored')
+                  elif isinstance(v, dict):
+                      for kk in v:
+                          if kk not in DEFAULTS['metrics'][k] and kk != 'mode':
+                              warnings.append(f'unknown key metrics.{k}.{kk!r} ignored (typo?)')
               cfg = deep_merge(DEFAULTS, {k: v for k, v in raw.items() if k in DEFAULTS})
               cfg['metrics'] = {k: cfg['metrics'][k] for k in METRIC_IDS}
               if cfg['mode'] not in MODES:
@@ -369,7 +373,7 @@ jobs:
           def parse_cobertura(text, root, workdir='.'):
               tree = ET.fromstring(text)
               sources = [s.text.strip() for s in tree.iter('source') if s.text and s.text.strip()]
-              cov = {}
+              cov, bad, good = {}, 0, 0
               for cls in tree.iter('class'):
                   fn = cls.get('filename')
                   if not fn:
@@ -385,8 +389,12 @@ jobs:
                       try:
                           n, h = int(ln.get('number')), int(float(ln.get('hits', '0')))
                       except (TypeError, ValueError):
+                          bad += 1
                           continue
+                      good += 1
                       d[n] = max(d.get(n, 0), h)
+              if bad and not good:
+                  raise ValueError(f'cobertura report has {bad} malformed <line> record(s) and no valid line data')
               return cov
 
           def changed_line_coverage(added, cov):
@@ -642,7 +650,7 @@ jobs:
           def eval_tests_changed(m, files, labels, body):
               src_re, test_re = re.compile(m['source_regex']), re.compile(m['test_regex'])
               live = [f for f in files if f.get('status') != 'removed']
-              tests = [f['filename'] for f in files if test_re.search(f['filename'])]
+              tests = [f['filename'] for f in live if test_re.search(f['filename'])]  # deleting tests doesn't count
               sources = [f['filename'] for f in live if src_re.search(f['filename']) and not test_re.search(f['filename'])]
               if not sources:
                   return r('pass', 'no source changes', '')
@@ -730,7 +738,8 @@ jobs:
               except ValueError:
                   return []
               if isinstance(v, dict):
-                  return [x for k in ('forbidden', 'unresolved', 'unlicensed') for x in (v.get(k) or [])]
+                  # `unlicensed` is informational upstream (does not fail the action).
+                  return [x for k in ('forbidden', 'unresolved') for x in (v.get(k) or [])]
               return v if isinstance(v, list) else []
 
           def eval_dependencies(m, files, dr):
@@ -763,7 +772,15 @@ jobs:
           def eval_evidence(m, body):
               text = re.sub(r'<!--.*?-->', '', body or '', flags=re.S)
               want = re.compile(m['heading_regex'], re.I)
-              lines = text.splitlines()
+              lines, fence = [], None
+              for line in text.splitlines():  # drop fenced code blocks (``` / ~~~)
+                  fm = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
+                  if fence is None and fm:
+                      fence = fm.group(1)[0] * len(fm.group(1))
+                  elif fence is not None and fm and fm.group(1).startswith(fence):
+                      fence = None
+                  elif fence is None:
+                      lines.append(line)
               found_empty = None
               for i, line in enumerate(lines):
                   h = HEADING.match(line)
