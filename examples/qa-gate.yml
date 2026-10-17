@@ -23,9 +23,15 @@
 # permissions only. Expect failing PRs to be re-evaluated every 15
 # minutes until green or closed.
 #
-# Concurrency: one evaluation per PR; a stale in-flight run is cancelled
-# by the newer event. Schedule runs fall back to a unique run_id group
-# (nothing to cancel).
+# Concurrency: synchronize (push) runs get their own group per head SHA
+# and are NEVER cancelled (cancel-in-progress is false for them), so a
+# label/unlabel event right after a push cannot cancel the run that strips
+# the label. Other pull_request_target events share one per-PR group and
+# cancel each other (they all evaluate the current state);
+# workflow_dispatch re-evaluations use a separate group so they cannot
+# cancel a run that attaches the PR-head check. Schedule runs fall back to
+# a unique run_id group (nothing to cancel). The gate itself does not rely
+# on this: a stale label is stripped on ANY event (fail closed).
 
 name: QA Gate
 
@@ -47,8 +53,12 @@ permissions:
   issues: write
 
 concurrency:
-  group: qa-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
-  cancel-in-progress: true
+  group: >-
+    qa-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}-${{
+    github.event_name != 'pull_request_target' && 'aux' ||
+    github.event.action == 'synchronize' && format('sync-{0}', github.event.pull_request.head.sha) ||
+    'target' }}
+  cancel-in-progress: ${{ github.event.action != 'synchronize' }}
 
 jobs:
   qa:
