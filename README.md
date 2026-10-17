@@ -209,7 +209,8 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
      运行与打标之间没有 `head_ref_force_pushed` 事件（每次 push 都会产生一次
      运行，运行只可能在推送之后产生；committer date 可伪造、REST
      `committed` 事件没有时间戳，单靠它们不算数）；或 B 本身也是这样被保留的
-     干净合入（可连续多次update branch）。因此评估 job 需要 `actions: read`（现有调用方的 `qa`
+     干净合入（可连续多次 update branch）。
+     因此评估 job 需要 `actions: read`（现有调用方的 `qa`
      job 已授予 `actions: write`，示例也已补上）。
    否则（作者普通提交、rebase/force push、`before` 缺失或取不到、多个
    merge base、git < 2.38、任何 git/网络错误）一律按原逻辑移除标签，并把
