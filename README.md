@@ -177,6 +177,8 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
 | 输入 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `qa_label` | string | `'qa-passed'` | 标记"已在最新 head 上完成人工 QA"的标签 |
+| `allowed_labelers` | string | `''` | 可选，逗号/空格分隔的登录名；只有这些人的 `labeled` 事件算签收（设置了但为空 → 失败） |
+| `keep_qa_on_clean_main_update` | boolean | `false` | 可选。push 只是把 base 分支**干净合入**已验收 head 时保留标签（见下文） |
 
 **标签流转**：
 
@@ -188,6 +190,29 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
    标签早于最后推送 → 失败（`label predates the latest push`）。
 3. **新的 push（synchronize）→ 自动移除 `qa-passed` 标签并失败**
    （`new push invalidated QA`），需重新验收、重新打标。
+   **例外（`keep_qa_on_clean_main_update: true`，默认关闭）**：新 head H
+   满足以下全部条件时**保留**标签、门禁按"标签有效"通过，并发/更新一条置顶
+   PR 评论「仅干净合入 main（无冲突、无与本 PR 重叠的文件），qa-passed 保留；
+   QA 测试基于 <B 短 SHA>」：
+   - H 是恰好 2 个父提交的 merge；parent1 == `github.event.before`（B，QA
+     验过的 head）；parent2 在 base 分支上（`git merge-base --is-ancestor
+     P2 origin/<base>`）；
+   - 在临时裸仓库里 `git merge-tree --write-tree B P2` 无冲突且结果 tree ==
+     `H^{tree}`（手工解冲突 / 夹带改动 → 不保留）；
+   - 保守规则：`git diff --name-only $(git merge-base B P2) P2` 与
+     `… B` 的文件集合**无交集**（main 改过本 PR 也改的文件 → 不保留；
+     重命名按删除+新增两侧路径都算）；
+   - 签收本身覆盖 B：最后一次 `labeled` 来自允许的打标人，且晚于 B 的推送
+     （或 B 本身也是这样被保留的干净合入，可连续多次 update branch）。
+   否则（作者普通提交、rebase/force push、`before` 缺失或取不到、多个
+   merge base、git < 2.38、任何 git/网络错误）一律按原逻辑移除标签，并把
+   原因写进 job summary。只跑 git 管道命令（fetch / merge-base /
+   merge-tree / diff），从不检出或执行 PR 代码。标签本身不被改动，所以
+   "最后一次 labeled 来自允许打标人"的检查仍针对原 QA 签收；第 3 步的竞态
+   保护（标签晚于本次 push 则保留）不变。之后的非 push 事件（labeled、
+   定时刷新重跑等）会沿 first-parent 逐个复核这些干净合入回到 QA 验过的
+   head。GitHub "Update branch"（merge 方式）产生的正是 parent1 = 旧 head、
+   parent2 = base tip 的 merge；"Update with rebase" 是 force push → 移除。
 4. 草稿 PR → 失败（在第 3 步移除标签**之后**才检查草稿，草稿 PR 收到新 push 同样会被移除 `qa-passed`）；非 PR 上下文 / 已关闭 PR → info 跳过（成功）。
 5. **`workflow_dispatch` 传入非法/非数字 `pr_number` → 失败**（与 Codex
    Gate 一致，操作错误必须显式报错）。

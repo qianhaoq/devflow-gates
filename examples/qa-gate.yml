@@ -57,6 +57,7 @@ jobs:
     with:
       qa_label: 'qa-passed'
       # allowed_labelers: 'alice, bob'   # optional: only these users' label counts
+      # keep_qa_on_clean_main_update: true   # optional: a clean "update branch" merge of main keeps the label
 
   # Schedule path only — see the header note. actions: write is scoped to
   # this job; it re-runs failing pull_request_target gate runs.
