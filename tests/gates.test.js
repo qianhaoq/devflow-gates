@@ -255,10 +255,19 @@ const UNL_KW = 'This is a security problem.';
     const c2 = await runQa({ ...exploit, action: 'labeled', runPrs: [2], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
     assert.deepStrictEqual(c2.removed, ['qa-passed']);
   });
-  await t('qa-gate: run listing error (e.g. no actions: read) fails closed without stripping', async () => {
+  await t('qa-gate: run listing error (e.g. no actions: read) strips and fails closed', async () => {
     const c = await runQa({ ...exploit, action: 'labeled', runs: null });
-    assert.deepStrictEqual(c.removed, []);
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
     assert.ok(c.failed && /could not verify/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: cancelled push then converted_to_draft → stale label stripped, fails', async () => {
+    const c = await runQa({ ...exploit, draft: true, action: 'converted_to_draft' });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed && /predates the latest push/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: draft without label fails as draft', async () => {
+    const c = await runQa({ draft: true, action: 'converted_to_draft', labels: [] });
+    assert.ok(c.failed && /draft/.test(c.failed), c.failed);
   });
   await t('qa-gate: workflow_dispatch run on the PR branch counts as a head observation', async () => {
     const c = await runQa({ ...exploit, action: 'labeled', runs: [], dispatch: [[HEAD, '2026-02-01T16:55:00Z']] });
@@ -587,6 +596,7 @@ const UNL_KW = 'This is a security problem.';
             getWorkflowRun: async () => ({ data: { workflow_id: 7, name: 'Gate' } }),
             listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
             reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
+            reRunWorkflow: async (a) => { reran.push(`all:${a.run_id}`); },
           },
           pulls: { list: async () => ({}) },
         },
@@ -603,6 +613,18 @@ const UNL_KW = 'This is a security problem.';
     });
     await t(`${file} refresh: ignores dispatch on another branch`, async () => {
       const r = await runRefresh({ workflow_dispatch: [{ id: 6, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'main', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }] });
+      assert.deepStrictEqual(r, []);
+    });
+    await t(`${file} refresh: a cancelled run on the head is re-run even if a later run succeeded`, async () => {
+      const r = await runRefresh({
+        pull_request_review: [{ id: 11, event: 'pull_request_review', head_sha: 'h1', status: 'completed', conclusion: 'cancelled', created_at: '2026-10-16T01:00:00Z' }],
+        pull_request_target: [{ id: 12, event: 'pull_request_target', head_sha: 'h1', status: 'completed', conclusion: 'success', created_at: '2026-10-16T02:00:00Z' }] });
+      assert.deepStrictEqual(r, ['all:11']);
+    });
+    await t(`${file} refresh: nothing is re-run while a run on the head is still in progress`, async () => {
+      const r = await runRefresh({
+        pull_request_target: [{ id: 13, event: 'pull_request_target', head_sha: 'h1', status: 'completed', conclusion: 'cancelled', created_at: '2026-10-16T01:00:00Z' },
+          { id: 14, event: 'pull_request_target', head_sha: 'h1', status: 'in_progress', conclusion: null, created_at: '2026-10-16T02:00:00Z' }] });
       assert.deepStrictEqual(r, []);
     });
     await t(`${file} refresh: newest run decides (later target success wins)`, async () => {

@@ -130,6 +130,12 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
 - 该 API 需要 `actions: write`，**只**授予调用方的 `codex-refresh` job
   （schedule 路径专属）；评估 job 保持只读。
 - 副作用：检查仍为红的 PR 每 15 分钟会被重跑一次，直到转绿或关闭。
+- **被取消的运行不是最终结论**：head 上任何 `cancelled` 的 Gate 运行
+  （pull_request_target / pull_request_review / pull_request_review_comment /
+  分支上的 workflow_dispatch；例如 review 事件之间的 cancel-in-progress）会被
+  `actions.reRunWorkflow` 整体重跑一次，避免分支保护把残留的 cancelled
+  必需检查当作结果（405 "Required status check … is cancelled"）。该 head
+  上仍有排队/运行中的运行时本轮不重跑。QA Gate Refresh 同样适用。
 - 检查缺失 / 最近一次 pull_request_target 运行仍在跑 / 已成功 → 不动。
 
 判定规则（fail-closed）：

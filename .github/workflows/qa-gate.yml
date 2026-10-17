@@ -560,16 +560,11 @@ jobs:
               return;
             }
 
-            // Draft check runs AFTER the synchronize invalidation so a
-            // draft PR cannot keep a stale QA label across a push.
-            if (pr.draft) {
-              const msg = 'PR is draft — QA gate fails until ready_for_review';
-              core.info(`PR #${prNumber}: ${msg}`);
-              core.setFailed(msg);
-              return;
-            }
-
             if (!hasLabel) {
+              if (pr.draft) {
+                core.setFailed('PR is draft — QA gate fails until ready_for_review');
+                return;
+              }
               const msg = `PR #${prNumber} has no "${QA_LABEL}" label — manual QA not signed off on head ${sha.slice(0, 7)}. Follow templates/QA.md, verify the latest head, then apply the label.`;
               core.setFailed(msg);
               return;
@@ -577,7 +572,7 @@ jobs:
 
             const so = await signoff();
             if (!so.ok) {
-              core.setFailed(so.msg);
+              core.setFailed(pr.draft ? `PR is draft — QA gate fails until ready_for_review; also: ${so.msg}` : so.msg);
               return;
             }
             const labeledTime = so.labeledTime;
@@ -592,9 +587,17 @@ jobs:
               a = await qaAnchor(sha, labeledTime, 0);
             } catch (err) {
               // API error (e.g. caller did not grant actions: read): the
-              // binding cannot be proven → FAIL (never green), but leave the
-              // label alone — a re-evaluation can still verify it.
-              core.setFailed(`QA Gate could not verify that "${QA_LABEL}" is bound to head ${short(sha)} (error while checking: ${err.message}) — failing closed; re-run the gate`);
+              // binding cannot be proven → treat as stale (AGENTS.md: any
+              // doubt or error strips the label).
+              a = { ok: false, reason: `could not verify the binding (error while checking: ${err.message})` };
+            }
+            // Draft check runs AFTER the synchronize invalidation and the
+            // stale-label check, so a draft PR can never keep a stale QA
+            // label (push or cancelled push).
+            if (a.ok && pr.draft) {
+              const msg = 'PR is draft — QA gate fails until ready_for_review';
+              core.info(`PR #${prNumber}: ${msg}`);
+              core.setFailed(msg);
               return;
             }
             if (a.ok) {
@@ -625,6 +628,11 @@ jobs:
   # pull_request_target event, so the fresh conclusion re-attaches to the
   # PR head check. Needs actions:write granted by the CALLER on its
   # schedule-path job (see examples/qa-gate.yml, job `qa-refresh`).
+  # ALSO: every CANCELLED gate run on the current head (concurrency
+  # cancel-in-progress between events leaves a cancelled check run that
+  # branch protection may treat as the required check's result) is re-run
+  # in full (actions.reRunWorkflow) — a cancelled run is never the final
+  # word. Nothing is re-run while a run on that head is still in flight.
   qa-gate-refresh:
     name: QA Gate Refresh
     runs-on: ubuntu-latest
@@ -665,40 +673,55 @@ jobs:
               scanned += 1;
               const sha = pr.head.sha;
               // Gate runs whose check sits on this PR head: pull_request_target
-              // runs, plus workflow_dispatch runs dispatched ON the PR branch
-              // (e.g. crawl.yml for a GITHUB_TOKEN-created PR, where no
-              // pull_request(_target) event ever fires). A dispatch on another
-              // ref has a different head_sha and is excluded.
+              // and pull_request_review(_comment) runs (all carry the PR
+              // head SHA), plus workflow_dispatch runs dispatched ON the PR
+              // branch (e.g. crawl.yml for a GITHUB_TOKEN-created PR, where
+              // no pull_request(_target) event ever fires). A dispatch on
+              // another ref has a different head_sha and is excluded.
               const runs = [];
-              for (const event of ['pull_request_target', 'workflow_dispatch']) {
+              for (const event of ['pull_request_target', 'pull_request_review', 'pull_request_review_comment', 'workflow_dispatch']) {
                 const { data: runsData } = await github.rest.actions.listWorkflowRuns({
                   owner,
                   repo,
                   workflow_id: workflowId,
                   head_sha: sha,
                   event,
-                  status: 'completed',
                   per_page: 20,
                 });
                 runs.push(...(runsData.workflow_runs || []).filter((r) => r.head_sha === sha
-                  && (event === 'pull_request_target' || r.head_branch === pr.head.ref)));
+                  && (event !== 'workflow_dispatch' || r.head_branch === pr.head.ref)));
               }
+              // Something is still queued/running on this head: its result
+              // will land on the check; re-running now could cancel it.
+              if (runs.some((r) => r.status && r.status !== 'completed')) continue;
               runs.sort((a, b) => (Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)) || ((b.id || 0) - (a.id || 0)));
               const latest = runs[0];
-              // Only re-run when the gate check on this head is failing:
-              // the latest completed pull_request_target run's conclusion
-              // IS that check. Success/missing/still-running → nothing to
-              // refresh.
-              if (!latest || latest.conclusion !== 'failure') continue;
-              await github.rest.actions.reRunWorkflowFailedJobs({
-                owner,
-                repo,
-                run_id: latest.id,
-              });
-              rerun += 1;
-              core.info(
-                `PR #${pr.number}: re-running failed jobs of run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`
-              );
+              // Re-run when the gate check on this head is failing: the
+              // latest completed run's conclusion IS that check.
+              if (latest && latest.conclusion === 'failure') {
+                await github.rest.actions.reRunWorkflowFailedJobs({
+                  owner,
+                  repo,
+                  run_id: latest.id,
+                });
+                rerun += 1;
+                core.info(
+                  `PR #${pr.number}: re-running failed jobs of run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`
+                );
+              }
+              // A CANCELLED run (concurrency cancel-in-progress between
+              // events) leaves its own cancelled check run on the head, and
+              // branch protection can treat that as the required check's
+              // result even when another run succeeded. A cancelled run is
+              // never the final word: re-run it so it re-evaluates the
+              // current state (the gate reads live API state, not the
+              // event).
+              for (const r of runs) {
+                if (r.conclusion !== 'cancelled') continue;
+                await github.rest.actions.reRunWorkflow({ owner, repo, run_id: r.id });
+                rerun += 1;
+                core.info(`PR #${pr.number}: re-running cancelled run ${r.id} (${r.event}, head ${sha.slice(0, 7)})`);
+              }
             }
             core.info(
               `QA Gate Refresh done: ${scanned} open non-draft PR(s) scanned, ${rerun} failing gate run(s) re-run`
