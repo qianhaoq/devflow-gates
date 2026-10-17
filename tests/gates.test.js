@@ -100,18 +100,33 @@ const UNL_KW = 'This is a security problem.';
 
   // QA gate dry-run.
   const qa = scripts('qa-gate.yml')[0];
-  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt }) {
-    const calls = { removed: [], failed: null };
+  const HEAD = 'abcdef1234567abcdef1234567abcdef12345678';
+  const PREV = '1111111111111111111111111111111111111111';
+  // Default head observations: HEAD's run long before any label below.
+  const RUNS0 = [[HEAD, '2026-01-15T00:00:00Z']];
+  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt, runs = RUNS0, timeline = [], headRepo = 'o/r', runPrs = [1], dispatch = [] }) {
+    const calls = { removed: [], failed: null, info: [] };
+    const mkRun = (event) => ([sha, at, extra = {}], i) => ({ id: i + 1, event, head_sha: sha, head_branch: 'feat', head_repository: { full_name: headRepo }, pull_requests: runPrs.map((number) => ({ number })), created_at: at, ...extra });
     const github = {
       rest: {
-        pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft, head: { sha: 'abcdef1234567' }, labels: labels.map((name) => ({ name })) } }) },
+        pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft, head: { sha: HEAD, ref: 'feat', repo: { full_name: headRepo } }, base: { ref: 'main' }, labels: labels.map((name) => ({ name })) } }) },
         issues: { removeLabel: async (a) => { calls.removed.push(a.name); }, listEvents: async () => ({}), listEventsForTimeline: async () => ({}) },
-        repos: { getCommit: async () => ({ data: { commit: { committer: { date: '2026-01-01T00:00:00Z' } } } }) },
+        actions: { getWorkflowRun: async () => ({ data: { workflow_id: 7 } }), listWorkflowRuns: async () => ({}) },
+        repos: { getCommit: async () => { throw new Error('committer dates must not be consulted'); } },
       },
-      paginate: async (fn) => (fn === github.rest.issues.listEvents ? events : []),
+      paginate: async (fn, args) => {
+        if (fn === github.rest.issues.listEvents) return events;
+        if (fn === github.rest.issues.listEventsForTimeline) return timeline;
+        if (fn === github.rest.actions.listWorkflowRuns) {
+          if (runs === null) throw new Error('Resource not accessible by integration');
+          return args.event === 'pull_request_target' ? runs.map(mkRun('pull_request_target'))
+            : dispatch.map(mkRun('workflow_dispatch')).map((r) => ({ ...r, pull_requests: [], head_repository: { full_name: 'o/r' } }));
+        }
+        return [];
+      },
     };
-    const core = { info() {}, warning() {}, setFailed: (m) => { calls.failed = m; } };
-    const context = { eventName: 'pull_request_target', payload: { action, pull_request: { number: 1, head: { sha: 'abcdef1234567' }, updated_at: updatedAt } }, repo: { owner: 'o', repo: 'r' } };
+    const core = { info: (m) => calls.info.push(m), warning() {}, setFailed: (m) => { calls.failed = m; }, summary: { addRaw() { return this; }, async write() {} } };
+    const context = { eventName: 'pull_request_target', runId: 99, payload: { action, pull_request: { number: 1, head: { sha: HEAD }, updated_at: updatedAt } }, repo: { owner: 'o', repo: 'r' } };
     await new AsyncFunction('github', 'context', 'core', 'process', qa)(github, context, core, { env: { QA_LABEL: 'qa-passed', ALLOWED_LABELERS: allowed } });
     return calls;
   }
@@ -164,16 +179,90 @@ const UNL_KW = 'This is a security problem.';
   });
 
   await t('qa-gate: label applied after the push survives synchronize (race)', async () => {
+    // The synchronize payload itself observes HEAD at the push (16:57:25);
+    // its run may not even be listed yet.
     const c = await runQa({ draft: false, action: 'synchronize', labels: ['qa-passed'], allowed: 'qianhaoq',
+      runs: [[PREV, '2026-02-01T16:40:00Z']],
       updatedAt: '2026-02-01T16:57:25Z', events: [at('labeled', 'qianhaoq', '2026-02-01T16:57:34Z')] });
     assert.deepStrictEqual(c.removed, []);
     assert.strictEqual(c.failed, null, c.failed);
   });
   await t('qa-gate: label applied before the push is stripped on synchronize', async () => {
     const c = await runQa({ draft: false, action: 'synchronize', labels: ['qa-passed'],
+      runs: [[PREV, '2026-02-01T16:40:00Z'], [HEAD, '2026-02-01T16:57:26Z']],
       updatedAt: '2026-02-01T16:57:25Z', events: [at('labeled', 'qianhaoq', '2026-02-01T16:50:00Z')] });
     assert.deepStrictEqual(c.removed, ['qa-passed']);
     assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
+  });
+
+  // ---- P1 regression: backdated committer date + label event that
+  // cancels the synchronize run (qa-gate-sandbox-91 PR #17). QA signed
+  // off PREV at 17:00; the author pushes HEAD (committer date backdated,
+  // irrelevant now) at 17:10 and adds "wip" 0.3s later; the synchronize
+  // run is cancelled, the labeled run evaluates.
+  const exploit = { draft: false, labels: ['qa-passed', 'wip'], allowed: 'qianhaoq',
+    events: [at('labeled', 'qianhaoq', '2026-02-01T17:00:00Z')],
+    runs: [[PREV, '2026-02-01T16:55:00Z'], [HEAD, '2026-02-01T17:10:01Z', { conclusion: 'cancelled' }], [HEAD, '2026-02-01T17:10:01Z']],
+    updatedAt: '2026-02-01T17:10:01Z' };
+  await t('qa-gate: backdated push + label event cancelling the synchronize run → stripped, fails', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled' });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed && /predates the latest push/.test(c.failed) && /head was 1111111 at sign-off/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: same exploit, label added BEFORE the push (labeled run sees the old head) → later run strips', async () => {
+    const c = await runQa({ ...exploit, action: 'unlabeled', runs: [[PREV, '2026-02-01T16:55:00Z'], [PREV, '2026-02-01T17:10:00Z'], [HEAD, '2026-02-01T17:10:00Z', { conclusion: 'cancelled' }]] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed, 'gate must fail');
+  });
+  await t('qa-gate: same exploit even when no run for the new head is listed (payload only) → stripped', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [[PREV, '2026-02-01T16:55:00Z']] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed);
+  });
+  await t('qa-gate: no head observation before the label at all → stripped (fail closed)', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [], updatedAt: '2026-02-01T17:10:01Z' });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed && /no head observation before the label/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: control — label applied on the tested head stays green on later events', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [[HEAD, '2026-02-01T16:55:00Z'], [HEAD, '2026-02-01T17:10:01Z']] });
+    assert.deepStrictEqual(c.removed, []);
+    assert.strictEqual(c.failed, null, c.failed);
+  });
+  await t('qa-gate: a run in the same second as the label does not count (strictly before)', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [[PREV, '2026-02-01T16:55:00Z'], [HEAD, '2026-02-01T17:00:00Z']] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+  });
+  await t('qa-gate: force push TO the head before the label is fine; to another SHA rejects', async () => {
+    const runs = [[HEAD, '2026-02-01T16:55:00Z']];
+    const ok = await runQa({ ...exploit, action: 'labeled', runs,
+      timeline: [{ event: 'head_ref_force_pushed', commit_id: HEAD, created_at: '2026-02-01T16:55:00Z' }] });
+    assert.strictEqual(ok.failed, null, ok.failed);
+    const bad = await runQa({ ...exploit, action: 'labeled', runs,
+      timeline: [{ event: 'head_ref_force_pushed', commit_id: PREV, created_at: '2026-02-01T16:58:00Z' }] });
+    assert.deepStrictEqual(bad.removed, ['qa-passed']);
+    assert.ok(/force push/.test(bad.failed), bad.failed);
+  });
+  await t('qa-gate: fork PR (runs carry no PR association) binds on head repo + branch', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', headRepo: 'fork/r', runPrs: [], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
+    assert.strictEqual(c.failed, null, c.failed);
+    const c2 = await runQa({ ...exploit, action: 'labeled', headRepo: 'fork/r', runPrs: [] });
+    assert.deepStrictEqual(c2.removed, ['qa-passed']);
+  });
+  await t('qa-gate: same-repo run without PR association / of another PR does not count', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runPrs: [], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    const c2 = await runQa({ ...exploit, action: 'labeled', runPrs: [2], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
+    assert.deepStrictEqual(c2.removed, ['qa-passed']);
+  });
+  await t('qa-gate: run listing error (e.g. no actions: read) fails closed without stripping', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: null });
+    assert.deepStrictEqual(c.removed, []);
+    assert.ok(c.failed && /could not verify/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: workflow_dispatch run on the PR branch counts as a head observation', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [], dispatch: [[HEAD, '2026-02-01T16:55:00Z']] });
+    assert.strictEqual(c.failed, null, c.failed);
   });
 
   // ---- keep_qa_on_clean_main_update: real git in temp repos ----------
@@ -244,6 +333,7 @@ const UNL_KW = 'This is a security problem.';
         paginate: async (fn, args) => {
           if (fn === github.rest.issues.listEvents) return [{ event: 'labeled', label: { name: 'qa-passed' }, actor: { login: labeler }, created_at: iso(labeledAt) }];
           if (fn === github.rest.actions.listWorkflowRuns) {
+            if (args.event !== 'pull_request_target') return [];
             const mk = (sha, at, i) => ({ id: i, event: 'pull_request_target', head_sha: sha, head_branch: 'feat', head_repository: { full_name: 'o/r' }, pull_requests: runPr ? [{ number: runPr }] : [], created_at: iso(at) });
             const list = [[B, runAt], ...extraRuns.map(([sha, at]) => [sha === 'A' ? f.m0 : sha, at]), ...pushed.map((sha) => [sha, 4])];
             return list.map(([sha, at], i) => mk(sha, at, i + 1));
@@ -425,7 +515,7 @@ const UNL_KW = 'This is a security problem.';
     });
     await t('qa-gate keep: B committed before the label but pushed after it (no run proof) → stripped', async () => {
       const c = await scenario((f) => ({ H: mergeMain(f) }), { runAt: 2.5 });
-      stripped(c, /no pull_request_target run .* proves/);
+      stripped(c, /no gate run proves/);
     });
     await t('qa-gate keep: non-sync run with a stale label on an unreviewed commit strips it', async () => {
       const c = await scenario((f) => {
@@ -463,17 +553,17 @@ const UNL_KW = 'This is a security problem.';
     });
     await t('qa-gate keep: run proof from another PR (same branch/SHA) or no PR association → stripped', async () => {
       const c = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 2 });
-      stripped(c, /no pull_request_target run .* proves/);
+      stripped(c, /no gate run proves/);
       const c2 = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 0 });
-      stripped(c2, /no pull_request_target run .* proves/);
+      stripped(c2, /no gate run proves/);
     });
     await t('qa-gate keep: SHA replayed after sign-off (B → reset to A, QA on A, fast-forward to B) → stripped', async () => {
       // B ran at 1.1, then a run for A at 1.5 (head moved back), label at 2.
       const c = await scenario((f) => ({ H: mergeMain(f) }), { extraRuns: [['A', 1.5]] });
-      stripped(c, /no pull_request_target run .* proves/);
+      stripped(c, /no gate run proves/);
       // Same, but the reset produced no run: the force-push event alone rejects.
       const c2 = await scenario((f) => ({ H: mergeMain(f) }), { forcePushAt: 1.5 });
-      stripped(c2, /no pull_request_target run .* proves|label predates/);
+      stripped(c2, /no gate run proves/);
     });
     await t('qa-gate keep: race guard still keeps a label applied after the push', async () => {
       const c = await scenario((f) => {

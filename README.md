@@ -184,10 +184,17 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
 
 1. QA 按 [templates/QA.md](templates/QA.md) 在**最新 head commit** 上完成
    测试点 + 黄金样例，然后给 PR 打 `qa-passed`。
-2. 门禁通过条件：标签存在，**且**该标签最近一次 `labeled` 事件时间晚于
-   head 的最后推送时间（取三者最大：head commit 的 committer date、
-   timeline 里该 SHA 的 `committed` 事件、`head_ref_force_pushed` 事件）。
-   标签早于最后推送 → 失败（`label predates the latest push`）。
+2. 门禁通过条件：标签存在，**且**该标签最近一次 `labeled` 事件**绑定到当前
+   head SHA**：在 GitHub 服务端记录的本 PR head 观测中（本 caller 工作流的
+   `pull_request_target` 运行——含被取消的运行；本 PR 分支上的
+   `workflow_dispatch` 运行；当前事件 payload 的 `head.sha`@`updated_at`），
+   严格早于打标时间的**最后一次**观测就是当前 head，且其与打标之间没有指向
+   其他 SHA 的 `head_ref_force_pushed` 事件。committer date 可由作者伪造
+   （回填），**完全不参与判断**；REST `committed` 事件没有时间戳，也不用。
+   不满足 → 在**任何事件**上都移除标签并失败（`label predates the latest
+   push`）——即使 push 的 synchronize 运行被随后的 label 事件取消也一样
+   （fail closed，不依赖调用方的 concurrency 配置）。fork PR 的运行没有 PR
+   关联，按 head 仓库 + 分支匹配；同仓库 PR 的运行必须关联本 PR。
 3. **新的 push（synchronize）→ 自动移除 `qa-passed` 标签并失败**
    （`new push invalidated QA`），需重新验收、重新打标。
    **例外（`keep_qa_on_clean_main_update: true`，默认关闭）**：新 head H
@@ -202,14 +209,10 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
    - 保守规则：`git diff --name-only $(git merge-base B P2) P2` 与
      `… B` 的文件集合**无交集**（main 改过本 PR 也改的文件 → 不保留；
      重命名按删除+新增两侧路径都算）；
-   - 签收本身覆盖 B：最后一次 `labeled` 来自允许的打标人，晚于 B 的
-     committer date，**且**打标时 B 确实是本 PR 的 head —— 本工作流在本 PR
-     （头分支/仓库一致、运行关联的 PR 含本 PR；fork PR 无关联 → 不保留）上
-     打标**之前**的最后一次 `pull_request_target` 运行的 head 就是 B，并且该
-     运行与打标之间没有 `head_ref_force_pushed` 事件（每次 push 都会产生一次
-     运行，运行只可能在推送之后产生；committer date 可伪造、REST
-     `committed` 事件没有时间戳，单靠它们不算数）；或 B 本身也是这样被保留的
-     干净合入（可连续多次 update branch）。
+   - 签收本身覆盖 B：最后一次 `labeled` 来自允许的打标人，**且**按第 2 步的
+     规则绑定到 B（打标前最后一次服务端 head 观测就是 B，中间无指向其他 SHA
+     的 force push）；或 B 本身也是这样被保留的干净合入（可连续多次 update
+     branch）。
      因此评估 job 需要 `actions: read`（现有调用方的 `qa`
      job 已授予 `actions: write`，示例也已补上）。
    否则（作者普通提交、rebase/force push、`before` 缺失或取不到、多个
@@ -217,7 +220,8 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
    原因写进 job summary。只跑 git 管道命令（fetch / merge-base /
    merge-tree / diff），从不检出或执行 PR 代码。标签本身不被改动，所以
    "最后一次 labeled 来自允许打标人"的检查仍针对原 QA 签收；第 3 步的竞态
-   保护（标签晚于本次 push 则保留）不变。之后的非 push 事件（labeled、
+   保护：标签已绑定到新 head（打标前的最后一次 head 观测就是新 head，例如
+   本次 synchronize payload 本身）则保留。之后的非 push 事件（labeled、
    定时刷新重跑等）会沿 first-parent 逐个复核这些干净合入回到 QA 验过的
    head；复核失败（例如 synchronize 运行被取消、残留了过期标签）同样移除标签。GitHub "Update branch"（merge 方式）产生的正是 parent1 = 旧 head、
    parent2 = base tip 的 merge；"Update with rebase" 是 force push → 移除。
@@ -237,8 +241,10 @@ workflow_dispatch 的结论不挂 PR 检查，所以定时路径只重跑：对�
 非草稿、head 检查为失败的 PR，`actions.reRunWorkflowFailedJobs` 重跑其最近
 一次失败的 pull_request_target 来源 Gate 运行，让新结论重新挂回 head 检查
 （例如时序竞态留下的红检查）。需要 `actions: write`，只授予调用方的
-`qa-refresh` job；仍红的 PR 每 15 分钟重跑一次。并发每 PR 一组、
-`cancel-in-progress: true`。见 [examples/qa-gate.yml](examples/qa-gate.yml)。
+`qa-refresh` job；仍红的 PR 每 15 分钟重跑一次。并发（示例）：synchronize
+运行按 head SHA 单独成组且**不会被取消**（`cancel-in-progress` 对 push 为
+false），label/unlabel 等其他 `pull_request_target` 事件每 PR 一组互相取消，
+`workflow_dispatch` 另成一组；门禁本身不依赖这一点（见第 2 步）。见 [examples/qa-gate.yml](examples/qa-gate.yml)。
 
 ### 4. `.github/workflows/auto-merge.yml` — 自动合并
 
