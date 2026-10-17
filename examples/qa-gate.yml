@@ -53,10 +53,19 @@ concurrency:
 jobs:
   qa:
     if: github.event_name != 'schedule'
+    # GitHub checks EVERY job of the called file against this job's
+    # ceiling (incl. the skipped refresh job, which needs actions: write);
+    # the evaluator itself narrows to actions: read.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@main
     with:
       qa_label: 'qa-passed'
       # allowed_labelers: 'alice, bob'   # optional: only these users' label counts
+      # keep_qa_on_clean_main_update: true   # optional: a clean "update branch" merge of main keeps the label
 
   # Schedule path only — see the header note. actions: write is scoped to
   # this job; it re-runs failing pull_request_target gate runs.

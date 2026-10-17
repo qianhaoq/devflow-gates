@@ -21,6 +21,17 @@
 #     count, when that input is set). Push time = max(head commit committer date, 'committed'
 #     timeline events for the head SHA, 'head_ref_force_pushed' timeline
 #     events). A label that predates the last push is stale → fail.
+#   - Opt-in `keep_qa_on_clean_main_update: true`: a synchronize whose new
+#     head H only merges the base branch cleanly into the QA-tested head B
+#     (= event.before) KEEPS the label: H has exactly 2 parents, parent1 ==
+#     B, parent2 is on the base branch; `git merge-tree --write-tree B P2`
+#     is conflict-free and equals H^{tree}; files changed on the base since
+#     merge-base(B, P2) do not intersect files changed by the PR; and the
+#     sign-off (allowed labeler, label newer than B's push — or B itself a
+#     kept clean merge) covered B. A sticky PR comment records it; later
+#     evaluations walk back over such clean merges to the QA-tested head.
+#     Anything else, incl. any git/fetch error or missing `before`, strips
+#     as before and writes the reason to the job summary.
 #   - Draft PR → fail (checked after the synchronize label removal, so a
 #     push to a draft still strips the label). Non-PR contexts (no resolvable PR / closed PR) →
 #     info + success (nothing to gate). workflow_dispatch with an
@@ -43,7 +54,11 @@
 # only restrict permissions further, never elevate them).
 #
 # Security: gate logic uses ONLY actions/github-script + the GitHub API;
-# it never checks out the PR head and never runs PR-controlled code.
+# it never checks out the PR head and never runs PR-controlled code. With
+# keep_qa_on_clean_main_update the step additionally runs git PLUMBING
+# (fetch, rev-list, merge-base, merge-tree, diff --name-only) in a fresh
+# bare repo under RUNNER_TEMP — objects only, no worktree, no hooks, no
+# PR-supplied config; needs git >= 2.38 (ubuntu-latest has it).
 
 name: Reusable QA Gate
 
@@ -66,6 +81,18 @@ on:
         required: false
         type: string
         default: ''
+      keep_qa_on_clean_main_update:
+        description: >-
+          Opt-in. On a push (synchronize) KEEP the QA label instead of
+          stripping it when the new head is ONLY a clean merge of the base
+          branch into the head QA signed off: 2-parent merge, parent1 = the
+          previous head, parent2 on the base branch, `git merge-tree
+          --write-tree` of the parents is conflict-free and equals the head
+          tree, and no file changed on the base since the merge base is also
+          changed by the PR. Anything else (or any git error) strips as usual.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -76,7 +103,16 @@ jobs:
   qa-gate:
     name: QA Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+    # actions: read — keep_qa_on_clean_main_update proves WHEN the QA-tested
+    # head was pushed from this workflow's own pull_request_target runs.
+    # Callers already grant actions: write on this job (the refresh job in
+    # this file needs it, and GitHub checks every job against the ceiling).
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
     # Schedule never evaluates directly (a scheduled conclusion does not
     # attach to the PR head check) — the refresh job below handles it.
     if: >-
@@ -88,6 +124,11 @@ jobs:
         env:
           QA_LABEL: ${{ inputs.qa_label }}
           ALLOWED_LABELERS: ${{ inputs.allowed_labelers }}
+          KEEP_QA_ON_CLEAN_MAIN_UPDATE: ${{ inputs.keep_qa_on_clean_main_update }}
+          # Read-only fetch token for the clean-main-update check; only
+          # handed to the step when the feature is on. Never printed (git
+          # runs silent, auth goes via GIT_CONFIG_* env, not argv/URL).
+          QA_GIT_TOKEN: ${{ inputs.keep_qa_on_clean_main_update && github.token || '' }}
         with:
           script: |
             const owner = context.repo.owner;
@@ -95,6 +136,8 @@ jobs:
             const QA_LABEL = (process.env.QA_LABEL || 'qa-passed').trim() || 'qa-passed';
             const ALLOWED = (process.env.ALLOWED_LABELERS || '')
               .split(/[\s,]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+            const KEEP_CLEAN = String(process.env.KEEP_QA_ON_CLEAN_MAIN_UPDATE || '').trim().toLowerCase() === 'true';
+            const IS_SYNC = context.eventName === 'pull_request_target' && context.payload.action === 'synchronize';
 
             async function resolvePrNumber() {
               if (context.payload.pull_request?.number) return context.payload.pull_request.number;
@@ -107,6 +150,15 @@ jobs:
 
             function fmt(ts) {
               return new Date(ts).toISOString().replace('T', ' ').replace('.000Z', ' UTC');
+            }
+            const short = (s) => String(s || '').slice(0, 7);
+
+            async function summary(text) {
+              try {
+                await core.summary.addRaw(text + '\n').write();
+              } catch (err) {
+                core.info(`(job summary unavailable: ${err.message})`);
+              }
             }
 
             const prNumber = await resolvePrNumber();
@@ -134,7 +186,247 @@ jobs:
             }
 
             const sha = pr.head.sha;
+            const baseRef = pr.base?.ref || 'main';
             const hasLabel = pr.labels.some((l) => l.name === QA_LABEL);
+
+            // ---- cached API reads -------------------------------------
+            let issueEventsCache = null;
+            async function issueEvents() {
+              if (!issueEventsCache) {
+                issueEventsCache = await github.paginate(github.rest.issues.listEvents, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                });
+              }
+              return issueEventsCache;
+            }
+            let timelineCache = null;
+            async function timeline() {
+              if (!timelineCache) {
+                timelineCache = await github.paginate(github.rest.issues.listEventsForTimeline, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                });
+              }
+              return timelineCache;
+            }
+            // Latest push time for a SHA: max of its committer date,
+            // 'committed' timeline events for that SHA, and every
+            // 'head_ref_force_pushed' timeline event (conservative).
+            const pushTimeCache = new Map();
+            async function pushTimeOf(s) {
+              if (pushTimeCache.has(s)) return pushTimeCache.get(s);
+              let t = 0;
+              const { data: c } = await github.rest.repos.getCommit({ owner, repo, ref: s });
+              if (c.commit?.committer?.date) t = new Date(c.commit.committer.date).getTime();
+              for (const ev of await timeline()) {
+                if (!ev.created_at) continue;
+                if (ev.event === 'committed' && ev.sha === s) t = Math.max(t, new Date(ev.created_at).getTime());
+                if (ev.event === 'head_ref_force_pushed') t = Math.max(t, new Date(ev.created_at).getTime());
+              }
+              pushTimeCache.set(s, t);
+              return t;
+            }
+
+            // Sign-off = the LAST labeled/unlabeled event for QA_LABEL is a
+            // 'labeled' event by an allowed labeler (when allowed_labelers
+            // is set). Returns { ok, msg, labeledTime }.
+            async function signoff() {
+              // allowed_labelers: '' (unset) = legacy, anyone with label rights.
+              // Set but parsing to an empty list (" ", ",") = misconfiguration → FAIL.
+              const ALLOWED_RAW = process.env.ALLOWED_LABELERS ?? '';
+              if (ALLOWED_RAW !== '' && ALLOWED.length === 0) {
+                return { ok: false, msg: `allowed_labelers is set (${JSON.stringify(ALLOWED_RAW)}) but contains no logins — refusing to accept any "${QA_LABEL}" sign-off` };
+              }
+              // Only the LAST 'labeled' event for QA_LABEL decides; a later
+              // 'unlabeled' event for it means the label is not applied.
+              const labelEvents = (await issueEvents())
+                .filter((e) => (e.event === 'labeled' || e.event === 'unlabeled') && e.label?.name === QA_LABEL && e.created_at)
+                .sort((a, b) => new Date(a.created_at) - new Date(b.created_at) || (a.id || 0) - (b.id || 0));
+              const last = labelEvents[labelEvents.length - 1];
+              if (!last || last.event !== 'labeled') {
+                return { ok: false, msg: last
+                  ? `Label "${QA_LABEL}" was removed after it was last applied — treat as not signed off`
+                  : `Label "${QA_LABEL}" is present but no 'labeled' event was found — cannot verify it postdates the latest push` };
+              }
+              const labeler = String(last.actor?.login || '').toLowerCase();
+              if (ALLOWED.length && !ALLOWED.includes(labeler)) {
+                return { ok: false, msg: `Label "${QA_LABEL}" was last applied by "${last.actor?.login || 'unknown'}", not an allowed labeler (${ALLOWED.join(', ')}) — sign-off by other users (incl. the PR author) does not count` };
+              }
+              return { ok: true, labeledTime: new Date(last.created_at).getTime() };
+            }
+
+            // ---- keep_qa_on_clean_main_update: git plumbing only ------
+            // A throwaway BARE repo under RUNNER_TEMP: objects are fetched,
+            // never checked out, no hooks, no repo config from the PR. Any
+            // error → not clean (fail safe: the label is stripped).
+            const SHA_RE = /^[0-9a-f]{40}$/;
+            const MAX_HOPS = 10;
+            let gitDir = null;
+            let gitPrep = null;
+            async function git(args) {
+              const env = { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1' };
+              delete env.QA_GIT_TOKEN;
+              const token = process.env.QA_GIT_TOKEN || '';
+              if (token) {
+                const auth = Buffer.from(`x-access-token:${token}`).toString('base64');
+                if (core.setSecret) core.setSecret(auth);
+                env.GIT_CONFIG_COUNT = '1';
+                env.GIT_CONFIG_KEY_0 = 'http.extraheader';
+                env.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${auth}`;
+              }
+              const argv = gitDir ? ['-C', gitDir, ...args] : args;
+              const r = await exec.getExecOutput('git', argv, { silent: true, ignoreReturnCode: true, env });
+              const raw = String(r.stdout || '');
+              return { code: r.exitCode, raw, out: raw.trim(), err: String(r.stderr || '').trim().split('\n').slice(-1)[0] };
+            }
+            async function hasCommit(s) {
+              return (await git(['cat-file', '-e', `${s}^{commit}`])).code === 0;
+            }
+            function prepareRepo(extraShas) {
+              if (!gitPrep) gitPrep = (async () => {
+                const v = await git(['version']);
+                const m = v.out.match(/(\d+)\.(\d+)/);
+                if (v.code !== 0 || !m || Number(m[1]) < 2 || (Number(m[1]) === 2 && Number(m[2]) < 38)) {
+                  return { ok: false, reason: `git >= 2.38 is required for merge-tree --write-tree (runner has: ${v.out || v.err || 'none'})` };
+                }
+                const fs = require('fs');
+                const os = require('os');
+                const path = require('path');
+                const dir = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP || os.tmpdir(), 'qa-keep-'));
+                const init = await git(['init', '-q', '--bare', dir]);
+                if (init.code !== 0) return { ok: false, reason: `git init failed: ${init.err}` };
+                gitDir = dir;
+                const fmtRef = await git(['check-ref-format', `refs/heads/${baseRef}`]);
+                if (fmtRef.code !== 0) return { ok: false, reason: `unusable base ref name ${JSON.stringify(baseRef)}` };
+                const url = `${process.env.GITHUB_SERVER_URL || 'https://github.com'}/${owner}/${repo}.git`;
+                // Full history of base + PR head (no --depth): merge-base and
+                // merge-tree need real ancestry, a shallow repo would lie.
+                const f = await git(['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', url,
+                  `+refs/heads/${baseRef}:refs/remotes/origin/${baseRef}`,
+                  `+refs/pull/${prNumber}/head:refs/remotes/pr/head`]);
+                if (f.code !== 0) return { ok: false, reason: `git fetch of ${baseRef} / PR head failed: ${f.err}` };
+                for (const s of extraShas) {
+                  if (await hasCommit(s)) continue;
+                  const g = await git(['fetch', '--quiet', '--no-tags', '--no-recurse-submodules', url, s]);
+                  if (g.code !== 0 || !(await hasCommit(s))) {
+                    return { ok: false, reason: `commit ${short(s)} is not fetchable (force-pushed away?)` };
+                  }
+                }
+                const sh = await git(['rev-parse', '--is-shallow-repository']);
+                if (sh.code !== 0 || sh.out !== 'false') return { ok: false, reason: 'temp repo is shallow — refusing to judge ancestry' };
+                return { ok: true };
+              })();
+              return gitPrep;
+            }
+            // Is commit h a clean, conflict-free merge of the base branch
+            // into its first parent (expected to be `expectP1` if given)?
+            const mergeCache = new Map();
+            async function cleanMainMerge(h, expectP1) {
+              const key = `${h}:${expectP1 || ''}`;
+              if (!mergeCache.has(key)) mergeCache.set(key, cleanMainMergeUncached(h, expectP1));
+              return mergeCache.get(key);
+            }
+            async function cleanMainMergeUncached(h, expectP1) {
+              if (!(await hasCommit(h))) return { ok: false, reason: `commit ${short(h)} is not available` };
+              const p = await git(['rev-list', '--parents', '-n', '1', h]);
+              if (p.code !== 0) return { ok: false, reason: `cannot read parents of ${short(h)}: ${p.err}` };
+              const parts = p.out.split(/\s+/).filter(Boolean);
+              if (parts.length !== 3 || !parts.every((s) => SHA_RE.test(s))) {
+                return { ok: false, reason: `${short(h)} is not a merge commit with exactly 2 parents` };
+              }
+              const [, p1, p2] = parts;
+              if (expectP1 && p1 !== expectP1) {
+                return { ok: false, reason: `first parent of ${short(h)} is ${short(p1)}, not the previous head ${short(expectP1)}` };
+              }
+              const anc = await git(['merge-base', '--is-ancestor', p2, `refs/remotes/origin/${baseRef}`]);
+              if (anc.code === 1) return { ok: false, reason: `second parent ${short(p2)} of ${short(h)} is not on ${baseRef}` };
+              if (anc.code !== 0) return { ok: false, reason: `merge-base --is-ancestor failed: ${anc.err}` };
+              const mb = await git(['merge-base', '--all', p1, p2]);
+              const bases = mb.out.split(/\s+/).filter(Boolean);
+              if (mb.code !== 0 || bases.length !== 1) {
+                return { ok: false, reason: bases.length > 1 ? 'multiple merge bases (criss-cross history)' : `no merge base for ${short(p1)} and ${short(p2)}` };
+              }
+              const mt = await git(['merge-tree', '--write-tree', '--no-messages', p1, p2]);
+              if (mt.code === 1) return { ok: false, reason: `re-merging ${baseRef} into ${short(p1)} has conflicts (hand-resolved merge)` };
+              if (mt.code !== 0) return { ok: false, reason: `git merge-tree failed: ${mt.err}` };
+              const tree = mt.out.split('\n')[0].trim();
+              const ht = await git(['rev-parse', `${h}^{tree}`]);
+              if (ht.code !== 0 || !SHA_RE.test(tree) || ht.out !== tree) {
+                return { ok: false, reason: `tree of ${short(h)} differs from a clean re-merge of ${short(p1)} + ${short(p2)} (conflict resolution or extra changes in the merge commit)` };
+              }
+              const names = async (to) => {
+                const d = await git(['diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', '-z', bases[0], to]);
+                if (d.code !== 0) throw new Error(`git diff failed: ${d.err}`);
+                // -z output is verbatim: never trim it (leading/trailing
+                // whitespace can be part of a pathname).
+                return d.raw.split('\0').filter((x) => x !== '');
+              };
+              const mainFiles = await names(p2);
+              const prFiles = new Set(await names(p1));
+              const overlap = mainFiles.filter((f) => prFiles.has(f));
+              if (overlap.length) {
+                return { ok: false, reason: `${baseRef} changed ${overlap.length} file(s) this PR also changes: ${overlap.slice(0, 10).join(', ')}${overlap.length > 10 ? ', …' : ''}` };
+              }
+              return { ok: true, parent1: p1, parent2: p2 };
+            }
+            // Proof that s was THIS PR's head at sign-off time: among this
+            // caller workflow's pull_request_target runs for this PR (head
+            // repo/branch match AND pull_requests contains the PR; fork PRs
+            // carry no association → no proof → strip), the LATEST run
+            // created before the label is for head s (every push creates a
+            // run, and a run can only exist after its push), and no
+            // head_ref_force_pushed event lies between that run and the
+            // label (catches a head moved away and back without a run).
+            // Committer dates are author-controlled and REST 'committed'
+            // events carry no timestamp, so they never prove ordering alone.
+            // Needs actions: read.
+            let prRunsCache = null;
+            async function prRuns() {
+              if (prRunsCache) return prRunsCache;
+              const { data: thisRun } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: context.runId });
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner, repo, workflow_id: thisRun.workflow_id, event: 'pull_request_target', branch: pr.head.ref, per_page: 100,
+              });
+              prRunsCache = runs
+                .filter((r) => r.event === 'pull_request_target'
+                  && r.head_branch === pr.head.ref
+                  && (r.head_repository?.full_name || '') === (pr.head.repo?.full_name || '\0')
+                  && (r.pull_requests || []).some((p) => p?.number === prNumber)
+                  && SHA_RE.test(String(r.head_sha || ''))
+                  && Number.isFinite(Date.parse(r.created_at || '')))
+                .map((r) => ({ sha: r.head_sha, t: Date.parse(r.created_at), id: r.id || 0 }))
+                .sort((x, y) => x.t - y.t || x.id - y.id);
+              return prRunsCache;
+            }
+            async function headAtSignoff(s, labeledTime) {
+              const earlier = (await prRuns()).filter((r) => r.t < labeledTime);
+              const last = earlier[earlier.length - 1];
+              if (!last || last.sha !== s) return false;
+              for (const ev of await timeline()) {
+                if (ev.event !== 'head_ref_force_pushed' || !ev.created_at) continue;
+                const ft = Date.parse(ev.created_at);
+                if (ft > last.t && ft < labeledTime) return false;
+              }
+              return true;
+            }
+            // Walk back over consecutive clean base merges until a head QA
+            // provably signed off. Returns { ok, tested | reason }.
+            async function qaAnchor(s, labeledTime, hops) {
+              let stale = `label predates the push of ${short(s)}`;
+              if (labeledTime > (await pushTimeOf(s))) {
+                // The head itself (hops 0) keeps the legacy timestamp rule;
+                // an ancestor must also have a provable push-before-label.
+                if (hops === 0) return { ok: true, tested: s };
+                if (await headAtSignoff(s, labeledTime)) return { ok: true, tested: s };
+                stale = `no pull_request_target run of this workflow proves ${short(s)} was this PR's head when it was signed off`;
+              }
+              if (!KEEP_CLEAN) return { ok: false, reason: stale };
+              if (hops >= MAX_HOPS) return { ok: false, reason: `${stale}; more than ${MAX_HOPS} consecutive merges since QA` };
+              const prep = await prepareRepo([s]);
+              if (!prep.ok) return prep;
+              const m = await cleanMainMerge(s, null);
+              if (!m.ok) return { ok: false, reason: `${stale}, and it is not a clean ${baseRef} merge: ${m.reason}` };
+              return qaAnchor(m.parent1, labeledTime, hops + 1);
+            }
 
             // New push: invalidate QA. Remove the label (if present) so a
             // stale sign-off can never satisfy this gate or auto-merge,
@@ -147,16 +439,13 @@ jobs:
             // pull_request.updated_at, captured when the push happened),
             // falling back to the head commit's committer date.
             let freshLabel = false;
-            if (context.eventName === 'pull_request_target' && context.payload.action === 'synchronize' && hasLabel
-                && context.payload.pull_request?.head?.sha === sha) {
+            if (IS_SYNC && hasLabel && context.payload.pull_request?.head?.sha === sha) {
               let syncTime = Date.parse(context.payload.pull_request?.updated_at || '');
               if (!Number.isFinite(syncTime)) {
                 const { data: hc } = await github.rest.repos.getCommit({ owner, repo, ref: sha });
                 syncTime = Date.parse(hc.commit?.committer?.date || '');
               }
-              const evs = await github.paginate(github.rest.issues.listEvents, {
-                owner, repo, issue_number: prNumber, per_page: 100,
-              });
+              const evs = await issueEvents();
               const lastLabeled = evs
                 .filter((e) => e.event === 'labeled' && e.label?.name === QA_LABEL && e.created_at)
                 .map((e) => Date.parse(e.created_at))
@@ -167,7 +456,60 @@ jobs:
               }
             }
 
-            if (context.eventName === 'pull_request_target' && context.payload.action === 'synchronize' && !freshLabel) {
+            // keep_qa_on_clean_main_update: the push only merged the base
+            // branch cleanly into the QA-tested head → keep the label. The
+            // label itself is untouched, so its last 'labeled' event (and
+            // labeler) is still the original QA sign-off.
+            let kept = null;
+            let keepReason = '';
+            if (IS_SYNC && hasLabel && !freshLabel && KEEP_CLEAN) {
+              try {
+                const before = String(context.payload.before || '');
+                const so = await signoff();
+                if (context.payload.pull_request?.head?.sha !== sha) {
+                  keepReason = `PR head moved to ${short(sha)} after this push event`;
+                } else if (!so.ok) {
+                  keepReason = so.msg;
+                } else if (!SHA_RE.test(before) || /^0+$/.test(before)) {
+                  keepReason = 'push event has no usable `before` SHA';
+                } else {
+                  const prep = await prepareRepo([sha, before]);
+                  if (!prep.ok) {
+                    keepReason = prep.reason;
+                  } else {
+                    const m = await cleanMainMerge(sha, before);
+                    if (!m.ok) {
+                      keepReason = m.reason;
+                    } else {
+                      const a = await qaAnchor(before, so.labeledTime, 1);
+                      if (!a.ok) keepReason = `QA sign-off does not cover the previous head ${short(before)}: ${a.reason}`;
+                      else kept = { tested: a.tested, before, p2: m.parent2 };
+                    }
+                  }
+                }
+              } catch (err) {
+                kept = null;
+                keepReason = `error while checking: ${err.message}`;
+              }
+              if (kept) {
+                core.info(`Clean ${baseRef} merge ${short(sha)} = ${short(kept.before)} + ${short(kept.p2)} — keeping "${QA_LABEL}" (QA tested ${short(kept.tested)})`);
+                await summary(`### QA Gate\n\`${QA_LABEL}\` kept: ${short(sha)} only merges \`${baseRef}\` (${short(kept.p2)}) cleanly into ${short(kept.before)}; QA tested ${short(kept.tested)}.`);
+                const MARK = '<!-- devflow-qa-gate:clean-main-update -->';
+                const body = `${MARK}\n仅干净合入 ${baseRef}（无冲突、无与本 PR 重叠的文件），${QA_LABEL} 保留；QA 测试基于 ${short(kept.tested)}\n\n<sub>head ${short(sha)} = merge(${short(kept.before)}, ${baseRef}@${short(kept.p2)}) · keep_qa_on_clean_main_update</sub>`;
+                try {
+                  const comments = await github.paginate(github.rest.issues.listComments, {
+                    owner, repo, issue_number: prNumber, per_page: 100,
+                  });
+                  const mine = comments.find((c) => c.user?.type === 'Bot' && c.user?.login === 'github-actions[bot]' && String(c.body || '').includes(MARK));
+                  if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+                  else await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+                } catch (err) {
+                  core.warning(`Could not post the clean-merge comment (${err.message})`);
+                }
+              }
+            }
+
+            if (IS_SYNC && !freshLabel && !kept) {
               if (hasLabel) {
                 try {
                   await github.rest.issues.removeLabel({
@@ -182,8 +524,13 @@ jobs:
                     `Could not remove label "${QA_LABEL}" (${err.message}) — the caller workflow must grant pull-requests:write and issues:write`
                   );
                 }
+                if (KEEP_CLEAN) {
+                  core.info(`keep_qa_on_clean_main_update: not kept — ${keepReason}`);
+                  await summary(`### QA Gate\n\`${QA_LABEL}\` stripped on push to ${short(sha)} — not a clean \`${baseRef}\` merge: ${keepReason}`);
+                }
               }
-              const msg = `new push invalidated QA — head is now ${sha.slice(0, 7)}; re-run manual QA (templates/QA.md) and re-apply "${QA_LABEL}"`;
+              const why = KEEP_CLEAN && hasLabel && keepReason ? ` (not a clean ${baseRef} merge: ${keepReason})` : '';
+              const msg = `new push invalidated QA — head is now ${sha.slice(0, 7)}; re-run manual QA (templates/QA.md) and re-apply "${QA_LABEL}"${why}`;
               core.info(`PR #${prNumber}: ${msg}`);
               core.setFailed(msg);
               return;
@@ -204,74 +551,46 @@ jobs:
               return;
             }
 
-            // Most recent 'labeled' event for QA_LABEL (issue events).
-            const issueEvents = await github.paginate(github.rest.issues.listEvents, {
-              owner,
-              repo,
-              issue_number: prNumber,
-              per_page: 100,
-            });
-            // allowed_labelers: '' (unset) = legacy, anyone with label rights.
-            // Set but parsing to an empty list (" ", ",") = misconfiguration → FAIL.
-            const ALLOWED_RAW = process.env.ALLOWED_LABELERS ?? '';
-            if (ALLOWED_RAW !== '' && ALLOWED.length === 0) {
-              core.setFailed(`allowed_labelers is set (${JSON.stringify(ALLOWED_RAW)}) but contains no logins — refusing to accept any "${QA_LABEL}" sign-off`);
+            const so = await signoff();
+            if (!so.ok) {
+              core.setFailed(so.msg);
               return;
             }
-            // Only the LAST 'labeled' event for QA_LABEL decides; a later
-            // 'unlabeled' event for it means the label is not applied.
-            const labelEvents = issueEvents
-              .filter((e) => (e.event === 'labeled' || e.event === 'unlabeled') && e.label?.name === QA_LABEL && e.created_at)
-              .sort((a, b) => new Date(a.created_at) - new Date(b.created_at) || (a.id || 0) - (b.id || 0));
-            const last = labelEvents[labelEvents.length - 1];
-            if (!last || last.event !== 'labeled') {
-              core.setFailed(last
-                ? `Label "${QA_LABEL}" was removed after it was last applied — treat as not signed off`
-                : `Label "${QA_LABEL}" is present but no 'labeled' event was found — cannot verify it postdates the latest push`);
-              return;
-            }
-            const labeler = String(last.actor?.login || '').toLowerCase();
-            if (ALLOWED.length && !ALLOWED.includes(labeler)) {
-              core.setFailed(`Label "${QA_LABEL}" was last applied by "${last.actor?.login || 'unknown'}", not an allowed labeler (${ALLOWED.join(', ')}) — sign-off by other users (incl. the PR author) does not count`);
-              return;
-            }
-            const labeledTime = new Date(last.created_at).getTime();
-
-            // Latest push time for the head SHA: max of the head commit's
-            // committer date, 'committed' timeline events for that SHA,
-            // and 'head_ref_force_pushed' timeline events.
-            let pushTime = 0;
-            const { data: headCommit } = await github.rest.repos.getCommit({
-              owner,
-              repo,
-              ref: sha,
-            });
-            if (headCommit.commit?.committer?.date) {
-              pushTime = new Date(headCommit.commit.committer.date).getTime();
-            }
-
-            const timeline = await github.paginate(github.rest.issues.listEventsForTimeline, {
-              owner,
-              repo,
-              issue_number: prNumber,
-              per_page: 100,
-            });
-            for (const ev of timeline) {
-              if (!ev.created_at) continue;
-              if (ev.event === 'committed' && ev.sha === sha) {
-                pushTime = Math.max(pushTime, new Date(ev.created_at).getTime());
-              }
-              if (ev.event === 'head_ref_force_pushed') {
-                pushTime = Math.max(pushTime, new Date(ev.created_at).getTime());
-              }
-            }
+            const labeledTime = so.labeledTime;
+            const pushTime = await pushTimeOf(sha);
 
             core.info(
               `"${QA_LABEL}" applied at ${fmt(labeledTime)}; latest push to head ${sha.slice(0, 7)} at ${fmt(pushTime)}`
             );
 
             if (labeledTime <= pushTime) {
-              const msg = `QA label "${QA_LABEL}" predates the latest push (label ${fmt(labeledTime)} <= push ${fmt(pushTime)}). Re-run QA on head ${sha.slice(0, 7)} and re-apply the label.`;
+              // keep_qa_on_clean_main_update: the head may be one or more
+              // clean base merges on top of the head QA signed off.
+              let why = '';
+              if (KEEP_CLEAN) {
+                let a;
+                try {
+                  a = await qaAnchor(sha, labeledTime, 0);
+                } catch (err) {
+                  a = { ok: false, reason: `error while checking: ${err.message}` };
+                }
+                if (a.ok) {
+                  core.info(`QA verified: "${QA_LABEL}" covers ${short(a.tested)}; head ${short(sha)} only adds clean ${baseRef} merge(s) (keep_qa_on_clean_main_update)`);
+                  return;
+                }
+                why = ` (${a.reason})`;
+                // Stale label that cannot be reconstructed as clean merges
+                // (e.g. its synchronize run was cancelled): strip it like
+                // the synchronize path would, so no automation sees it.
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: QA_LABEL });
+                  core.info(`Removed stale label "${QA_LABEL}" from PR #${prNumber}`);
+                } catch (err) {
+                  core.warning(`Could not remove label "${QA_LABEL}" (${err.message})`);
+                }
+                await summary(`### QA Gate\n\`${QA_LABEL}\` stripped — it predates the latest push and ${short(sha)} is not a clean \`${baseRef}\` merge of the QA-tested head: ${a.reason}`);
+              }
+              const msg = `QA label "${QA_LABEL}" predates the latest push (label ${fmt(labeledTime)} <= push ${fmt(pushTime)}). Re-run QA on head ${sha.slice(0, 7)} and re-apply the label.${why}`;
               core.setFailed(msg);
               return;
             }

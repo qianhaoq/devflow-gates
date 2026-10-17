@@ -176,6 +176,316 @@ const UNL_KW = 'This is a security problem.';
     assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
   });
 
+  // ---- keep_qa_on_clean_main_update: real git in temp repos ----------
+  // The script's `exec.getExecOutput('git', …)` runs real git; the fetch
+  // URL https://github.com/o/r.git is mapped to a local bare "remote".
+  {
+    const cp = require('child_process');
+    const os = require('os');
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qa-keep-test-'));
+    const T0 = Date.parse('2026-03-01T00:00:00Z');
+    const iso = (h) => new Date(T0 + h * 3600e3).toISOString();
+    let n = 0;
+    // Fresh remote + work clone per scenario. g(args, hour) runs git in the
+    // work tree with author/committer date T0+hour.
+    function fixture() {
+      const dir = path.join(tmp, `s${++n}`);
+      const remote = `${dir}/remote.git`;
+      const work = `${dir}/work`;
+      fs.mkdirSync(work, { recursive: true });
+      const g = (args, hour = 0, opts = {}) => {
+        const r = cp.spawnSync('git', args, { cwd: work, encoding: 'utf8', env: { ...process.env,
+          GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@x', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@x',
+          GIT_AUTHOR_DATE: iso(hour), GIT_COMMITTER_DATE: iso(hour), GIT_CONFIG_NOSYSTEM: '1', HOME: dir } });
+        if (r.status !== 0 && !opts.allowFail) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
+        return r.stdout.trim();
+      };
+      const write = (f, txt) => fs.writeFileSync(path.join(work, f), txt);
+      const commit = (msg, hour) => { g(['add', '-A']); g(['commit', '-q', '-m', msg], hour); return g(['rev-parse', 'HEAD']); };
+      cp.spawnSync('git', ['init', '-q', '--bare', remote]);
+      g(['init', '-q', '-b', 'main']);
+      const lines = Array.from({ length: 20 }, (_, i) => `line ${i}`);
+      write('shared.txt', lines.join('\n') + '\n');
+      write('pr.txt', 'pr v0\n');
+      write('app.txt', 'app v0\n');
+      const m0 = commit('m0', 0);
+      g(['checkout', '-q', '-b', 'feat']);
+      return { dir, remote, work, g, write, commit, lines, m0 };
+    }
+    // QA tested B (pushed at +1h, labeled at +2h); `build` creates the new
+    // head H (and main commits) at +3h/+4h and returns { H, before? }.
+    async function scenario(build, { keep = true, action = 'synchronize', labeledAt = 2, labeler = 'qa-bot', runAt = 1.1, runPr = 1, extraRuns = [], forcePushAt = null } = {}) {
+      const f = fixture();
+      f.write('pr.txt', 'pr v1\n');
+      const B = f.commit('feat: B', 1);
+      const res = build(f, B);
+      const H = res.H;
+      f.g(['push', '-q', '-f', f.remote, 'main:refs/heads/main', `${H}:refs/pull/1/head`]);
+      const before = res.before !== undefined ? res.before : B;
+      const pushed = [H, ...(res.pushed || []), ...(res.before ? [res.before] : [])];
+      const calls = { removed: [], failed: null, comments: [], summary: '', info: [] };
+      const github = {
+        rest: {
+          pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft: false, head: { sha: H, ref: 'feat', repo: { full_name: 'o/r' } }, base: { ref: 'main' }, labels: [{ name: 'qa-passed' }] } }) },
+          issues: {
+            removeLabel: async (a) => { calls.removed.push(a.name); },
+            listEvents: async () => ({}), listEventsForTimeline: async () => ({}), listComments: async () => ({}),
+            createComment: async (a) => { calls.comments.push(a.body); },
+            updateComment: async (a) => { calls.comments.push(a.body); },
+          },
+          actions: {
+            getWorkflowRun: async () => ({ data: { workflow_id: 7 } }),
+            listWorkflowRuns: async () => ({}),
+          },
+          repos: { getCommit: async ({ ref }) => ({ data: { commit: { committer: { date: f.g(['log', '-1', '--format=%cI', ref]) } } } }) },
+        },
+        // One pull_request_target run per pushed PR head: B at runAt
+        // (default just after its push), other heads at +4h.
+        paginate: async (fn, args) => {
+          if (fn === github.rest.issues.listEvents) return [{ event: 'labeled', label: { name: 'qa-passed' }, actor: { login: labeler }, created_at: iso(labeledAt) }];
+          if (fn === github.rest.actions.listWorkflowRuns) {
+            const mk = (sha, at, i) => ({ id: i, event: 'pull_request_target', head_sha: sha, head_branch: 'feat', head_repository: { full_name: 'o/r' }, pull_requests: runPr ? [{ number: runPr }] : [], created_at: iso(at) });
+            const list = [[B, runAt], ...extraRuns.map(([sha, at]) => [sha === 'A' ? f.m0 : sha, at]), ...pushed.map((sha) => [sha, 4])];
+            return list.map(([sha, at], i) => mk(sha, at, i + 1));
+          }
+          if (fn === github.rest.issues.listEventsForTimeline) {
+            return forcePushAt === null ? [] : [{ event: 'head_ref_force_pushed', created_at: iso(forcePushAt) }];
+          }
+          return [];
+        },
+      };
+      const sum = { addRaw(s) { calls.summary += s; return sum; }, async write() { return sum; } };
+      const core = { info: (m) => calls.info.push(m), warning() {}, setSecret() {}, summary: sum, setFailed: (m) => { calls.failed = m; } };
+      const exec = {
+        getExecOutput: async (cmd, args, opts) => {
+          const mapped = args.map((a) => (a === 'https://github.com/o/r.git' ? f.remote : a));
+          const r = cp.spawnSync(cmd, mapped, { encoding: 'utf8', env: opts.env });
+          return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr };
+        },
+      };
+      const context = { eventName: 'pull_request_target', repo: { owner: 'o', repo: 'r' },
+        payload: { action, before, pull_request: { number: 1, head: { sha: H }, updated_at: iso(4) } } };
+      const env = { ...process.env, QA_LABEL: 'qa-passed', ALLOWED_LABELERS: 'qa-bot', KEEP_QA_ON_CLEAN_MAIN_UPDATE: keep ? 'true' : 'false',
+        QA_GIT_TOKEN: keep ? 'dummy-token' : '', RUNNER_TEMP: f.dir, GITHUB_SERVER_URL: 'https://github.com' };
+      await new AsyncFunction('github', 'context', 'core', 'process', 'exec', 'require', qa)(github, context, core, { env }, exec, require);
+      const all = JSON.stringify(calls);
+      assert.ok(!all.includes('dummy-token') && !all.includes(Buffer.from('x-access-token:dummy-token').toString('base64')), 'token leaked into output');
+      return { ...calls, H, B };
+    }
+    // main gets an unrelated change, then merge main into feat (clean).
+    const mergeMain = (f, hourMain = 3, hourMerge = 4) => {
+      f.g(['checkout', '-q', 'main']);
+      f.write('app.txt', 'app v1\n');
+      f.commit('main: app', hourMain);
+      f.g(['checkout', '-q', 'feat']);
+      f.g(['merge', '-q', '--no-edit', '--no-ff', 'main'], hourMerge);
+      return f.g(['rev-parse', 'HEAD']);
+    };
+    const kept = (c) => {
+      assert.deepStrictEqual(c.removed, [], `label removed; failed=${c.failed}`);
+      assert.strictEqual(c.failed, null, c.failed);
+    };
+    const stripped = (c, re) => {
+      assert.deepStrictEqual(c.removed, ['qa-passed']);
+      assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
+      assert.ok(re.test(c.failed), `reason ${re} not in: ${c.failed}`);
+      assert.ok(/stripped on push/.test(c.summary), 'reason missing from job summary');
+      assert.strictEqual(c.comments.length, 0);
+    };
+
+    await t('qa-gate keep: clean merge of main keeps qa-passed, passes, posts sticky comment', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }));
+      kept(c);
+      assert.strictEqual(c.comments.length, 1);
+      assert.ok(c.comments[0].includes(`仅干净合入 main（无冲突、无与本 PR 重叠的文件），qa-passed 保留；QA 测试基于 ${c.B.slice(0, 7)}`), c.comments[0]);
+    });
+    await t('qa-gate keep: feature off → clean merge still strips (default behaviour)', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { keep: false });
+      assert.deepStrictEqual(c.removed, ['qa-passed']);
+      assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
+      assert.strictEqual(c.comments.length, 0);
+    });
+    await t('qa-gate keep: later non-sync run on the kept head passes (label older than push)', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { action: 'labeled' });
+      kept(c);
+    });
+    await t('qa-gate keep: two consecutive clean main merges keep (chain back to QA head)', async () => {
+      const c = await scenario((f) => {
+        const H1 = mergeMain(f, 3, 4);
+        f.g(['checkout', '-q', 'main']);
+        f.write('app2.txt', 'more\n');
+        f.commit('main: app2', 5);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', '--no-ff', 'main'], 6);
+        return { H: f.g(['rev-parse', 'HEAD']), before: H1 };
+      });
+      kept(c);
+      assert.ok(c.comments[0].includes(`QA 测试基于 ${c.B.slice(0, 7)}`), c.comments[0]);
+    });
+    await t('qa-gate keep: conflict hand-resolved in the merge → stripped', async () => {
+      const c = await scenario((f) => {
+        f.g(['checkout', '-q', 'main']);
+        f.write('pr.txt', 'main v1\n');
+        f.commit('main: touches pr.txt', 3);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', 'main'], 4, { allowFail: true });
+        f.write('pr.txt', 'resolved\n');
+        return { H: f.commit('Merge branch main (resolved)', 4) };
+      });
+      stripped(c, /conflicts/);
+    });
+    await t('qa-gate keep: change smuggled into a clean merge commit → stripped', async () => {
+      const c = await scenario((f) => {
+        mergeMain(f);
+        f.write('evil.txt', 'surprise\n');
+        f.g(['add', '-A']);
+        f.g(['commit', '-q', '--amend', '--no-edit'], 4);
+        return { H: f.g(['rev-parse', 'HEAD']) };
+      });
+      stripped(c, /differs from a clean re-merge/);
+    });
+    await t('qa-gate keep: main changed a file the PR also changed (no conflict) → stripped', async () => {
+      const c = await scenario((f, B) => {
+        // PR also edits shared.txt line 18 (on top of B: amend B → new B').
+        f.g(['checkout', '-q', 'main']);
+        const l = f.lines.slice(); l[1] = 'main edit';
+        f.write('shared.txt', l.join('\n') + '\n');
+        f.commit('main: shared top', 3);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', '--no-ff', 'main'], 4);
+        return { H: f.g(['rev-parse', 'HEAD']) };
+      }, {});
+      // B only touched pr.txt, so that variant must be KEPT; the overlap
+      // variant is below.
+      kept(c);
+      const c2 = await scenario((f) => {
+        const lp = f.lines.slice(); lp[18] = 'pr edit';
+        f.write('shared.txt', lp.join('\n') + '\n');
+        const B2 = f.commit('feat: shared bottom', 1);
+        f.g(['checkout', '-q', 'main']);
+        const lm = f.lines.slice(); lm[1] = 'main edit';
+        f.write('shared.txt', lm.join('\n') + '\n');
+        f.commit('main: shared top', 3);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', '--no-ff', 'main'], 4);
+        return { H: f.g(['rev-parse', 'HEAD']), before: B2 };
+      });
+      stripped(c2, /also changes: shared\.txt/);
+    });
+    await t("qa-gate keep: author's normal commit → stripped", async () => {
+      const c = await scenario((f) => {
+        f.write('pr.txt', 'pr v2\n');
+        return { H: f.commit('feat: more', 4) };
+      });
+      stripped(c, /not a merge commit/);
+    });
+    await t('qa-gate keep: rebase-style update (force push onto main) → stripped', async () => {
+      const c = await scenario((f, B) => {
+        f.g(['checkout', '-q', 'main']);
+        f.write('app.txt', 'app v1\n');
+        f.commit('main: app', 3);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['rebase', '-q', 'main'], 4);
+        return { H: f.g(['rev-parse', 'HEAD']) };
+      });
+      stripped(c, /not a merge commit|not fetchable/);
+    });
+    await t('qa-gate keep: merge on top of a commit other than `before` → stripped', async () => {
+      const c = await scenario((f, B) => {
+        f.write('pr.txt', 'pr v2\n');
+        f.commit('feat: unreviewed', 3);
+        return { H: mergeMain(f, 3, 4), before: B };
+      });
+      stripped(c, /first parent .* not the previous head/);
+    });
+    await t('qa-gate keep: second parent not on the base branch → stripped', async () => {
+      const c = await scenario((f) => {
+        f.g(['checkout', '-q', '-b', 'side', f.m0]);
+        f.write('side.txt', 'x\n');
+        f.commit('side', 3);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', '--no-ff', 'side'], 4);
+        return { H: f.g(['rev-parse', 'HEAD']) };
+      });
+      stripped(c, /not on main/);
+    });
+    await t('qa-gate keep: missing / unfetchable `before` → stripped', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f), before: '' }));
+      stripped(c, /no usable `before`/);
+      const c2 = await scenario((f) => ({ H: mergeMain(f), before: '1'.repeat(40) }));
+      stripped(c2, /first parent|not fetchable/);
+    });
+    await t('qa-gate keep: label applied before B was pushed (stale on B) → stripped', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { labeledAt: 0.5 });
+      stripped(c, /does not cover the previous head/);
+    });
+    await t('qa-gate keep: label from a non-allowed labeler is not kept', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { labeler: 'pr-author' });
+      stripped(c, /not an allowed labeler/);
+    });
+    await t('qa-gate keep: B committed before the label but pushed after it (no run proof) → stripped', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { runAt: 2.5 });
+      stripped(c, /no pull_request_target run .* proves/);
+    });
+    await t('qa-gate keep: non-sync run with a stale label on an unreviewed commit strips it', async () => {
+      const c = await scenario((f) => {
+        f.write('pr.txt', 'pr v2\n');
+        return { H: f.commit('feat: more', 4) };
+      }, { action: 'labeled' });
+      assert.deepStrictEqual(c.removed, ['qa-passed']);
+      assert.ok(c.failed && /predates the latest push/.test(c.failed), c.failed);
+      assert.ok(/stripped/.test(c.summary));
+    });
+    await t('qa-gate keep: whitespace-leading path overlap is detected (verbatim -z)', async () => {
+      // base changes only " shared" (top line); PR changes "\tx" and
+      // " shared" (bottom line) → clean merge, but the files overlap.
+      const c = await scenario((f) => {
+        const ws = f.lines.join('\n') + '\n';
+        f.write(' shared', ws);
+        f.g(['checkout', '-q', 'main']);
+        f.write(' shared', ws);
+        f.commit('main: add " shared"', 0.1);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', 'main'], 0.2);
+        const lp = f.lines.slice(); lp[18] = 'pr edit';
+        f.write(' shared', lp.join('\n') + '\n');
+        f.write('\tx', 'tab\n');
+        const B2 = f.commit('feat: tab + " shared"', 1);
+        f.g(['checkout', '-q', 'main']);
+        const lm = f.lines.slice(); lm[1] = 'main edit';
+        f.write(' shared', lm.join('\n') + '\n');
+        f.commit('main: " shared" top', 3);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', '--no-ff', 'main'], 4);
+        return { H: f.g(['rev-parse', 'HEAD']), before: B2 };
+      });
+      stripped(c, /also changes:  shared/);
+    });
+    await t('qa-gate keep: run proof from another PR (same branch/SHA) or no PR association → stripped', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 2 });
+      stripped(c, /no pull_request_target run .* proves/);
+      const c2 = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 0 });
+      stripped(c2, /no pull_request_target run .* proves/);
+    });
+    await t('qa-gate keep: SHA replayed after sign-off (B → reset to A, QA on A, fast-forward to B) → stripped', async () => {
+      // B ran at 1.1, then a run for A at 1.5 (head moved back), label at 2.
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { extraRuns: [['A', 1.5]] });
+      stripped(c, /no pull_request_target run .* proves/);
+      // Same, but the reset produced no run: the force-push event alone rejects.
+      const c2 = await scenario((f) => ({ H: mergeMain(f) }), { forcePushAt: 1.5 });
+      stripped(c2, /no pull_request_target run .* proves|label predates/);
+    });
+    await t('qa-gate keep: race guard still keeps a label applied after the push', async () => {
+      const c = await scenario((f) => {
+        f.write('pr.txt', 'pr v2\n');
+        return { H: f.commit('feat: more', 3) };
+      }, { labeledAt: 5 });
+      kept(c);
+      assert.strictEqual(c.comments.length, 0);
+    });
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+
   // Refresh: dispatch runs on the PR branch count (crawl PRs created with GITHUB_TOKEN).
   for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
     const refresh = scripts(file)[1];

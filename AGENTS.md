@@ -31,6 +31,11 @@ in [README.md](README.md).
   concurrency group with `cancel-in-progress` per PR/ref.
 - Gates other than the QA gate never add or remove labels. Only the editor /
   QA owner applies `qa-passed` / `editorial-approved` — agents never do.
+- QA gate `keep_qa_on_clean_main_update` (opt-in, default `false`): the only
+  place a gate runs git, and only plumbing in a temp bare repo (never a
+  checkout, never PR code). Any doubt or error must STRIP the label (fail
+  safe). The git scenarios live in `tests/gates.test.js` ("qa-gate keep:")
+  and use real git against a local bare remote — keep them passing.
 - No dependency on Copilot (quota is not guaranteed).
 - Callers pin a merged commit SHA; after merging here, re-pin callers via
   their own PRs.
