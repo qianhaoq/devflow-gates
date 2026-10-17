@@ -371,7 +371,8 @@ jobs:
             // Proof that commit s was pushed as THIS PR's head BEFORE the
             // sign-off: a pull_request_target run of this caller workflow
             // for head s on the PR's head repo/branch created before the
-            // label (a run can only exist after the push). Committer dates
+            // label (a run can only exist after the push), whose
+            // pull_requests association contains this PR. Committer dates
             // are author-controlled and REST 'committed' events carry no
             // timestamp, so they alone never prove ordering. No run → fail
             // closed. Needs actions: read.
@@ -389,7 +390,11 @@ jobs:
               const t = runs
                 .filter((r) => r.head_sha === s && r.event === 'pull_request_target'
                   && r.head_branch === pr.head.ref
-                  && (r.head_repository?.full_name || '') === (pr.head.repo?.full_name || '\0'))
+                  && (r.head_repository?.full_name || '') === (pr.head.repo?.full_name || '\0')
+                  // Bound to THIS PR: a run from an earlier PR on the same
+                  // branch/SHA proves nothing here. Fork PRs carry no
+                  // association → no proof → fail closed (strip).
+                  && (r.pull_requests || []).some((p) => p?.number === prNumber))
                 .map((r) => Date.parse(r.created_at || ''))
                 .filter(Number.isFinite)
                 .reduce((a, b) => Math.min(a, b), Infinity);

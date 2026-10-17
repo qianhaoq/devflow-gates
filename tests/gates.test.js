@@ -214,7 +214,7 @@ const UNL_KW = 'This is a security problem.';
     }
     // QA tested B (pushed at +1h, labeled at +2h); `build` creates the new
     // head H (and main commits) at +3h/+4h and returns { H, before? }.
-    async function scenario(build, { keep = true, action = 'synchronize', labeledAt = 2, labeler = 'qa-bot', runAt = 1.1 } = {}) {
+    async function scenario(build, { keep = true, action = 'synchronize', labeledAt = 2, labeler = 'qa-bot', runAt = 1.1, runPr = 1 } = {}) {
       const f = fixture();
       f.write('pr.txt', 'pr v1\n');
       const B = f.commit('feat: B', 1);
@@ -245,7 +245,7 @@ const UNL_KW = 'This is a security problem.';
           if (fn === github.rest.issues.listEvents) return [{ event: 'labeled', label: { name: 'qa-passed' }, actor: { login: labeler }, created_at: iso(labeledAt) }];
           if (fn === github.rest.actions.listWorkflowRuns) {
             const at = args.head_sha === B ? runAt : (pushed.includes(args.head_sha) ? 4 : null);
-            return at === null ? [] : [{ id: 1, event: 'pull_request_target', head_sha: args.head_sha, head_branch: 'feat', head_repository: { full_name: 'o/r' }, created_at: iso(at) }];
+            return at === null ? [] : [{ id: 1, event: 'pull_request_target', head_sha: args.head_sha, head_branch: 'feat', head_repository: { full_name: 'o/r' }, pull_requests: runPr ? [{ number: runPr }] : [], created_at: iso(at) }];
           }
           return [];
         },
@@ -456,6 +456,12 @@ const UNL_KW = 'This is a security problem.';
         return { H: f.g(['rev-parse', 'HEAD']), before: B2 };
       });
       stripped(c, /also changes:  shared/);
+    });
+    await t('qa-gate keep: run proof from another PR (same branch/SHA) or no PR association → stripped', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 2 });
+      stripped(c, /no pull_request_target run .* proves/);
+      const c2 = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 0 });
+      stripped(c2, /no pull_request_target run .* proves/);
     });
     await t('qa-gate keep: race guard still keeps a label applied after the push', async () => {
       const c = await scenario((f) => {

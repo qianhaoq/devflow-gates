@@ -204,7 +204,7 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
      重命名按删除+新增两侧路径都算）；
    - 签收本身覆盖 B：最后一次 `labeled` 来自允许的打标人，晚于 B 的
      committer date，**且**本工作流在该 PR 头分支上对 B 的最早一次
-     `pull_request_target` 运行早于打标（运行只可能在推送之后产生 —— 证明 B
+     `pull_request_target` 运行（且运行关联的 PR 含本 PR；fork PR 无关联 → 不保留）早于打标（运行只可能在推送之后产生 —— 证明 B
      是在签收前推送的；committer date 可伪造、REST `committed` 事件没有时间戳，
      单靠它们不算数）；或 B 本身也是这样被保留的干净合入（可连续多次
      update branch）。因此评估 job 需要 `actions: read`（现有调用方的 `qa`
