@@ -203,11 +203,13 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
      `… B` 的文件集合**无交集**（main 改过本 PR 也改的文件 → 不保留；
      重命名按删除+新增两侧路径都算）；
    - 签收本身覆盖 B：最后一次 `labeled` 来自允许的打标人，晚于 B 的
-     committer date，**且**本工作流在该 PR 头分支上对 B 的最早一次
-     `pull_request_target` 运行（且运行关联的 PR 含本 PR；fork PR 无关联 → 不保留）早于打标（运行只可能在推送之后产生 —— 证明 B
-     是在签收前推送的；committer date 可伪造、REST `committed` 事件没有时间戳，
-     单靠它们不算数）；或 B 本身也是这样被保留的干净合入（可连续多次
-     update branch）。因此评估 job 需要 `actions: read`（现有调用方的 `qa`
+     committer date，**且**打标时 B 确实是本 PR 的 head —— 本工作流在本 PR
+     （头分支/仓库一致、运行关联的 PR 含本 PR；fork PR 无关联 → 不保留）上
+     打标**之前**的最后一次 `pull_request_target` 运行的 head 就是 B，并且该
+     运行与打标之间没有 `head_ref_force_pushed` 事件（每次 push 都会产生一次
+     运行，运行只可能在推送之后产生；committer date 可伪造、REST
+     `committed` 事件没有时间戳，单靠它们不算数）；或 B 本身也是这样被保留的
+     干净合入（可连续多次update branch）。因此评估 job 需要 `actions: read`（现有调用方的 `qa`
      job 已授予 `actions: write`，示例也已补上）。
    否则（作者普通提交、rebase/force push、`before` 缺失或取不到、多个
    merge base、git < 2.38、任何 git/网络错误）一律按原逻辑移除标签，并把

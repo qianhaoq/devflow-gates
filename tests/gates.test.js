@@ -214,7 +214,7 @@ const UNL_KW = 'This is a security problem.';
     }
     // QA tested B (pushed at +1h, labeled at +2h); `build` creates the new
     // head H (and main commits) at +3h/+4h and returns { H, before? }.
-    async function scenario(build, { keep = true, action = 'synchronize', labeledAt = 2, labeler = 'qa-bot', runAt = 1.1, runPr = 1 } = {}) {
+    async function scenario(build, { keep = true, action = 'synchronize', labeledAt = 2, labeler = 'qa-bot', runAt = 1.1, runPr = 1, extraRuns = [], forcePushAt = null } = {}) {
       const f = fixture();
       f.write('pr.txt', 'pr v1\n');
       const B = f.commit('feat: B', 1);
@@ -244,8 +244,12 @@ const UNL_KW = 'This is a security problem.';
         paginate: async (fn, args) => {
           if (fn === github.rest.issues.listEvents) return [{ event: 'labeled', label: { name: 'qa-passed' }, actor: { login: labeler }, created_at: iso(labeledAt) }];
           if (fn === github.rest.actions.listWorkflowRuns) {
-            const at = args.head_sha === B ? runAt : (pushed.includes(args.head_sha) ? 4 : null);
-            return at === null ? [] : [{ id: 1, event: 'pull_request_target', head_sha: args.head_sha, head_branch: 'feat', head_repository: { full_name: 'o/r' }, pull_requests: runPr ? [{ number: runPr }] : [], created_at: iso(at) }];
+            const mk = (sha, at, i) => ({ id: i, event: 'pull_request_target', head_sha: sha, head_branch: 'feat', head_repository: { full_name: 'o/r' }, pull_requests: runPr ? [{ number: runPr }] : [], created_at: iso(at) });
+            const list = [[B, runAt], ...extraRuns.map(([sha, at]) => [sha === 'A' ? f.m0 : sha, at]), ...pushed.map((sha) => [sha, 4])];
+            return list.map(([sha, at], i) => mk(sha, at, i + 1));
+          }
+          if (fn === github.rest.issues.listEventsForTimeline) {
+            return forcePushAt === null ? [] : [{ event: 'head_ref_force_pushed', created_at: iso(forcePushAt) }];
           }
           return [];
         },
@@ -462,6 +466,14 @@ const UNL_KW = 'This is a security problem.';
       stripped(c, /no pull_request_target run .* proves/);
       const c2 = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 0 });
       stripped(c2, /no pull_request_target run .* proves/);
+    });
+    await t('qa-gate keep: SHA replayed after sign-off (B → reset to A, QA on A, fast-forward to B) → stripped', async () => {
+      // B ran at 1.1, then a run for A at 1.5 (head moved back), label at 2.
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { extraRuns: [['A', 1.5]] });
+      stripped(c, /no pull_request_target run .* proves/);
+      // Same, but the reset produced no run: the force-push event alone rejects.
+      const c2 = await scenario((f) => ({ H: mergeMain(f) }), { forcePushAt: 1.5 });
+      stripped(c2, /no pull_request_target run .* proves|label predates/);
     });
     await t('qa-gate keep: race guard still keeps a label applied after the push', async () => {
       const c = await scenario((f) => {
