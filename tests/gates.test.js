@@ -214,7 +214,7 @@ const UNL_KW = 'This is a security problem.';
     }
     // QA tested B (pushed at +1h, labeled at +2h); `build` creates the new
     // head H (and main commits) at +3h/+4h and returns { H, before? }.
-    async function scenario(build, { keep = true, action = 'synchronize', labeledAt = 2, labeler = 'qa-bot' } = {}) {
+    async function scenario(build, { keep = true, action = 'synchronize', labeledAt = 2, labeler = 'qa-bot', runAt = 1.1 } = {}) {
       const f = fixture();
       f.write('pr.txt', 'pr v1\n');
       const B = f.commit('feat: B', 1);
@@ -222,21 +222,33 @@ const UNL_KW = 'This is a security problem.';
       const H = res.H;
       f.g(['push', '-q', '-f', f.remote, 'main:refs/heads/main', `${H}:refs/pull/1/head`]);
       const before = res.before !== undefined ? res.before : B;
+      const pushed = [H, ...(res.pushed || []), ...(res.before ? [res.before] : [])];
       const calls = { removed: [], failed: null, comments: [], summary: '', info: [] };
       const github = {
         rest: {
-          pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft: false, head: { sha: H }, base: { ref: 'main' }, labels: [{ name: 'qa-passed' }] } }) },
+          pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft: false, head: { sha: H, ref: 'feat', repo: { full_name: 'o/r' } }, base: { ref: 'main' }, labels: [{ name: 'qa-passed' }] } }) },
           issues: {
             removeLabel: async (a) => { calls.removed.push(a.name); },
             listEvents: async () => ({}), listEventsForTimeline: async () => ({}), listComments: async () => ({}),
             createComment: async (a) => { calls.comments.push(a.body); },
             updateComment: async (a) => { calls.comments.push(a.body); },
           },
+          actions: {
+            getWorkflowRun: async () => ({ data: { workflow_id: 7 } }),
+            listWorkflowRuns: async () => ({}),
+          },
           repos: { getCommit: async ({ ref }) => ({ data: { commit: { committer: { date: f.g(['log', '-1', '--format=%cI', ref]) } } } }) },
         },
-        paginate: async (fn) => (fn === github.rest.issues.listEvents
-          ? [{ event: 'labeled', label: { name: 'qa-passed' }, actor: { login: labeler }, created_at: iso(labeledAt) }]
-          : []),
+        // One pull_request_target run per pushed PR head: B at runAt
+        // (default just after its push), other heads at +4h.
+        paginate: async (fn, args) => {
+          if (fn === github.rest.issues.listEvents) return [{ event: 'labeled', label: { name: 'qa-passed' }, actor: { login: labeler }, created_at: iso(labeledAt) }];
+          if (fn === github.rest.actions.listWorkflowRuns) {
+            const at = args.head_sha === B ? runAt : (pushed.includes(args.head_sha) ? 4 : null);
+            return at === null ? [] : [{ id: 1, event: 'pull_request_target', head_sha: args.head_sha, head_branch: 'feat', head_repository: { full_name: 'o/r' }, created_at: iso(at) }];
+          }
+          return [];
+        },
       };
       const sum = { addRaw(s) { calls.summary += s; return sum; }, async write() { return sum; } };
       const core = { info: (m) => calls.info.push(m), warning() {}, setSecret() {}, summary: sum, setFailed: (m) => { calls.failed = m; } };
@@ -406,6 +418,44 @@ const UNL_KW = 'This is a security problem.';
     await t('qa-gate keep: label from a non-allowed labeler is not kept', async () => {
       const c = await scenario((f) => ({ H: mergeMain(f) }), { labeler: 'pr-author' });
       stripped(c, /not an allowed labeler/);
+    });
+    await t('qa-gate keep: B committed before the label but pushed after it (no run proof) → stripped', async () => {
+      const c = await scenario((f) => ({ H: mergeMain(f) }), { runAt: 2.5 });
+      stripped(c, /no pull_request_target run .* proves/);
+    });
+    await t('qa-gate keep: non-sync run with a stale label on an unreviewed commit strips it', async () => {
+      const c = await scenario((f) => {
+        f.write('pr.txt', 'pr v2\n');
+        return { H: f.commit('feat: more', 4) };
+      }, { action: 'labeled' });
+      assert.deepStrictEqual(c.removed, ['qa-passed']);
+      assert.ok(c.failed && /predates the latest push/.test(c.failed), c.failed);
+      assert.ok(/stripped/.test(c.summary));
+    });
+    await t('qa-gate keep: whitespace-leading path overlap is detected (verbatim -z)', async () => {
+      // base changes only " shared" (top line); PR changes "\tx" and
+      // " shared" (bottom line) → clean merge, but the files overlap.
+      const c = await scenario((f) => {
+        const ws = f.lines.join('\n') + '\n';
+        f.write(' shared', ws);
+        f.g(['checkout', '-q', 'main']);
+        f.write(' shared', ws);
+        f.commit('main: add " shared"', 0.1);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', 'main'], 0.2);
+        const lp = f.lines.slice(); lp[18] = 'pr edit';
+        f.write(' shared', lp.join('\n') + '\n');
+        f.write('\tx', 'tab\n');
+        const B2 = f.commit('feat: tab + " shared"', 1);
+        f.g(['checkout', '-q', 'main']);
+        const lm = f.lines.slice(); lm[1] = 'main edit';
+        f.write(' shared', lm.join('\n') + '\n');
+        f.commit('main: " shared" top', 3);
+        f.g(['checkout', '-q', 'feat']);
+        f.g(['merge', '-q', '--no-edit', '--no-ff', 'main'], 4);
+        return { H: f.g(['rev-parse', 'HEAD']), before: B2 };
+      });
+      stripped(c, /also changes:  shared/);
     });
     await t('qa-gate keep: race guard still keeps a label applied after the push', async () => {
       const c = await scenario((f) => {

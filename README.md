@@ -202,8 +202,13 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
    - 保守规则：`git diff --name-only $(git merge-base B P2) P2` 与
      `… B` 的文件集合**无交集**（main 改过本 PR 也改的文件 → 不保留；
      重命名按删除+新增两侧路径都算）；
-   - 签收本身覆盖 B：最后一次 `labeled` 来自允许的打标人，且晚于 B 的推送
-     （或 B 本身也是这样被保留的干净合入，可连续多次 update branch）。
+   - 签收本身覆盖 B：最后一次 `labeled` 来自允许的打标人，晚于 B 的
+     committer date，**且**本工作流在该 PR 头分支上对 B 的最早一次
+     `pull_request_target` 运行早于打标（运行只可能在推送之后产生 —— 证明 B
+     是在签收前推送的；committer date 可伪造、REST `committed` 事件没有时间戳，
+     单靠它们不算数）；或 B 本身也是这样被保留的干净合入（可连续多次
+     update branch）。因此评估 job 需要 `actions: read`（现有调用方的 `qa`
+     job 已授予 `actions: write`，示例也已补上）。
    否则（作者普通提交、rebase/force push、`before` 缺失或取不到、多个
    merge base、git < 2.38、任何 git/网络错误）一律按原逻辑移除标签，并把
    原因写进 job summary。只跑 git 管道命令（fetch / merge-base /
@@ -211,7 +216,7 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
    "最后一次 labeled 来自允许打标人"的检查仍针对原 QA 签收；第 3 步的竞态
    保护（标签晚于本次 push 则保留）不变。之后的非 push 事件（labeled、
    定时刷新重跑等）会沿 first-parent 逐个复核这些干净合入回到 QA 验过的
-   head。GitHub "Update branch"（merge 方式）产生的正是 parent1 = 旧 head、
+   head；复核失败（例如 synchronize 运行被取消、残留了过期标签）同样移除标签。GitHub "Update branch"（merge 方式）产生的正是 parent1 = 旧 head、
    parent2 = base tip 的 merge；"Update with rebase" 是 force push → 移除。
 4. 草稿 PR → 失败（在第 3 步移除标签**之后**才检查草稿，草稿 PR 收到新 push 同样会被移除 `qa-passed`）；非 PR 上下文 / 已关闭 PR → info 跳过（成功）。
 5. **`workflow_dispatch` 传入非法/非数字 `pr_number` → 失败**（与 Codex

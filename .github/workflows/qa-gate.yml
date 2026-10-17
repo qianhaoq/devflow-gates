@@ -104,6 +104,15 @@ jobs:
     name: QA Gate
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # actions: read — keep_qa_on_clean_main_update proves WHEN the QA-tested
+    # head was pushed from this workflow's own pull_request_target runs.
+    # Callers already grant actions: write on this job (the refresh job in
+    # this file needs it, and GitHub checks every job against the ceiling).
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
     # Schedule never evaluates directly (a scheduled conclusion does not
     # attach to the PR head check) — the refresh job below handles it.
     if: >-
@@ -266,7 +275,8 @@ jobs:
               }
               const argv = gitDir ? ['-C', gitDir, ...args] : args;
               const r = await exec.getExecOutput('git', argv, { silent: true, ignoreReturnCode: true, env });
-              return { code: r.exitCode, out: String(r.stdout || '').trim(), err: String(r.stderr || '').trim().split('\n').slice(-1)[0] };
+              const raw = String(r.stdout || '');
+              return { code: r.exitCode, raw, out: raw.trim(), err: String(r.stderr || '').trim().split('\n').slice(-1)[0] };
             }
             async function hasCommit(s) {
               return (await git(['cat-file', '-e', `${s}^{commit}`])).code === 0;
@@ -346,7 +356,9 @@ jobs:
               const names = async (to) => {
                 const d = await git(['diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', '-z', bases[0], to]);
                 if (d.code !== 0) throw new Error(`git diff failed: ${d.err}`);
-                return d.out.split('\0').filter(Boolean);
+                // -z output is verbatim: never trim it (leading/trailing
+                // whitespace can be part of a pathname).
+                return d.raw.split('\0').filter((x) => x !== '');
               };
               const mainFiles = await names(p2);
               const prFiles = new Set(await names(p1));
@@ -356,16 +368,51 @@ jobs:
               }
               return { ok: true, parent1: p1, parent2: p2 };
             }
-            // Walk back over consecutive clean base merges until a head whose
-            // last push predates the sign-off. Returns { ok, tested | reason }.
+            // Proof that commit s was pushed as THIS PR's head BEFORE the
+            // sign-off: a pull_request_target run of this caller workflow
+            // for head s on the PR's head repo/branch created before the
+            // label (a run can only exist after the push). Committer dates
+            // are author-controlled and REST 'committed' events carry no
+            // timestamp, so they alone never prove ordering. No run → fail
+            // closed. Needs actions: read.
+            let workflowIdCache = null;
+            const firstRunCache = new Map();
+            async function firstRunTime(s) {
+              if (firstRunCache.has(s)) return firstRunCache.get(s);
+              if (workflowIdCache === null) {
+                const { data: thisRun } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: context.runId });
+                workflowIdCache = thisRun.workflow_id;
+              }
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner, repo, workflow_id: workflowIdCache, head_sha: s, event: 'pull_request_target', per_page: 100,
+              });
+              const t = runs
+                .filter((r) => r.head_sha === s && r.event === 'pull_request_target'
+                  && r.head_branch === pr.head.ref
+                  && (r.head_repository?.full_name || '') === (pr.head.repo?.full_name || '\0'))
+                .map((r) => Date.parse(r.created_at || ''))
+                .filter(Number.isFinite)
+                .reduce((a, b) => Math.min(a, b), Infinity);
+              firstRunCache.set(s, t);
+              return t;
+            }
+            // Walk back over consecutive clean base merges until a head QA
+            // provably signed off. Returns { ok, tested | reason }.
             async function qaAnchor(s, labeledTime, hops) {
-              if (labeledTime > (await pushTimeOf(s))) return { ok: true, tested: s };
-              if (!KEEP_CLEAN) return { ok: false, reason: `label predates the push of ${short(s)}` };
-              if (hops >= MAX_HOPS) return { ok: false, reason: `more than ${MAX_HOPS} consecutive merges since QA` };
+              let stale = `label predates the push of ${short(s)}`;
+              if (labeledTime > (await pushTimeOf(s))) {
+                // The head itself (hops 0) keeps the legacy timestamp rule;
+                // an ancestor must also have a provable push-before-label.
+                if (hops === 0) return { ok: true, tested: s };
+                if ((await firstRunTime(s)) < labeledTime) return { ok: true, tested: s };
+                stale = `no pull_request_target run of this workflow proves ${short(s)} was pushed before the sign-off`;
+              }
+              if (!KEEP_CLEAN) return { ok: false, reason: stale };
+              if (hops >= MAX_HOPS) return { ok: false, reason: `${stale}; more than ${MAX_HOPS} consecutive merges since QA` };
               const prep = await prepareRepo([s]);
               if (!prep.ok) return prep;
               const m = await cleanMainMerge(s, null);
-              if (!m.ok) return { ok: false, reason: `label predates the push of ${short(s)}, which is not a clean ${baseRef} merge: ${m.reason}` };
+              if (!m.ok) return { ok: false, reason: `${stale}, and it is not a clean ${baseRef} merge: ${m.reason}` };
               return qaAnchor(m.parent1, labeledTime, hops + 1);
             }
 
@@ -520,6 +567,16 @@ jobs:
                   return;
                 }
                 why = ` (${a.reason})`;
+                // Stale label that cannot be reconstructed as clean merges
+                // (e.g. its synchronize run was cancelled): strip it like
+                // the synchronize path would, so no automation sees it.
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: QA_LABEL });
+                  core.info(`Removed stale label "${QA_LABEL}" from PR #${prNumber}`);
+                } catch (err) {
+                  core.warning(`Could not remove label "${QA_LABEL}" (${err.message})`);
+                }
+                await summary(`### QA Gate\n\`${QA_LABEL}\` stripped — it predates the latest push and ${short(sha)} is not a clean \`${baseRef}\` merge of the QA-tested head: ${a.reason}`);
               }
               const msg = `QA label "${QA_LABEL}" predates the latest push (label ${fmt(labeledTime)} <= push ${fmt(pushTime)}). Re-run QA on head ${sha.slice(0, 7)} and re-apply the label.${why}`;
               core.setFailed(msg);
