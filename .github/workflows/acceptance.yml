@@ -56,6 +56,21 @@ name: Reusable Acceptance Gate
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: >-
+          Runner for jobs in this reusable workflow (default ubuntu-latest).
+          Pass a single label (e.g. self-hosted) or a JSON array string
+          such as ["self-hosted","linux","x64"] (parsed with fromJSON when
+          the value starts with "["). For Reusable CI prefer the JSON
+          array with linux/x64 — Secret Scan fetches a linux_x64
+          gitleaks binary. SECURITY: CI (PR code) on a persistent
+          self-hosted runner is only for trusted private repos with no
+          untrusted fork PRs; prefer ephemeral/isolated runners
+          otherwise. Gates that skip PR code still hold write tokens
+          (QA / auto-merge / refresh) — trusted runners only.
+        required: false
+        type: string
+        default: ubuntu-latest
       config_path:
         description: 'Path of the per-repo config file'
         required: false
@@ -79,7 +94,7 @@ jobs:
   config:
     name: Acceptance Config
     if: github.event.pull_request.number
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     permissions:
       contents: read
@@ -288,7 +303,7 @@ jobs:
   measure:
     name: Acceptance Measure
     needs: config
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     permissions:
       contents: read
@@ -576,7 +591,7 @@ jobs:
     needs: [config, measure]
     # !cancelled(): a run superseded by a newer PR event must not publish.
     if: ${{ !cancelled() && needs.config.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     permissions:
       contents: read

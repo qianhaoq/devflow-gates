@@ -75,6 +75,21 @@ name: Reusable QA Gate
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: >-
+          Runner for jobs in this reusable workflow (default ubuntu-latest).
+          Pass a single label (e.g. self-hosted) or a JSON array string
+          such as ["self-hosted","linux","x64"] (parsed with fromJSON when
+          the value starts with "["). For Reusable CI prefer the JSON
+          array with linux/x64 — Secret Scan fetches a linux_x64
+          gitleaks binary. SECURITY: CI (PR code) on a persistent
+          self-hosted runner is only for trusted private repos with no
+          untrusted fork PRs; prefer ephemeral/isolated runners
+          otherwise. Gates that skip PR code still hold write tokens
+          (QA / auto-merge / refresh) — trusted runners only.
+        required: false
+        type: string
+        default: ubuntu-latest
       qa_label:
         description: 'Label that marks a manually QA-verified PR head'
         required: false
@@ -112,7 +127,7 @@ permissions:
 jobs:
   qa-gate:
     name: QA Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 10
     # actions: read — the sign-off is bound to a head SHA via this
     # workflow's own pull_request_target / workflow_dispatch run records
@@ -660,7 +675,7 @@ jobs:
   # actions:write granted by the CALLER on its schedule-path job.
   qa-gate-refresh:
     name: QA Gate Refresh
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 5
     if: github.event_name == 'schedule'
     permissions:

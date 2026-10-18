@@ -24,6 +24,21 @@ name: Reusable Post-deploy Smoke
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: >-
+          Runner for jobs in this reusable workflow (default ubuntu-latest).
+          Pass a single label (e.g. self-hosted) or a JSON array string
+          such as ["self-hosted","linux","x64"] (parsed with fromJSON when
+          the value starts with "["). For Reusable CI prefer the JSON
+          array with linux/x64 — Secret Scan fetches a linux_x64
+          gitleaks binary. SECURITY: CI (PR code) on a persistent
+          self-hosted runner is only for trusted private repos with no
+          untrusted fork PRs; prefer ephemeral/isolated runners
+          otherwise. Gates that skip PR code still hold write tokens
+          (QA / auto-merge / refresh) — trusted runners only.
+        required: false
+        type: string
+        default: ubuntu-latest
       base_url:
         description: 'Deployed origin to smoke test, e.g. "https://example.com"'
         required: true
@@ -49,7 +64,7 @@ permissions:
 jobs:
   post-deploy-smoke:
     name: Post-deploy Smoke
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 5
     steps:
       - name: Smoke test

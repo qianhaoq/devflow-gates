@@ -23,6 +23,9 @@ jobs:
   ci:
     uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@main
     with:
+      # WARNING: persistent self-hosted executes PR code — trusted private
+      # repos only (no untrusted forks). Prefer ephemeral runners.
+      # runs_on: '["self-hosted","linux","x64"]'   # prefer OS/arch pins for CI
       node_version: '22'          # '' skips setup-node
       python_version: ''          # '' skips setup-python
       setup_command: 'npm ci'     # '' skips the setup step

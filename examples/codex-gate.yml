@@ -102,6 +102,7 @@ jobs:
       actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@main
     with:
+      # runs_on: self-hosted   # optional; default ubuntu-latest (also set on refresh)
       wait_minutes: 20
       # Default true (policy: unlabeled Codex threads block). Set false to
       # opt out to keyword-only matching for unlabeled threads.
@@ -122,5 +123,6 @@ jobs:
       actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@main
     with:
+      # runs_on: self-hosted   # keep in sync with codex job above
       wait_minutes: 20
       block_unlabeled: true

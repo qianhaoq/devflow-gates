@@ -86,6 +86,21 @@ name: Reusable Codex Review Gate
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: >-
+          Runner for jobs in this reusable workflow (default ubuntu-latest).
+          Pass a single label (e.g. self-hosted) or a JSON array string
+          such as ["self-hosted","linux","x64"] (parsed with fromJSON when
+          the value starts with "["). For Reusable CI prefer the JSON
+          array with linux/x64 — Secret Scan fetches a linux_x64
+          gitleaks binary. SECURITY: CI (PR code) on a persistent
+          self-hosted runner is only for trusted private repos with no
+          untrusted fork PRs; prefer ephemeral/isolated runners
+          otherwise. Gates that skip PR code still hold write tokens
+          (QA / auto-merge / refresh) — trusted runners only.
+        required: false
+        type: string
+        default: ubuntu-latest
       wait_minutes:
         description: 'Minutes to wait for Codex to post/refresh its Review Summary before treating it as a timeout'
         required: false
@@ -105,7 +120,7 @@ permissions:
 jobs:
   codex-review-gate:
     name: Codex Review Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 5
     # Head-attached events only. issue_comment / schedule go to the refresh
     # job below (their conclusion would land on the default branch, so
@@ -610,7 +625,7 @@ jobs:
   # when it would now pass; otherwise at most the newest cancelled one.
   codex-gate-refresh:
     name: Codex Gate Refresh
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 5
     if: >-
       github.event_name == 'schedule' ||
