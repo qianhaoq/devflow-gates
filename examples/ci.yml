@@ -23,6 +23,7 @@ jobs:
   ci:
     uses: qianhaoq/devflow-gates/.github/workflows/ci.yml@main
     with:
+      # runs_on: self-hosted   # optional; default ubuntu-latest
       node_version: '22'          # '' skips setup-node
       python_version: ''          # '' skips setup-python
       setup_command: 'npm ci'     # '' skips the setup step

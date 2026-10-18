@@ -56,6 +56,16 @@ name: Reusable Acceptance Gate
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: >-
+          Runner label(s) for jobs in this reusable workflow
+          (default ubuntu-latest). Pass self-hosted for a self-hosted
+          runner, or a JSON array string like ["self-hosted","linux","x64"]
+          only if the caller also changes runs-on to fromJSON(inputs.runs_on).
+          Plain label string is recommended.
+        required: false
+        type: string
+        default: ubuntu-latest
       config_path:
         description: 'Path of the per-repo config file'
         required: false
@@ -79,7 +89,7 @@ jobs:
   config:
     name: Acceptance Config
     if: github.event.pull_request.number
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     permissions:
       contents: read
@@ -288,7 +298,7 @@ jobs:
   measure:
     name: Acceptance Measure
     needs: config
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     permissions:
       contents: read
@@ -576,7 +586,7 @@ jobs:
     needs: [config, measure]
     # !cancelled(): a run superseded by a newer PR event must not publish.
     if: ${{ !cancelled() && needs.config.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: ${{ inputs.timeout_minutes || 10 }}
     permissions:
       contents: read

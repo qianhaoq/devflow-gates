@@ -76,6 +76,7 @@ jobs:
       actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@main
     with:
+      # runs_on: self-hosted   # optional; default ubuntu-latest
       qa_label: 'qa-passed'   # keep in sync with the `if:` above
       # allowed_labelers: 'alice, bob'   # optional: only these users' label counts
       # keep_qa_on_clean_main_update: true   # optional: a clean "update branch" merge of main keeps the label

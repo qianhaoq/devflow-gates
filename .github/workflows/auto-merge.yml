@@ -79,6 +79,16 @@ name: Reusable Auto Merge
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: >-
+          Runner label(s) for jobs in this reusable workflow
+          (default ubuntu-latest). Pass self-hosted for a self-hosted
+          runner, or a JSON array string like ["self-hosted","linux","x64"]
+          only if the caller also changes runs-on to fromJSON(inputs.runs_on).
+          Plain label string is recommended.
+        required: false
+        type: string
+        default: ubuntu-latest
       required_checks:
         description: >-
           Newline-separated check-run names that must be 'success' on the
@@ -120,7 +130,7 @@ permissions:
 jobs:
   auto-merge:
     name: Auto Merge
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 10
     # workflow_run runs whose event is 'push' are the ONLY skip (they have
     # no resolvable PR). Any submitted review re-evaluates (the script's

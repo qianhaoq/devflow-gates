@@ -24,6 +24,16 @@ name: Reusable Post-deploy Smoke
 on:
   workflow_call:
     inputs:
+      runs_on:
+        description: >-
+          Runner label(s) for jobs in this reusable workflow
+          (default ubuntu-latest). Pass self-hosted for a self-hosted
+          runner, or a JSON array string like ["self-hosted","linux","x64"]
+          only if the caller also changes runs-on to fromJSON(inputs.runs_on).
+          Plain label string is recommended.
+        required: false
+        type: string
+        default: ubuntu-latest
       base_url:
         description: 'Deployed origin to smoke test, e.g. "https://example.com"'
         required: true
@@ -49,7 +59,7 @@ permissions:
 jobs:
   post-deploy-smoke:
     name: Post-deploy Smoke
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs_on }}
     timeout-minutes: 5
     steps:
       - name: Smoke test

@@ -39,5 +39,6 @@ jobs:
     # Pin to a reviewed commit SHA of qianhaoq/devflow-gates.
     uses: qianhaoq/devflow-gates/.github/workflows/acceptance.yml@main
     # with:
+      # runs_on: self-hosted   # optional; default ubuntu-latest
     #   config_path: .github/acceptance.yml
     #   timeout_minutes: 10
