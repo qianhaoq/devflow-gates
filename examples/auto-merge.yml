@@ -56,7 +56,7 @@ jobs:
   auto-merge:
     uses: qianhaoq/devflow-gates/.github/workflows/auto-merge.yml@main
     with:
-      # runs_on: self-hosted   # optional; default ubuntu-latest
+      # runs_on: self-hosted   # or '["self-hosted","linux","x64"]'; default ubuntu-latest
       # Exact check-run names = "<caller job name> / <called job name>"
       # from YOUR ci.yml / codex-gate.yml / qa-gate.yml callers. Add
       # "ci / Secret Scan" if you also want the secret scan required.

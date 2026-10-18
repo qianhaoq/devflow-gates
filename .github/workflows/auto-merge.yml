@@ -81,11 +81,14 @@ on:
     inputs:
       runs_on:
         description: >-
-          Runner label(s) for jobs in this reusable workflow
-          (default ubuntu-latest). Pass self-hosted for a self-hosted
-          runner, or a JSON array string like ["self-hosted","linux","x64"]
-          only if the caller also changes runs-on to fromJSON(inputs.runs_on).
-          Plain label string is recommended.
+          Runner for jobs in this reusable workflow (default ubuntu-latest).
+          Pass a single label (e.g. self-hosted) or a JSON array string
+          such as ["self-hosted","linux","x64"] (parsed with fromJSON when
+          the value starts with "["). SECURITY: CI (and any job that
+          checks out / executes PR code) on a persistent self-hosted
+          runner is only for trusted private repos with no untrusted fork
+          PRs; prefer ephemeral/isolated runners otherwise. Read-only
+          gates (codex/qa/auto-merge) are safer on self-hosted.
         required: false
         type: string
         default: ubuntu-latest
@@ -130,7 +133,7 @@ permissions:
 jobs:
   auto-merge:
     name: Auto Merge
-    runs-on: ${{ inputs.runs_on }}
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 10
     # workflow_run runs whose event is 'push' are the ONLY skip (they have
     # no resolvable PR). Any submitted review re-evaluates (the script's

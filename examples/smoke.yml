@@ -41,7 +41,7 @@ jobs:
   smoke:
     uses: qianhaoq/devflow-gates/.github/workflows/post-deploy-smoke.yml@main
     with:
-      # runs_on: self-hosted   # optional; default ubuntu-latest
+      # runs_on: self-hosted   # or '["self-hosted","linux","x64"]'; default ubuntu-latest
       base_url: ${{ inputs.base_url }}
       protected_path: ${{ inputs.protected_path }}
       required_headers: ${{ inputs.required_headers }}

@@ -27,6 +27,12 @@ in [README.md](README.md).
 - Anything that executes PR code runs from a `pull_request` caller with
   read-only permissions and no secrets; gates on `pull_request_target`
   must never check out or run PR code.
+- `runs_on` (default `ubuntu-latest`): callers may pass `self-hosted`
+  (or a JSON label array) to avoid GitHub-hosted minute billing.
+  Persistent self-hosted runners that execute PR code (Reusable CI)
+  are only for trusted private repos with no untrusted fork PRs;
+  prefer ephemeral/isolated runners otherwise. Read-only gates are
+  safer on self-hosted than CI.
 - Minimal permissions per job, `timeout-minutes` on every job.
 - Actions minutes (private callers pay; every job bills >= 1 min):
   - Filter irrelevant events with a CALLER job-level `if:` (no runner, and
