@@ -134,10 +134,11 @@ const UNL_KW = 'This is a security problem.';
     assert.match(copilot([crev('COMMENTED', OLD, '2026-10-17T01:00:00Z'), cr], [], CH, 1, 'any').msg, /CHANGES_REQUESTED/);
     assert.strictEqual(copilot([cr, crev('COMMENTED', CH, '2026-10-17T03:00:00Z')], [], CH, 1, 'any').ok, true);
   });
-  await t('auto-merge copilot any: Copilot check running on head waits', () => {
-    const d = copilot([crev('COMMENTED', OLD, '2026-10-17T01:00:00Z')], [cchk('in_progress', null)], CH, 1, 'any');
-    assert.strictEqual(d.ok, false);
-    assert.match(d.msg, /pending on head/);
+  await t('auto-merge copilot any: a running head Copilot check does not stall (no re-trigger when it ends)', () => {
+    assert.strictEqual(copilot([crev('COMMENTED', OLD, '2026-10-17T01:00:00Z')], [cchk('in_progress', null)], CH, 1, 'any').ok, true);
+    assert.strictEqual(copilot([], [cchk('in_progress', null)], CH, 1, 'any').ok, false);
+    // 'head' scope keeps waiting on a pending check (unchanged behaviour).
+    assert.strictEqual(copilot([crev('COMMENTED', CH, '2026-10-17T01:00:00Z')], [cchk('in_progress', null)], CH, 1, 'head').ok, false);
   });
 
   // QA gate dry-run.

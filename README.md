@@ -288,7 +288,7 @@ dispatch、被跳过的事件）各自独立成组，**label 事件永远无法�
 | `required_checks` | string | **必填** | 换行分隔的必需检查名（head SHA 上必须为 success，按名取最新一次） |
 | `merge_method` | string | `'squash'` | `squash` / `merge` / `rebase` |
 | `require_copilot` | boolean | `false` | 是否要求 Copilot 评审 |
-| `copilot_scope` | string | `'head'` | 仅 `require_copilot` 时生效：`head` = head SHA 上须有 Copilot 检查 + 评审；`any` = PR 任一提交上评审过一次即可（见下）；其他值按 `head` |
+| `copilot_scope` | string | `'head'` | 仅 `require_copilot` 时生效：`head` = head SHA 上须有 Copilot 检查 + 评审；`any` = PR 任一提交上评审过一次即可，忽略 head 上的 Copilot 检查（见下）；其他值按 `head` |
 | `block_unlabeled` | boolean | `true` | 未标级 Codex 线程阻断（`false` = 仅关键词）；Copilot/人工显式 P2 不阻断 |
 
 调用方触发：`workflow_run`（对本仓库的 CI / Codex Review Gate / QA Gate
@@ -339,8 +339,9 @@ concurrency:
   且**没有**按 push 重审的仓库；否则任何后续 push 都会永久卡在
   "copilot-pull-request-reviewer missing on head SHA"）：PR 上至少有一条未被
   dismiss 的 Copilot 评审（任一提交）、最新一条 Copilot 评审不是
-  CHANGES_REQUESTED；head 上 Copilot 检查仍在运行时等待；head 上 Copilot
-  检查缺失/失败（配额）**不**阻断。head 新鲜度由 required checks（Codex
+  CHANGES_REQUESTED；head 上的 Copilot 检查一律忽略（缺失、运行中、失败都
+  **不**阻断——运行中的检查若最终因配额失败且不提交评审，不会再触发 Auto
+  Merge，等待会永久卡住）。head 新鲜度由 required checks（Codex
   Gate、CI、QA）保证。建议调用方用与 ai-review 相同的仓库变量做开关：
   `require_copilot: ${{ vars.DISABLE_COPILOT_REVIEW != 'true' }}`
   （默认要求）或 `${{ vars.DISABLE_COPILOT_REVIEW == 'false' }}`（默认不要求）。

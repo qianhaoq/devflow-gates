@@ -36,9 +36,10 @@
 #     once, on ANY commit" (for callers that request Copilot only on
 #     opened/ready_for_review and have no per-push re-review): at least one
 #     non-dismissed Copilot review must exist, the latest one must not be
-#     CHANGES_REQUESTED, and a Copilot check still running on the head
-#     waits; a missing/failed head check does NOT block. Per-head freshness
-#     is then the job of the required checks (Codex gate, CI, QA).
+#     CHANGES_REQUESTED; head Copilot check runs are ignored (missing,
+#     running or failed never block — a running one would not re-trigger
+#     this workflow when it ends without a review). Per-head freshness is
+#     then the job of the required checks (Codex gate, CI, QA).
 #   - GraphQL reviewThreads: non-Codex (Copilot/human) threads resolved
 #     unless explicitly P2; Codex threads resolved or non-blocking
 #     (explicit P2 may stay open; unlabeled blocks unless
@@ -99,8 +100,8 @@ on:
         description: >-
           Only with require_copilot. 'head' (default): Copilot check + review
           required on the head SHA. 'any': at least one Copilot review on any
-          commit of the PR (latest not CHANGES_REQUESTED; a running head
-          Copilot check waits). Unknown values fall back to 'head'.
+          commit of the PR (latest not CHANGES_REQUESTED; head Copilot check
+          runs are ignored). Unknown values fall back to 'head'.
         required: false
         type: string
         default: 'head'
@@ -244,12 +245,10 @@ jobs:
                 if (!gate.ok) {
                   return { ok: false, msg: `PR #${prNumber}: latest Copilot review is ${newest.state} (${gate.reason}) — skip` };
                 }
-                if (pendingChecks.length > 0) {
-                  // A Copilot re-review requested on this head is in flight —
-                  // wait for it instead of racing it. A failed/missing head
-                  // check (quota) does not block in 'any' scope.
-                  return { ok: false, msg: `copilot-pull-request-reviewer pending on head: ${pendingChecks.map((c) => c.status).join(', ')} — skip` };
-                }
+                // Head Copilot check runs are ignored here: waiting on a
+                // running one could stall forever (its completion does not
+                // re-trigger Auto Merge when it ends without a review, e.g.
+                // quota), and missing/failed ones are the expected case.
                 return {
                   ok: true,
                   msg: `PR #${prNumber}: Copilot reviewed ${String(newest.commit_id || '?').slice(0, 7)} (${gate.reason}); scope=any, head freshness via required checks`,
