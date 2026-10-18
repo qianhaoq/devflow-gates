@@ -31,6 +31,13 @@
 #     Actions) is picked up by the next Codex comment, a push, or a
 #     "/recheck" comment on the PR. Add an hourly-or-slower cron only if
 #     you really need it (each scheduled run boots a runner).
+#   - workflow_run(completed) — SELF-LISTENING, cancel-heal only (job
+#     `codex-cancel-heal`): a cancelled run cannot run its own post
+#     steps, so this workflow listens for its own completions (fires from
+#     the default branch only; GitHub caps workflow_run chains at 3
+#     levels, so self-listening cannot loop). Only cancelled completions
+#     of PR-head runs boot a runner — every other completion skips all
+#     jobs without billing.
 #
 # Concurrency (never lets one event class cancel another):
 #   - push-class runs (opened / synchronize / reopened) share one group per
@@ -38,6 +45,9 @@
 #     the OLDER head only (that cancelled check sits on the old SHA).
 #   - relevant refresh runs (Codex / "/recheck" comments) queue per PR
 #     (a running one is never cancelled).
+#   - cancel-heal runs (workflow_run cancelled) share one 'heal' group,
+#     never cancelled — a heal must not be cancelled by a newer push (the
+#     re-run preserves the ORIGINAL event and never joins the push group).
 #   - every other run (labels, Codex reviews, dispatch, skipped events)
 #     gets its own group: never cancelled, never cancels. Gate runs are
 #     ~15 s, read live state, and are idempotent.
@@ -59,6 +69,12 @@ on:
         description: 'PR number to evaluate (dispatch on the PR branch to attach the check)'
         required: true
         type: string
+  # Self-listening for cancel-heal (see the `codex-cancel-heal` job):
+  # fires from the default branch only, on every completion of this
+  # workflow. Non-cancelled completions skip all jobs (no runner boots).
+  workflow_run:
+    workflows: ["Codex Review Gate"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -75,6 +91,7 @@ concurrency:
     (github.event_name == 'issue_comment' &&
       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector' ||
        startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
+    (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled') && 'heal' ||
     format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
 
@@ -117,6 +134,36 @@ jobs:
        github.event.comment.user.login == 'chatgpt-codex-connector' ||
        startsWith(github.event.comment.body, '/recheck'))
     permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: write
+    uses: qianhaoq/devflow-gates/.github/workflows/codex-gate.yml@main
+    with:
+      # runs_on: self-hosted   # keep in sync with codex job above
+      wait_minutes: 20
+      block_unlabeled: true
+
+  # Cancel-heal — a cancelled run cannot run its own post steps, so this
+  # job (fed by the self-listening workflow_run trigger above) re-runs the
+  # TRIGGERING cancelled run via the reusable refresh path: branch
+  # protection gates on the LATEST check run per required name on the head
+  # SHA, and a cancelled latest blocks merge even when the change is
+  # substantively green. Same caps as every refresh: at most one re-run
+  # per PR, never past run_attempt 3, never while a run is in flight —
+  # no blind re-runs, and a re-run preserves the ORIGINAL event so the
+  # fresh conclusion re-attaches to the PR head check. Push-originated
+  # cancellations are excluded: their head is the default branch, not a
+  # PR head. Non-cancelled completions of this workflow also reach this
+  # `if:` and skip it (no runner boots).
+  codex-cancel-heal:
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'cancelled' &&
+      github.event.workflow_run.event != 'push'
+    permissions:
+      # Same ceiling as codex-refresh: the reusable refresh job needs
+      # actions: write to re-run the cancelled run.
       contents: read
       pull-requests: read
       issues: read

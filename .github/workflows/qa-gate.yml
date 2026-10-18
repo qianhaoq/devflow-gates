@@ -45,14 +45,23 @@
 #     info + success (nothing to gate). workflow_dispatch with an
 #     invalid/nonnumeric pr_number FAILS (operator error must be loud).
 #
-# Scheduled refresh (QA Gate Refresh job, schedule-path only, OPTIONAL):
+# Scheduled refresh (QA Gate Refresh job, refresh path, schedule OPTIONAL):
 # no blind re-runs. It re-runs a failed head gate run only when the QA
 # label was applied after that run evaluated (input changed), else at
 # most the newest cancelled head run; one re-run per PR, never past
 # run_attempt 3 (see the job comment). Needs `actions: write`, granted by
-# the CALLER on the schedule-path job only (examples/qa-gate.yml,
-# `qa-refresh`). The example caller ships without a cron: every QA input
-# change is itself a pull_request_target event.
+# the CALLER on the refresh-path job (examples/qa-gate.yml, `qa-refresh`
+# / `qa-cancel-heal`). The example caller ships without a cron: every QA
+# input change is itself a pull_request_target event.
+#
+# Cancel-heal (A1, DEFAULT ON): the caller self-listens for its own runs
+# via workflow_run(completed) (default branch only; GitHub caps
+# workflow_run chains at 3 levels, so self-listening cannot loop) and
+# routes cancelled completions (event != push) to the refresh job, which
+# re-runs the TRIGGERING cancelled run on that head — a cancelled run
+# cannot run its own post steps, so its completion event is the only
+# prompt hook. Without it, a manually cancelled synchronize run leaves
+# the required check on "cancelled" and the merge API 405s forever.
 #
 # Filtering: the CALLER skips label events for other labels with a
 # job-level `if:` (a skipped caller job attaches a check named "qa", never
@@ -673,11 +682,18 @@ jobs:
   # A gate that is legitimately red (no sign-off yet) is NEVER re-run.
   # Nothing is re-run while a run on that head is still in flight. Needs
   # actions:write granted by the CALLER on its schedule-path job.
+  # Cancel-heal (A1) also routes here: a workflow_run(cancelled)
+  # completion of the caller workflow (the caller self-listens; a
+  # cancelled run cannot run its own post steps) resolves the PR behind
+  # the cancelled run — no sweep — and re-runs the TRIGGERING run (same
+  # caps: one re-run per PR, attempt 3, never while in flight).
   qa-gate-refresh:
     name: QA Gate Refresh
     runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 5
-    if: github.event_name == 'schedule'
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled')
     permissions:
       contents: read
       pull-requests: read
@@ -694,6 +710,12 @@ jobs:
             const repo = context.repo.repo;
             const QA_LABEL = (process.env.QA_LABEL || 'qa-passed').trim() || 'qa-passed';
             const MAX_ATTEMPTS = 3;
+            // Cancel-heal: the workflow_run.id whose CANCELLED completion
+            // triggered this refresh (0 for schedule sweeps). The caller
+            // self-listens via workflow_run because a cancelled run cannot
+            // run its own post steps.
+            const triggeredId = context.eventName === 'workflow_run'
+              ? Number(context.payload.workflow_run?.id) || 0 : 0;
             const POLL_MS = Number(process.env.REFRESH_POLL_MS ?? 10000);
             // One shared ~40 s wait budget for the whole sweep (not per PR).
             let pollBudget = 4;
@@ -708,12 +730,46 @@ jobs:
             const workflowId = thisRun.workflow_id;
             core.info(`Refreshing gate checks for workflow "${thisRun.name}" (id ${workflowId})`);
 
-            const prs = await github.paginate(github.rest.pulls.list, {
-              owner,
-              repo,
-              state: 'open',
-              per_page: 100,
-            });
+            // Cancel-heal trigger: resolve ONLY the PR(s) behind the
+            // cancelled run (no sweep). A run triggered by
+            // pull_request_target / dispatch-on-PR-branch carries the PR head
+            // SHA; push runs are filtered out by the caller job's if.
+            let prs;
+            if (context.eventName === 'workflow_run') {
+              const wr = context.payload.workflow_run;
+              if (!wr || wr.conclusion !== 'cancelled') {
+                core.info('workflow_run trigger is not a cancelled run — nothing to heal');
+                return;
+              }
+              // pull_requests entries carry no state/head fields: re-read each.
+              prs = [];
+              for (const cand of wr.pull_requests || []) {
+                const { data: candPr } = await github.rest.pulls.get({ owner, repo, pull_number: cand.number });
+                if (candPr.state === 'open' && candPr.head.sha === wr.head_sha) prs.push(candPr);
+              }
+              if (prs.length === 0) {
+                // Fallback: the PR association can be unindexed right after a
+                // cancel; match open PRs by head SHA instead.
+                const open = await github.paginate(github.rest.pulls.list, {
+                  owner,
+                  repo,
+                  state: 'open',
+                  per_page: 100,
+                });
+                prs = open.filter((p) => p.head.sha === wr.head_sha);
+              }
+              if (prs.length === 0) {
+                core.info(`Cancelled run ${wr.id} (head ${String(wr.head_sha || '').slice(0, 7)}) matches no open PR — nothing to heal`);
+                return;
+              }
+            } else {
+              prs = await github.paginate(github.rest.pulls.list, {
+                owner,
+                repo,
+                state: 'open',
+                per_page: 100,
+              });
+            }
             let scanned = 0;
             let rerun = 0;
             for (const pr of prs) {
@@ -765,6 +821,21 @@ jobs:
               const capped = (r) => (r.run_attempt || 1) >= MAX_ATTEMPTS;
               const latest = evaluated[0];
               if (!latest) continue;
+              // Cancel-heal priority: when a cancelled COMPLETION triggered this
+              // refresh, re-run THAT run first if it is still an uncapped
+              // cancelled run on this head — before the generic newest-cancelled
+              // fallback below. Still at most one re-run per PR per refresh.
+              if (triggeredId) {
+                const triggered = evaluated.find((r) => r.id === triggeredId
+                  && r.conclusion === 'cancelled' && !capped(r));
+                if (triggered) {
+                  await github.rest.actions.reRunWorkflow({ owner, repo, run_id: triggered.id });
+                  rerun += 1;
+                  core.info(`PR #${pr.number}: cancel-heal — re-running triggered run ${triggered.id} (attempt ${triggered.run_attempt || 1}, ${triggered.event}, head ${sha.slice(0, 7)})`);
+                  continue;
+                }
+                core.info(`PR #${pr.number}: triggered run ${triggeredId} is not (or no longer) an uncapped cancelled run on this head — falling back to the newest-cancelled logic`);
+              }
               if ((latest.conclusion === 'failure' || latest.conclusion === 'timed_out') && !capped(latest)
                   && (pr.labels || []).some((l) => l.name === QA_LABEL)) {
                 const events = await github.paginate(github.rest.issues.listEvents, {
