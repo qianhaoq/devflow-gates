@@ -84,11 +84,13 @@ on:
           Runner for jobs in this reusable workflow (default ubuntu-latest).
           Pass a single label (e.g. self-hosted) or a JSON array string
           such as ["self-hosted","linux","x64"] (parsed with fromJSON when
-          the value starts with "["). SECURITY: CI (and any job that
-          checks out / executes PR code) on a persistent self-hosted
-          runner is only for trusted private repos with no untrusted fork
-          PRs; prefer ephemeral/isolated runners otherwise. Read-only
-          gates (codex/qa/auto-merge) are safer on self-hosted.
+          the value starts with "["). For Reusable CI prefer the JSON
+          array with linux/x64 — Secret Scan fetches a linux_x64
+          gitleaks binary. SECURITY: CI (PR code) on a persistent
+          self-hosted runner is only for trusted private repos with no
+          untrusted fork PRs; prefer ephemeral/isolated runners
+          otherwise. Gates that skip PR code still hold write tokens
+          (QA / auto-merge / refresh) — trusted runners only.
         required: false
         type: string
         default: ubuntu-latest
