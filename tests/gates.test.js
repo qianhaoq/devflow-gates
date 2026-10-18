@@ -671,13 +671,15 @@ const UNL_KW = 'This is a security problem.';
   const RH = 'feedfacefeedfacefeedfacefeedfacefeedface';
   const SUMMARY_DONE = { user: { login: 'chatgpt-codex-connector[bot]' }, updated_at: '2026-10-16T03:00:00Z', body: `<!-- codex-pull-request-review-summary -->\n**Completed** — reviewed ${RH}` };
   const SUMMARY_RUNNING = { ...SUMMARY_DONE, body: '<!-- codex-pull-request-review-summary -->\n**Running**' };
-  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [] } = {}) {
+  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [], runById } = {}) {
     const reran = [];
     const prList = prs || [{ number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: labels.map((name) => ({ name })) }];
     const github = {
       rest: {
         actions: {
-          getWorkflowRun: async () => ({ data: { workflow_id: 7, name: 'Gate' } }),
+          // Branches by run_id: context.runId (=1) and any id not in runById
+          // keep the default caller-workflow answer.
+          getWorkflowRun: async (a) => ({ data: (runById && runById[a.run_id]) || { workflow_id: 7, name: 'Gate' } }),
           listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
           reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
           reRunWorkflow: async (a) => { reran.push(`all:${a.run_id}`); },
@@ -844,6 +846,16 @@ const UNL_KW = 'This is a security problem.';
       // unindexed right after the cancel.
       const unindexed = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request', head_sha: RH, pull_requests: [] } } };
       assert.deepStrictEqual(await runRefresh(file, cancelled, unindexed), ['all:21']);
+    });
+    await t(`${file} refresh: heal fetches the triggering run BY ID when headRuns cannot list it`, async () => {
+      // A pull_request_target run's own head_sha is the BASE SHA, so
+      // headRuns (indexed by PR head SHA) never lists it: runsByEvent has
+      // no trace of the triggered run 21. The heal must still get it via
+      // getWorkflowRun(triggeredId) and re-run it.
+      const wr = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: 'base000000000000000000000000000000000000', pull_requests: [{ number: 9 }] } } };
+      const runs = { pull_request_target: [run(12, 'pull_request_target', 'success', '2026-10-16T02:00:00Z')] };
+      const byId = { 21: { id: 21, workflow_id: 7, conclusion: 'cancelled', event: 'pull_request_target', run_attempt: 1, pull_requests: [{ number: 9 }] } };
+      assert.deepStrictEqual(await runRefresh(file, runs, { ...wr, runById: byId }), ['all:21']);
     });
     await t(`${file} refresh: workflow_run(cancelled) with no open PR / healed head → nothing`, async () => {
       // The cancelled run was already re-run to success elsewhere: latest is

@@ -834,8 +834,29 @@ jobs:
               // cancelled run on this head — before the generic newest-cancelled
               // fallback below. Still at most one re-run per PR per refresh.
               if (triggeredId) {
-                const triggered = evaluated.find((r) => r.id === triggeredId
+                let triggered = evaluated.find((r) => r.id === triggeredId
                   && r.conclusion === 'cancelled' && !capped(r));
+                if (!triggered) {
+                  // Do NOT rely on the headRuns index here: headRuns lists
+                  // runs by PR head SHA, but a pull_request_target run's own
+                  // head_sha is the BASE SHA, so the triggering cancelled
+                  // run may never appear in `evaluated`. The cancel-heal
+                  // trigger run is authoritative BY ID — fetch it directly
+                  // and validate before re-running.
+                  const { data: tr } = await github.rest.actions.getWorkflowRun({
+                    owner,
+                    repo,
+                    run_id: triggeredId,
+                  });
+                  const assoc = tr.pull_requests || [];
+                  // Empty association: trust the pr loop — it was already
+                  // narrowed to this run's PR(s) above.
+                  if (tr.conclusion === 'cancelled' && !capped(tr)
+                    && tr.workflow_id === workflowId
+                    && (assoc.length === 0 || assoc.some((p) => p.number === pr.number))) {
+                    triggered = tr;
+                  }
+                }
                 if (triggered) {
                   await github.rest.actions.reRunWorkflow({ owner, repo, run_id: triggered.id });
                   rerun += 1;
