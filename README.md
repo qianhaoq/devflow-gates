@@ -26,8 +26,10 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 | `examples/ci.yml` | `ci` | `ci / Build & Test`、`ci / Secret Scan` |
 | `examples/codex-gate.yml` | `codex` | `codex / Codex Review Gate` |
 | `examples/codex-gate.yml` | `codex-refresh` | `codex-refresh / Codex Gate Refresh`（仅 Codex 评论 / `/recheck` 评论触发，**不**挂在 PR 检查上） |
+| `examples/codex-gate.yml` | `codex-cancel-heal` | `codex-cancel-heal / Codex Gate Refresh`（自听 `workflow_run`，仅 cancelled 完成时触发，**不**挂在 PR 检查上） |
 | `examples/qa-gate.yml` | `qa` | `qa / QA Gate` |
 | `examples/qa-gate.yml` | `qa-refresh` | `qa-refresh / QA Gate Refresh`（可选，示例默认注释掉；仅 schedule 运行，**不**挂在 PR 检查上） |
+| `examples/qa-gate.yml` | `qa-cancel-heal` | `qa-cancel-heal / QA Gate Refresh`（自听 `workflow_run`，仅 cancelled 完成时触发，**默认启用**，**不**挂在 PR 检查上） |
 | `examples/auto-merge.yml` | `auto-merge` | `auto-merge / Auto Merge` |
 | `examples/smoke.yml` | `smoke` | `smoke / Post-deploy Smoke` |
 | `examples/acceptance.yml` | `acceptance` | `acceptance / Acceptance Gate`（另有辅助检查 `Acceptance Config` / `Acceptance Measure`；M1 仅观察，**不要**加入分支保护） |
@@ -159,6 +161,15 @@ pull_request_review(_comment) / PR 分支上的 workflow_dispatch；被调用方
   由 verdict 翻转驱动的重跑上限 20（避免把一个现在能通过的检查卡成红）。
   列表分页读取；head 上有进行中的运行（多为几秒内即 skipped 的调用方过滤）时
   先等待最多约 40 秒。
+- **Cancel-heal（A1，默认启用）**：示例调用方还通过
+  `workflow_run(completed)` **自听**本工作流（只在默认分支生效；GitHub 把
+  workflow_run 链条限制在 3 层内，所以自听不会循环）。某次运行被取消
+  （非 push 来源）时，`codex-cancel-heal` job 走同一刷新逻辑，**只重跑被取消
+  的那次运行**——被取消的运行自己跑不了 post 步骤，只能靠完成事件来触发
+  补救；同样的上限（每 PR 一次、`run_attempt 3`、进行中不动）。重跑前若发现
+  同 PR 已有**更新的** success / 进行中运行，则让位不重跑（先看 headRuns 结果，
+  再按 PR 关联做无 head_sha 的兜底扫描，因为 pull_request_target 运行对
+  headRuns 不可见）——迟到的 heal 不能把绿/进行中的必需检查顶回 pending/红。
 - 需要 `actions: write`（调用方授予）。
 - 检查缺失 / 最近一次 pull_request_target 运行仍在跑 / 已成功 → 不动。
 
@@ -277,12 +288,22 @@ PR 立刻把检查置为失败。
 dispatch、被跳过的事件）各自独立成组，**label 事件永远无法取消 push 评估**；
 门禁本身也不依赖这一点（见第 2 步）。见 [examples/qa-gate.yml](examples/qa-gate.yml)。
 
+**Cancel-heal（A1，默认启用）**：示例调用方通过 `workflow_run(completed)`
+**自听**本工作流（只在默认分支生效；GitHub 把 workflow_run 链条限制在 3 层
+内，所以自听不会循环）。某次运行被取消（非 push 来源）时，`qa-cancel-heal`
+job 走同一刷新逻辑，**只重跑被取消的那次运行**（被取消的运行自己跑不了
+post 步骤）；同样的上限（每 PR 一次、`run_attempt 3`、进行中不动），heal
+所在并发组永不取消、绝不进入 push 的 cancel-in-progress 组。重跑前若发现
+同 PR 已有**更新的** success / 进行中运行，则让位不重跑（先看 headRuns
+结果，再按 PR 关联做无 head_sha 的兜底扫描）——迟到的 heal 不能把绿/
+进行中的必需检查顶回 pending/红。
+
 已知局限（P3）：如果有人**手动取消** push（synchronize）触发的 QA Gate 运行，
 移除过期 `qa-passed` 的那次评估就没有发生：标签暂时保留，`qa / QA Gate`
-停在 cancelled（cancelled 不是 success，Auto Merge 与分支保护都不会放行），
-直到下一个 QA 事件（打/撤标签、草稿/就绪、dispatch、新 push，或启用了刷新时
-的 schedule 重跑最新 cancelled 运行）重新评估并按第 3 步移除标签。不会造成
-误合并，只是状态滞后；处理方式：`workflow_dispatch(pr_number)` 重新评估。
+停在 cancelled——上面的 **cancel-heal 现在会自动重跑被取消的运行**，重新评估
+并按第 3 步移除/保留标签（重跑到 `run_attempt 3` 为止；超限后仍需
+`workflow_dispatch(pr_number)` 重新评估）。cancelled 不是 success，Auto Merge
+与分支保护都不会放行，不会造成误合并。
 
 ### 4. `.github/workflows/auto-merge.yml` — 自动合并
 
@@ -296,9 +317,9 @@ dispatch、被跳过的事件）各自独立成组，**label 事件永远无法�
 | `block_unlabeled` | boolean | `true` | 未标级 Codex 线程阻断（`false` = 仅关键词）；Copilot/人工显式 P2 不阻断 |
 
 调用方触发：`workflow_run`（对本仓库的 CI / Codex Review Gate / QA Gate
-等 `completed`）、`pull_request_review` [submitted]、
-`workflow_dispatch(pr_number)`（非法/非数字 `pr_number` → **失败**）。
-注意 `workflow_run` 只在默认分支上的文件生效（合并后才触发）。
+等 `completed`，**cancelled 完成也会进入评估**——见下）、`pull_request_review`
+[submitted]、`workflow_dispatch(pr_number)`（非法/非数字 `pr_number` →
+**失败**）。注意 `workflow_run` 只在默认分支上的文件生效（合并后才触发）。
 
 **并发必须由调用方设置**（可复用工作流管不了调用方的事件流）。已知 PR 的
 事件用每 PR 一个 group（review / dispatch / 触发事件为 `pull_request` 的
@@ -333,6 +354,12 @@ concurrency:
   `skip-codex-gate` 标签、**任一 required check 缺失/非 success（按名取
   最新一次尝试）**、最新评审 CHANGES_REQUESTED、未解决的非 Codex 线程、
   未解决的阻断级 Codex 线程（严重度规则与 codex-gate.yml 完全一致）。
+- **必需检查按名取最新一次分类（A2）**：缺失 → 跳过本轮（等检查出现，
+  绝不当成功）；进行中 → 跳过；**最新一次是 `cancelled` → 既不当失败也绝
+  不当成功**：找到对应 workflow run 重新跑它（`actions: write`，
+  `run_attempt >= 3` 只记日志不重跑）并**跳过本轮合并**，重跑完成会再次
+  触发评估。**更旧的 success 不能绕过最新的 cancelled**（分支保护同样按
+  最新一次检查判定）；failure / timed_out 等 → 普通红，照旧跳过。
 - 可选 Copilot 要求（`require_copilot: true`）：`copilot-pull-request-reviewer`
   检查须 success，且 head 上最新 Copilot 评审为 APPROVED 或 COMMENTED
   （Copilot 常提交 COMMENTED，不要求 APPROVED）。软路径：官方检查缺失但
@@ -451,6 +478,15 @@ Config 解析失败时 Gate 被跳过（跳过 = 通过）。
 `.github/workflows/` 与 `examples/` 全量静态检查（表达式、输入类型、
 shellcheck），并运行 `node tests/gates.test.js` 与
 `python3 tests/acceptance_test.py`（门禁内联脚本的离线测试）。
+
+## 合入前探测脚本
+
+合入卡在 expected / cancelled 必需检查上时，先跑
+`./scripts/heal-required-checks.sh owner/repo PR_NUMBER [check_name ...]`
+（需已登录 `gh`；默认探测 `ci / Build & Test`、`codex / Codex Review Gate`、
+`qa / QA Gate`，可用参数或 `HEAL_REQUIRED_CHECKS` 环境变量覆盖）：cancelled
+→ `gh run rerun` 触发补终态；退出码 0 = 全绿可合、1 = 已触发 heal 或仍未绿、
+2 = 用法/API 错误。**不要临时撤分支保护**（极端兜底的人工撤保护须开 issue）。
 
 ## 许可证
 
