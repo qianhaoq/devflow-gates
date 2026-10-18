@@ -107,6 +107,7 @@ Job：
 
 | 输入 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
+| `runs_on` | string | `ubuntu-latest` | Runner 标签；可传 `self-hosted` 或 JSON 数组 `["self-hosted","linux","x64"]`（以 `[` 开头时 fromJSON）。CI 的 Secret Scan 依赖 linux_x64 gitleaks，建议用带 OS/arch 的数组。在持久 self-hosted 上跑会执行 PR 代码的 CI：仅限可信私有仓、无不可信 fork；门禁虽不执行 PR 代码但仍持有写令牌，也只用可信隔离 runner。 |
 | `wait_minutes` | number | `20` | 等待 Codex 发布/更新 Review Summary 的超时分钟数 |
 | `block_unlabeled` | boolean | `true` | 未标级 Codex 线程阻断（既定策略）；`false` = opt-out，仅关键词匹配时阻断 |
 
@@ -287,6 +288,7 @@ dispatch、被跳过的事件）各自独立成组，**label 事件永远无法�
 
 | 输入 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
+| `runs_on` | string | `ubuntu-latest` | Runner 标签；可传 `self-hosted` 或 JSON 数组 `["self-hosted","linux","x64"]`（以 `[` 开头时 fromJSON）。CI 的 Secret Scan 依赖 linux_x64 gitleaks，建议用带 OS/arch 的数组。在持久 self-hosted 上跑会执行 PR 代码的 CI：仅限可信私有仓、无不可信 fork；门禁虽不执行 PR 代码但仍持有写令牌，也只用可信隔离 runner。 |
 | `required_checks` | string | **必填** | 换行分隔的必需检查名（head SHA 上必须为 success，按名取最新一次） |
 | `merge_method` | string | `'squash'` | `squash` / `merge` / `rebase` |
 | `require_copilot` | boolean | `false` | 是否要求 Copilot 评审 |
@@ -382,6 +384,7 @@ concurrency:
 
 | 输入 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
+| `runs_on` | string | `ubuntu-latest` | Runner 标签；可传 `self-hosted` 或 JSON 数组 `["self-hosted","linux","x64"]`（以 `[` 开头时 fromJSON）。CI 的 Secret Scan 依赖 linux_x64 gitleaks，建议用带 OS/arch 的数组。在持久 self-hosted 上跑会执行 PR 代码的 CI：仅限可信私有仓、无不可信 fork；门禁虽不执行 PR 代码但仍持有写令牌，也只用可信隔离 runner。 |
 | `config_path` | string | `.github/acceptance.yml` | 配置文件路径 |
 | `timeout_minutes` | number | `10` | 每个 job 的超时 |
 
