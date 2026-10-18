@@ -65,3 +65,7 @@ jobs:
         qa / QA Gate
       merge_method: squash
       require_copilot: false
+      # With require_copilot: 'head' (default) needs a Copilot check + review on
+      # the head SHA; 'any' accepts one Copilot review on any commit (use it when
+      # Copilot is requested only on opened/ready_for_review, not per push).
+      copilot_scope: head
