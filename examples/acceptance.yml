@@ -26,7 +26,9 @@ permissions: {}
 jobs:
   acceptance:
     # Saves Actions minutes: label events for other labels skip without
-    # booting a runner (Measure runs the PR's tests).
+    # booting a runner (Measure runs the PR's tests). KEEP IN SYNC with
+    # `tests_changed.exempt_label` in .github/acceptance.yml if you change
+    # it from the default `no-test-needed` (or drop this `if:`).
     if: >-
       (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'no-test-needed'

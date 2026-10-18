@@ -13,10 +13,12 @@
 #     unlabeled for `skip-codex-gate` only (other labels are skipped by the
 #     caller `if:` below — no runner boots, and the skipped check is named
 #     "codex", never the required "codex / Codex Review Gate").
-#   - pull_request_review (submitted) by chatgpt-codex-connector[bot] only.
-#     One Codex review with N inline comments = ONE run (the old
-#     pull_request_review_comment trigger fired N more runs; reply
-#     comments are submitted as reviews too, so it is not needed).
+#   - pull_request_review (submitted) by Codex only. One Codex review with
+#     N inline comments = ONE run.
+#   - pull_request_review_comment by Codex only, and only when it is an
+#     EDIT or a thread REPLY (e.g. a finding edited into P0/P1). New
+#     top-level inline comments are part of a submitted review, which
+#     already evaluates — the old unfiltered trigger fired N more runs.
 #   - issue_comment → the REFRESH job, only for comments by Codex (summary
 #     created/edited, "no major issues") or a "/recheck" comment. Its
 #     conclusion would land on the default branch, so it does not
@@ -49,6 +51,8 @@ on:
     types: [created, edited]
   pull_request_review:
     types: [submitted]
+  pull_request_review_comment:
+    types: [created, edited]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -66,7 +70,8 @@ concurrency:
     codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || 'none' }}-${{
     (github.event_name == 'pull_request_target' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
     (github.event_name == 'issue_comment' &&
-      (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
+      (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector' ||
+       startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
     format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
 
@@ -77,7 +82,10 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_review' &&
-        github.event.review.user.login == 'chatgpt-codex-connector[bot]') ||
+        (github.event.review.user.login == 'chatgpt-codex-connector[bot]' || github.event.review.user.login == 'chatgpt-codex-connector')) ||
+      (github.event_name == 'pull_request_review_comment' &&
+        (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector') &&
+        (github.event.action == 'edited' || github.event.comment.in_reply_to_id)) ||
       (github.event_name == 'pull_request_target' &&
         ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
          github.event.label.name == 'skip-codex-gate'))
@@ -101,6 +109,7 @@ jobs:
     if: >-
       github.event_name == 'issue_comment' && github.event.issue.pull_request &&
       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' ||
+       github.event.comment.user.login == 'chatgpt-codex-connector' ||
        startsWith(github.event.comment.body, '/recheck'))
     permissions:
       contents: read

@@ -113,11 +113,12 @@ Job：
 `pull_request_target` [opened, synchronize, reopened, ready_for_review,
 converted_to_draft, labeled, unlabeled]（labeled/unlabeled 只对
 `skip-codex-gate` 评估，其他标签由调用方 `if:` 跳过）、`pull_request_review`
-[submitted]（只评估 `chatgpt-codex-connector[bot]` 的 review）、
+[submitted]（只评估 Codex 的 review）、`pull_request_review_comment`
+[created, edited]（只评估 Codex 评论的**编辑**或**线程回复**；新的顶层行内评论
+属于已提交的 review，已被评估）、
 `issue_comment` [created, edited]（只走刷新 job：Codex 的评论或 `/recheck`）、
-`workflow_dispatch(pr_number)`。**不再**使用 `pull_request_review_comment`
-（一次带 N 条行内评论的 Codex review 会多触发 N 次运行；线程回复也会以
-review 形式提交）和 `schedule`。`converted_to_draft` 让退回草稿的 PR 立刻
+`workflow_dispatch(pr_number)`。不再无过滤地对每条 review comment 评估（一次带
+N 条行内评论的 Codex review 以前会多触发 N 次运行），也**不再**使用 `schedule`。`converted_to_draft` 让退回草稿的 PR 立刻
 重新评估并把检查置为失败（否则旧的绿色检查会一直挂着）。
 
 并发（示例）：push 类事件（opened / synchronize / reopened）每 PR 一组且
