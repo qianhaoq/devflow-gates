@@ -98,6 +98,49 @@ const UNL_KW = 'This is a security problem.';
     assert.strictEqual(am.isBlockingNonCodexThread(['P2: nit', '[P1] actually this breaks prod']), true);
   });
 
+  // Copilot gate: 'head' (strict, default) vs 'any' (reviewed once, any commit).
+  const copilot = (() => {
+    const src = scripts('auto-merge.yml')[0];
+    const logins = src.match(/const COPILOT_LOGINS = new Set\(\[[\s\S]*?\]\);/);
+    const start = src.indexOf('function copilotReviewAllowsMerge');
+    const end = src.indexOf('async function candidatePrNumbers', start);
+    assert.ok(logins && start >= 0 && end > start, 'auto-merge.yml: copilot region not found');
+    return new Function(logins[0] + '\n' + src.slice(start, end) + '\nreturn copilotGateDecision;')();
+  })();
+  const CH = 'c0ffee0000000000000000000000000000000000';
+  const OLD = 'babe000000000000000000000000000000000000';
+  const crev = (state, commit_id, submitted_at, login = 'copilot-pull-request-reviewer[bot]') => ({ state, commit_id, submitted_at, user: { login } });
+  const cchk = (status, conclusion) => ({ name: 'copilot-pull-request-reviewer', status, conclusion });
+  await t('auto-merge copilot head: review only on an older commit stalls (strict default)', () => {
+    const d = copilot([crev('COMMENTED', OLD, '2026-10-17T01:00:00Z')], [], CH, 1, 'head');
+    assert.strictEqual(d.ok, false);
+    assert.match(d.msg, /missing on head SHA/);
+    assert.strictEqual(copilot([crev('COMMENTED', CH, '2026-10-17T01:00:00Z')], [], CH, 1, 'head').ok, true);
+    assert.strictEqual(copilot([crev('COMMENTED', CH, '2026-10-17T01:00:00Z')], [cchk('completed', 'failure')], CH, 1, 'head').ok, false);
+  });
+  await t('auto-merge copilot any: one review on an older commit satisfies', () => {
+    const d = copilot([crev('COMMENTED', OLD, '2026-10-17T01:00:00Z')], [], CH, 1, 'any');
+    assert.strictEqual(d.ok, true, d.msg);
+    // A failed (quota) head check does not block in 'any' scope.
+    assert.strictEqual(copilot([crev('APPROVED', OLD, '2026-10-17T01:00:00Z')], [cchk('completed', 'failure')], CH, 1, 'any').ok, true);
+  });
+  await t('auto-merge copilot any: no review / dismissed / other user → blocks', () => {
+    assert.match(copilot([], [], CH, 1, 'any').msg, /no Copilot review on any commit/);
+    assert.strictEqual(copilot([crev('DISMISSED', OLD, '2026-10-17T01:00:00Z')], [], CH, 1, 'any').ok, false);
+    assert.strictEqual(copilot([crev('APPROVED', CH, '2026-10-17T01:00:00Z', 'someone')], [], CH, 1, 'any').ok, false);
+  });
+  await t('auto-merge copilot any: latest CHANGES_REQUESTED vetoes; a later COMMENTED clears it', () => {
+    const cr = crev('CHANGES_REQUESTED', OLD, '2026-10-17T02:00:00Z');
+    assert.match(copilot([crev('COMMENTED', OLD, '2026-10-17T01:00:00Z'), cr], [], CH, 1, 'any').msg, /CHANGES_REQUESTED/);
+    assert.strictEqual(copilot([cr, crev('COMMENTED', CH, '2026-10-17T03:00:00Z')], [], CH, 1, 'any').ok, true);
+  });
+  await t('auto-merge copilot any: a running head Copilot check does not stall (no re-trigger when it ends)', () => {
+    assert.strictEqual(copilot([crev('COMMENTED', OLD, '2026-10-17T01:00:00Z')], [cchk('in_progress', null)], CH, 1, 'any').ok, true);
+    assert.strictEqual(copilot([], [cchk('in_progress', null)], CH, 1, 'any').ok, false);
+    // 'head' scope keeps waiting on a pending check (unchanged behaviour).
+    assert.strictEqual(copilot([crev('COMMENTED', CH, '2026-10-17T01:00:00Z')], [cchk('in_progress', null)], CH, 1, 'head').ok, false);
+  });
+
   // QA gate dry-run.
   const qa = scripts('qa-gate.yml')[0];
   const HEAD = 'abcdef1234567abcdef1234567abcdef12345678';

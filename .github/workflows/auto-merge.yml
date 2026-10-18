@@ -32,6 +32,14 @@
 #     Copilot gate as satisfied; still fail-closed with no Copilot review.
 #     TODO(2026-10-29): remove Copilot COMMENTED/quota soft-path after
 #     stable Copilot Pro+ quota.
+#     `copilot_scope: any` relaxes this to "Copilot reviewed the PR at least
+#     once, on ANY commit" (for callers that request Copilot only on
+#     opened/ready_for_review and have no per-push re-review): at least one
+#     non-dismissed Copilot review must exist, the latest one must not be
+#     CHANGES_REQUESTED; head Copilot check runs are ignored (missing,
+#     running or failed never block — a running one would not re-trigger
+#     this workflow when it ends without a review). Per-head freshness is
+#     then the job of the required checks (Codex gate, CI, QA).
 #   - GraphQL reviewThreads: non-Codex (Copilot/human) threads resolved
 #     unless explicitly P2; Codex threads resolved or non-blocking
 #     (explicit P2 may stay open; unlabeled blocks unless
@@ -88,6 +96,15 @@ on:
         required: false
         type: boolean
         default: false
+      copilot_scope:
+        description: >-
+          Only with require_copilot. 'head' (default): Copilot check + review
+          required on the head SHA. 'any': at least one Copilot review on any
+          commit of the PR (latest not CHANGES_REQUESTED; head Copilot check
+          runs are ignored). Unknown values fall back to 'head'.
+        required: false
+        type: string
+        default: 'head'
       block_unlabeled:
         description: 'Unresolved unlabeled Codex threads block (default true, fail-closed policy; same rule as codex-gate.yml). false = opt-out: keyword-only. Non-Codex unlabeled threads always block; explicit P2 never blocks.'
         required: false
@@ -122,6 +139,7 @@ jobs:
           REQUIRED_CHECKS: ${{ inputs.required_checks }}
           MERGE_METHOD: ${{ inputs.merge_method }}
           REQUIRE_COPILOT: ${{ inputs.require_copilot }}
+          COPILOT_SCOPE: ${{ inputs.copilot_scope }}
           BLOCK_UNLABELED: ${{ inputs.block_unlabeled }}
         with:
           script: |
@@ -133,6 +151,8 @@ jobs:
             ]);
             const COPILOT_CHECK_RE = /copilot-pull-request-reviewer/i;
             const REQUIRE_COPILOT = process.env.REQUIRE_COPILOT === 'true';
+            // Fail closed: anything but an explicit 'any' keeps the strict head rule.
+            const COPILOT_SCOPE = (process.env.COPILOT_SCOPE || '').trim() === 'any' ? 'any' : 'head';
             // Fail closed: only an explicit 'false' opts out.
             const BLOCK_UNLABELED = process.env.BLOCK_UNLABELED !== 'false';
             const MERGE_METHOD = ['squash', 'merge', 'rebase'].includes(process.env.MERGE_METHOD)
@@ -204,6 +224,81 @@ jobs:
                 return { ok: true, reason: state };
               }
               return { ok: false, reason: state };
+            }
+
+            // Pure Copilot gate decision (unit-tested in tests/gates.test.js).
+            // reviews: pulls.listReviews; copilotChecks: latest-per-name head
+            // check runs matching COPILOT_CHECK_RE. Returns { ok, msg }.
+            function copilotGateDecision(reviews, copilotChecks, sha, prNumber, scope) {
+              const copilotReviews = reviews.filter(
+                (r) => COPILOT_LOGINS.has(r.user?.login || '') && r.state !== 'DISMISSED' && r.state !== 'PENDING'
+              );
+              const byNewest = (a, b) => new Date(b.submitted_at) - new Date(a.submitted_at);
+              const pendingChecks = copilotChecks.filter((c) => c.status !== 'completed');
+
+              if (scope === 'any') {
+                if (copilotReviews.length === 0) {
+                  return { ok: false, msg: `PR #${prNumber}: no Copilot review on any commit yet — skip` };
+                }
+                const newest = [...copilotReviews].sort(byNewest)[0];
+                const gate = copilotReviewAllowsMerge(newest);
+                if (!gate.ok) {
+                  return { ok: false, msg: `PR #${prNumber}: latest Copilot review is ${newest.state} (${gate.reason}) — skip` };
+                }
+                // Head Copilot check runs are ignored here: waiting on a
+                // running one could stall forever (its completion does not
+                // re-trigger Auto Merge when it ends without a review, e.g.
+                // quota), and missing/failed ones are the expected case.
+                return {
+                  ok: true,
+                  msg: `PR #${prNumber}: Copilot reviewed ${String(newest.commit_id || '?').slice(0, 7)} (${gate.reason}); scope=any, head freshness via required checks`,
+                };
+              }
+
+              const withCommit = copilotReviews.filter((r) => r.commit_id);
+              const forHead = withCommit.length
+                ? withCommit.filter((r) => r.commit_id === sha)
+                : copilotReviews;
+              const latest = forHead.length ? [...forHead].sort(byNewest)[0] : null;
+              const copilotGate = latest
+                ? copilotReviewAllowsMerge(latest)
+                : { ok: false, reason: 'missing' };
+
+              let note = '';
+              if (copilotChecks.length === 0) {
+                // Soft-path: Copilot quota death — official check never appears, but a head
+                // review that is APPROVED/COMMENTED still satisfies the Copilot gate.
+                // TODO(2026-10-29): remove Copilot COMMENTED/quota soft-path after 1-2
+                // weeks of stable Copilot Pro+ quota.
+                if (!latest || !copilotGate.ok) {
+                  return { ok: false, msg: 'copilot-pull-request-reviewer missing on head SHA — skip' };
+                }
+                note = `copilot official check missing; head review ${copilotGate.reason} allows merge`;
+              } else {
+                const bad = copilotChecks.filter(
+                  (c) => c.status === 'completed' && c.conclusion !== 'success'
+                );
+                if (pendingChecks.length > 0) {
+                  return { ok: false, msg: `copilot-pull-request-reviewer pending: ${pendingChecks.map((c) => c.status).join(', ')} — skip` };
+                }
+                if (bad.length > 0) {
+                  return { ok: false, msg: `copilot-pull-request-reviewer not successful: ${bad.map((c) => c.conclusion).join(', ')} — skip` };
+                }
+              }
+
+              if (copilotReviews.length === 0) {
+                return { ok: false, msg: `PR #${prNumber}: no Copilot review yet — skip (will retry when review lands)` };
+              }
+              if (!latest) {
+                return { ok: false, msg: `PR #${prNumber}: no Copilot review for head ${sha.slice(0, 7)} — skip` };
+              }
+              if (!copilotGate.ok) {
+                return {
+                  ok: false,
+                  msg: `PR #${prNumber}: latest Copilot review for head is ${latest.state} (${copilotGate.reason}) — skip`,
+                };
+              }
+              return { ok: true, msg: note };
             }
 
             async function candidatePrNumbers() {
@@ -487,7 +582,7 @@ jobs:
                 return;
               }
 
-              // Optional Copilot requirement.
+              // Optional Copilot requirement (scope: see copilotGateDecision).
               if (REQUIRE_COPILOT) {
                 const reviews = await github.paginate(github.rest.pulls.listReviews, {
                   owner,
@@ -495,61 +590,10 @@ jobs:
                   pull_number: prNumber,
                   per_page: 100,
                 });
-
-                const copilotReviews = reviews.filter(
-                  (r) => COPILOT_LOGINS.has(r.user?.login || '') && r.state !== 'DISMISSED' && r.state !== 'PENDING'
-                );
-                const withCommit = copilotReviews.filter((r) => r.commit_id);
-                const forHead = withCommit.length
-                  ? withCommit.filter((r) => r.commit_id === sha)
-                  : copilotReviews;
-                const latest = forHead.length
-                  ? forHead.sort((a, b) => new Date(b.submitted_at) - new Date(a.submitted_at))[0]
-                  : null;
-                const copilotGate = latest
-                  ? copilotReviewAllowsMerge(latest)
-                  : { ok: false, reason: 'missing' };
-
                 const copilotChecks = relevantChecks.filter((c) => COPILOT_CHECK_RE.test(c.name || ''));
-                if (copilotChecks.length === 0) {
-                  // Soft-path: Copilot quota death — official check never appears, but a head
-                  // review that is APPROVED/COMMENTED still satisfies the Copilot gate.
-                  // TODO(2026-10-29): remove Copilot COMMENTED/quota soft-path after 1-2
-                  // weeks of stable Copilot Pro+ quota.
-                  if (!latest || !copilotGate.ok) {
-                    core.info('copilot-pull-request-reviewer missing on head SHA — skip');
-                    return;
-                  }
-                  core.info(`copilot official check missing; head review ${copilotGate.reason} allows merge`);
-                } else {
-                  const pending = copilotChecks.filter((c) => c.status !== 'completed');
-                  const bad = copilotChecks.filter(
-                    (c) => c.status === 'completed' && c.conclusion !== 'success'
-                  );
-                  if (pending.length > 0) {
-                    core.info(`copilot-pull-request-reviewer pending: ${pending.map((c) => c.status).join(', ')} — skip`);
-                    return;
-                  }
-                  if (bad.length > 0) {
-                    core.info(`copilot-pull-request-reviewer not successful: ${bad.map((c) => c.conclusion).join(', ')} — skip`);
-                    return;
-                  }
-                }
-
-                if (copilotReviews.length === 0) {
-                  core.info(`PR #${prNumber}: no Copilot review yet — skip (will retry when review lands)`);
-                  return;
-                }
-                if (!latest) {
-                  core.info(`PR #${prNumber}: no Copilot review for head ${sha.slice(0, 7)} — skip`);
-                  return;
-                }
-                if (!copilotGate.ok) {
-                  core.info(
-                    `PR #${prNumber}: latest Copilot review for head is ${latest.state} (${copilotGate.reason}) — skip`
-                  );
-                  return;
-                }
+                const decision = copilotGateDecision(reviews, copilotChecks, sha, prNumber, COPILOT_SCOPE);
+                if (decision.msg) core.info(decision.msg);
+                if (!decision.ok) return;
               }
 
               let unresolved;

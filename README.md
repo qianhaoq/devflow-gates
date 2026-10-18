@@ -274,6 +274,13 @@ PR 立刻把检查置为失败。
 dispatch、被跳过的事件）各自独立成组，**label 事件永远无法取消 push 评估**；
 门禁本身也不依赖这一点（见第 2 步）。见 [examples/qa-gate.yml](examples/qa-gate.yml)。
 
+已知局限（P3）：如果有人**手动取消** push（synchronize）触发的 QA Gate 运行，
+移除过期 `qa-passed` 的那次评估就没有发生：标签暂时保留，`qa / QA Gate`
+停在 cancelled（cancelled 不是 success，Auto Merge 与分支保护都不会放行），
+直到下一个 QA 事件（打/撤标签、草稿/就绪、dispatch、新 push，或启用了刷新时
+的 schedule 重跑最新 cancelled 运行）重新评估并按第 3 步移除标签。不会造成
+误合并，只是状态滞后；处理方式：`workflow_dispatch(pr_number)` 重新评估。
+
 ### 4. `.github/workflows/auto-merge.yml` — 自动合并
 
 | 输入 | 类型 | 默认 | 说明 |
@@ -281,6 +288,7 @@ dispatch、被跳过的事件）各自独立成组，**label 事件永远无法�
 | `required_checks` | string | **必填** | 换行分隔的必需检查名（head SHA 上必须为 success，按名取最新一次） |
 | `merge_method` | string | `'squash'` | `squash` / `merge` / `rebase` |
 | `require_copilot` | boolean | `false` | 是否要求 Copilot 评审 |
+| `copilot_scope` | string | `'head'` | 仅 `require_copilot` 时生效：`head` = head SHA 上须有 Copilot 检查 + 评审；`any` = PR 任一提交上评审过一次即可，忽略 head 上的 Copilot 检查（见下）；其他值按 `head` |
 | `block_unlabeled` | boolean | `true` | 未标级 Codex 线程阻断（`false` = 仅关键词）；Copilot/人工显式 P2 不阻断 |
 
 调用方触发：`workflow_run`（对本仓库的 CI / Codex Review Gate / QA Gate
@@ -327,6 +335,16 @@ concurrency:
   head 上已有 Copilot APPROVED/COMMENTED（配额故障）时视为满足；完全没有
   Copilot 评审仍 fail-closed。
   TODO(2026-10-29)：Copilot Pro+ 配额稳定后删除该软路径。
+- `copilot_scope: any`（推荐给只在 opened / ready_for_review 请求一次 Copilot、
+  且**没有**按 push 重审的仓库；否则任何后续 push 都会永久卡在
+  "copilot-pull-request-reviewer missing on head SHA"）：PR 上至少有一条未被
+  dismiss 的 Copilot 评审（任一提交）、最新一条 Copilot 评审不是
+  CHANGES_REQUESTED；head 上的 Copilot 检查一律忽略（缺失、运行中、失败都
+  **不**阻断——运行中的检查若最终因配额失败且不提交评审，不会再触发 Auto
+  Merge，等待会永久卡住）。head 新鲜度由 required checks（Codex
+  Gate、CI、QA）保证。建议调用方用与 ai-review 相同的仓库变量做开关：
+  `require_copilot: ${{ vars.DISABLE_COPILOT_REVIEW != 'true' }}`
+  （默认要求）或 `${{ vars.DISABLE_COPILOT_REVIEW == 'false' }}`（默认不要求）。
 - 本工作流自己的检查（名字含 "auto merge"）会被忽略，不会自我死锁。
 
 ### 5. `.github/workflows/post-deploy-smoke.yml` — 部署后冒烟
