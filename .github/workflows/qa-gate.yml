@@ -703,9 +703,12 @@ jobs:
               if (runs.some((r) => r.status && r.status !== 'completed')) continue;
               // Caller-level skips (unrelated label events) conclude
               // 'skipped' and attach no gate check — ignore them.
+              // Newest by the LATEST ATTEMPT's start (a re-run of an older
+              // run is the freshest check), not by run creation time.
+              const attemptAt = (r) => Date.parse(r.run_started_at || r.created_at || 0) || 0;
               const evaluated = runs
                 .filter((r) => r.conclusion !== 'skipped')
-                .sort((a, b) => (Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)) || ((b.id || 0) - (a.id || 0)));
+                .sort((a, b) => (attemptAt(b) - attemptAt(a)) || ((b.id || 0) - (a.id || 0)));
               const capped = (r) => (r.run_attempt || 1) >= MAX_ATTEMPTS;
               const latest = evaluated[0];
               if (!latest) continue;

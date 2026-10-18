@@ -146,6 +146,10 @@ pull_request_review(_comment) / PR 分支上的 workflow_dispatch；被调用方
   切换，测试强制两份脚本一致）算 `verdict()`；**只有现在能通过**才
   `reRunWorkflowFailedJobs`。仍会失败的 Gate（例如合法地等人工处理）**绝不**
   重跑——不再有盲目的周期性重跑。
+- 最近一次为 `success` 但 `verdict()` 现在为假（例如 Codex 在同一 SHA 上把
+  Summary 改回 Running / Failed）→ 整体重跑它，让必需检查转红（fail closed）。
+- "最近一次"按**最新一次 attempt 的开始时间**（`run_started_at`）排序：被重跑的
+  旧运行才是最新的检查。
 - 否则若 head 上有 `cancelled` 运行 → 只整体重跑**最新的那一个**（避免分支
   保护把残留的 cancelled 必需检查当结果：405 "Required status check … is
   cancelled"）。

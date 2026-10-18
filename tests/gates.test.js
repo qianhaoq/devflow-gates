@@ -667,6 +667,20 @@ const UNL_KW = 'This is a security problem.';
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { eventName: 'issue_comment', payload: { issue: { number: 9, pull_request: {} } }, prs }), [5]);
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { eventName: 'issue_comment', payload: { issue: { number: 9 } }, prs }), []);
   });
+  await t('codex-gate refresh: green head check is re-run when the verdict turned false (fail closed)', async () => {
+    const runs = { pull_request_target: [run(5, 'pull_request_target', 'success', '2026-10-16T01:20:00Z', { run_attempt: 3 })] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: SUMMARY_RUNNING }), ['all:5']);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs), []);
+  });
+  for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
+    await t(`${file} refresh: newest = latest ATTEMPT start (a re-run older run beats a later-created success)`, async () => {
+      const r = await runRefresh(file, { pull_request_target: [
+        run(8, 'pull_request_target', 'success', '2026-10-16T02:00:00Z'),
+        run(4, 'pull_request_target', 'failure', '2026-10-16T01:00:00Z', { run_started_at: '2026-10-16T03:00:00Z', run_attempt: 2 })] },
+        { labels: ['qa-passed'], labelEvents: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-16T03:10:00Z' }] });
+      assert.deepStrictEqual(r, [4]);
+    });
+  }
   await t('qa-gate refresh: legitimately red gate (no label) is NEVER re-run', async () => {
     const r = await runRefresh('qa-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')] });
     assert.deepStrictEqual(r, []);

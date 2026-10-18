@@ -50,8 +50,9 @@
 #     Codex comment (summary created/edited, "no major issues") or a
 #     "/recheck" comment lands on a PR — or on an optional schedule — it
 #     re-runs the latest FAILED head gate run ONLY IF the same verdict()
-#     the evaluator uses says the gate would now pass, else (at most) the
-#     newest CANCELLED head run. One re-run per PR per refresh, never a
+#     the evaluator uses says the gate would now pass, re-runs a GREEN
+#     latest run if the verdict is now false (fail closed), else (at
+#     most) the newest CANCELLED head run. One re-run per PR per refresh, never a
 #     run at run_attempt >= 3. No blind periodic re-runs: a gate that is
 #     legitimately red is left alone. A re-run preserves the original
 #     event, so the fresh conclusion re-attaches to the PR head check.
@@ -475,6 +476,9 @@ jobs:
             // pull_request_review(_comment) / workflow_dispatch on the PR branch):
             //   - any run on the head still queued/running → nothing (its result
             //     will land on the check);
+            //   - latest evaluated run (by latest-attempt start) SUCCEEDED but
+            //     verdict() now fails (Codex re-review Running / Failed on the same
+            //     SHA) → re-run it so the check turns red (fail closed);
             //   - latest evaluated run FAILED → re-run its failed jobs ONLY if
             //     verdict() says the gate would now pass (input changed: Codex
             //     finished / threads resolved). A gate that would still fail is
@@ -530,14 +534,31 @@ jobs:
               }
               // Only runs that evaluated count (a caller-level skip, e.g. a non-Codex
               // review, concludes 'skipped' and attaches no gate check).
+              // Newest by the LATEST ATTEMPT's start (a re-run of an older run is
+              // the freshest check), not by the run's creation time.
+              const attemptAt = (r) => Date.parse(r.run_started_at || r.created_at || 0) || 0;
               const evaluated = runs
                 .filter((r) => r.conclusion !== 'skipped')
-                .sort((a, b) => (Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)) || ((b.id || 0) - (a.id || 0)));
+                .sort((a, b) => (attemptAt(b) - attemptAt(a)) || ((b.id || 0) - (a.id || 0)));
               const capped = (r) => (r.run_attempt || 1) >= MAX_ATTEMPTS;
               const latest = evaluated[0];
               if (!latest) continue;
               // At most ONE re-run per PR per refresh, so re-runs can never cancel
               // each other through a shared concurrency group.
+              if (latest.conclusion === 'success') {
+                // Fail closed: a green head check whose verdict is now false (e.g.
+                // Codex edited the Summary back to Running / Failed on the same SHA)
+                // is re-run so the required check turns red. Not capped: only a
+                // state change (comment event / schedule) can trigger it, and the
+                // re-run's failure then needs verdict() to pass before it is re-run.
+                const v = await verdict(pr.number);
+                if (!v.ok && !v.none) {
+                  await github.rest.actions.reRunWorkflow({ owner, repo, run_id: latest.id });
+                  rerun += 1;
+                  core.info(`PR #${pr.number}: head check is green but the gate would now fail (${v.msg}) — re-running run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
+                  continue;
+                }
+              }
               if (latest.conclusion === 'failure') {
                 if (capped(latest)) {
                   core.info(`PR #${pr.number}: run ${latest.id} is at attempt ${latest.run_attempt} (cap ${MAX_ATTEMPTS}) — not re-running`);
@@ -942,6 +963,9 @@ jobs:
             // pull_request_review(_comment) / workflow_dispatch on the PR branch):
             //   - any run on the head still queued/running → nothing (its result
             //     will land on the check);
+            //   - latest evaluated run (by latest-attempt start) SUCCEEDED but
+            //     verdict() now fails (Codex re-review Running / Failed on the same
+            //     SHA) → re-run it so the check turns red (fail closed);
             //   - latest evaluated run FAILED → re-run its failed jobs ONLY if
             //     verdict() says the gate would now pass (input changed: Codex
             //     finished / threads resolved). A gate that would still fail is
@@ -997,14 +1021,31 @@ jobs:
               }
               // Only runs that evaluated count (a caller-level skip, e.g. a non-Codex
               // review, concludes 'skipped' and attaches no gate check).
+              // Newest by the LATEST ATTEMPT's start (a re-run of an older run is
+              // the freshest check), not by the run's creation time.
+              const attemptAt = (r) => Date.parse(r.run_started_at || r.created_at || 0) || 0;
               const evaluated = runs
                 .filter((r) => r.conclusion !== 'skipped')
-                .sort((a, b) => (Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)) || ((b.id || 0) - (a.id || 0)));
+                .sort((a, b) => (attemptAt(b) - attemptAt(a)) || ((b.id || 0) - (a.id || 0)));
               const capped = (r) => (r.run_attempt || 1) >= MAX_ATTEMPTS;
               const latest = evaluated[0];
               if (!latest) continue;
               // At most ONE re-run per PR per refresh, so re-runs can never cancel
               // each other through a shared concurrency group.
+              if (latest.conclusion === 'success') {
+                // Fail closed: a green head check whose verdict is now false (e.g.
+                // Codex edited the Summary back to Running / Failed on the same SHA)
+                // is re-run so the required check turns red. Not capped: only a
+                // state change (comment event / schedule) can trigger it, and the
+                // re-run's failure then needs verdict() to pass before it is re-run.
+                const v = await verdict(pr.number);
+                if (!v.ok && !v.none) {
+                  await github.rest.actions.reRunWorkflow({ owner, repo, run_id: latest.id });
+                  rerun += 1;
+                  core.info(`PR #${pr.number}: head check is green but the gate would now fail (${v.msg}) — re-running run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
+                  continue;
+                }
+              }
               if (latest.conclusion === 'failure') {
                 if (capped(latest)) {
                   core.info(`PR #${pr.number}: run ${latest.id} is at attempt ${latest.run_attempt} (cap ${MAX_ATTEMPTS}) — not re-running`);
