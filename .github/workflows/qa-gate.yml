@@ -45,17 +45,19 @@
 #     info + success (nothing to gate). workflow_dispatch with an
 #     invalid/nonnumeric pr_number FAILS (operator error must be loud).
 #
-# Scheduled refresh (QA Gate Refresh job, schedule-path only): a
-# scheduled run's job conclusion does NOT attach to any PR head check
-# (neither does workflow_dispatch), so the schedule path never evaluates
-# itself. For each open non-draft PR whose latest
-# pull_request_target-originated Gate run for that head SHA completed
-# with conclusion failure, it re-runs that run's failed jobs
-# (actions.reRunWorkflowFailedJobs) — the re-run keeps the original
-# pull_request_target event, so the fresh conclusion re-attaches to the
-# PR head check (e.g. after a timing race left the check red). Needs
-# `actions: write`, granted by the CALLER on the schedule-path job only
-# (see examples/qa-gate.yml, job `qa-refresh`).
+# Scheduled refresh (QA Gate Refresh job, schedule-path only, OPTIONAL):
+# no blind re-runs. It re-runs a failed head gate run only when the QA
+# label was applied after that run evaluated (input changed), else at
+# most the newest cancelled head run; one re-run per PR, never past
+# run_attempt 3 (see the job comment). Needs `actions: write`, granted by
+# the CALLER on the schedule-path job only (examples/qa-gate.yml,
+# `qa-refresh`). The example caller ships without a cron: every QA input
+# change is itself a pull_request_target event.
+#
+# Filtering: the CALLER skips label events for other labels with a
+# job-level `if:` (a skipped caller job attaches a check named "qa", never
+# the required "qa / QA Gate"). This file never skips a head-attached
+# event itself (that would attach a skipped = passing required check).
 #
 # The synchronize label-removal needs `pull-requests: write` and
 # `issues: write` — the CALLER must grant them (a reusable workflow can
@@ -620,23 +622,25 @@ jobs:
             core.setFailed(msg);
             return;
 
-  # Schedule-path only. A scheduled run's conclusion does not attach to
-  # any PR head check, and neither does a workflow_dispatch run — so this
-  # job never evaluates. It re-runs the most recent FAILED
-  # pull_request_target-originated Gate run for every open non-draft PR
-  # (actions.reRunWorkflowFailedJobs); the re-run keeps the original
-  # pull_request_target event, so the fresh conclusion re-attaches to the
-  # PR head check. Needs actions:write granted by the CALLER on its
-  # schedule-path job (see examples/qa-gate.yml, job `qa-refresh`).
-  # ALSO: every CANCELLED gate run on the current head (concurrency
-  # cancel-in-progress between events leaves a cancelled check run that
-  # branch protection may treat as the required check's result) is re-run
-  # in full (actions.reRunWorkflow) — a cancelled run is never the final
-  # word. Nothing is re-run while a run on that head is still in flight.
+  # Schedule-path only (OPTIONAL — the example caller has no cron any
+  # more: every QA input change — push, label, draft/ready — is itself a
+  # pull_request_target event that evaluates and attaches the check). A
+  # scheduled run's conclusion does not attach to any PR head check, so
+  # this job never evaluates. Per open non-draft PR it looks at the
+  # latest evaluated gate run on the current head and re-runs AT MOST ONE
+  # run, never one already at run_attempt >= 3:
+  #   - latest FAILED and the QA label is present with its last 'labeled'
+  #     event AFTER that run started (the input changed after the
+  #     evaluation, e.g. the label run was lost) → re-run its failed jobs;
+  #   - otherwise the newest CANCELLED run on the head → re-run it (a
+  #     cancelled required check is never the final word).
+  # A gate that is legitimately red (no sign-off yet) is NEVER re-run.
+  # Nothing is re-run while a run on that head is still in flight. Needs
+  # actions:write granted by the CALLER on its schedule-path job.
   qa-gate-refresh:
     name: QA Gate Refresh
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     if: github.event_name == 'schedule'
     permissions:
       contents: read
@@ -645,13 +649,17 @@ jobs:
     steps:
       - name: Refresh failing gate checks
         uses: actions/github-script@v7
+        env:
+          QA_LABEL: ${{ inputs.qa_label }}
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
+            const QA_LABEL = (process.env.QA_LABEL || 'qa-passed').trim() || 'qa-passed';
+            const MAX_ATTEMPTS = 3;
 
             // The run belongs to the CALLER workflow; identify it so we
-            // re-run its (not some other workflow's) failed gate runs.
+            // re-run its (not some other workflow's) gate runs.
             const { data: thisRun } = await github.rest.actions.getWorkflowRun({
               owner,
               repo,
@@ -673,13 +681,12 @@ jobs:
               scanned += 1;
               const sha = pr.head.sha;
               // Gate runs whose check sits on this PR head: pull_request_target
-              // and pull_request_review(_comment) runs (all carry the PR
-              // head SHA), plus workflow_dispatch runs dispatched ON the PR
-              // branch (e.g. crawl.yml for a GITHUB_TOKEN-created PR, where
-              // no pull_request(_target) event ever fires). A dispatch on
+              // runs, plus workflow_dispatch runs dispatched ON the PR branch
+              // (e.g. crawl.yml for a GITHUB_TOKEN-created PR, where no
+              // pull_request(_target) event ever fires). A dispatch on
               // another ref has a different head_sha and is excluded.
               const runs = [];
-              for (const event of ['pull_request_target', 'pull_request_review', 'pull_request_review_comment', 'workflow_dispatch']) {
+              for (const event of ['pull_request_target', 'workflow_dispatch']) {
                 const { data: runsData } = await github.rest.actions.listWorkflowRuns({
                   owner,
                   repo,
@@ -692,37 +699,40 @@ jobs:
                   && (event !== 'workflow_dispatch' || r.head_branch === pr.head.ref)));
               }
               // Something is still queued/running on this head: its result
-              // will land on the check; re-running now could cancel it.
+              // will land on the check; re-running now could race it.
               if (runs.some((r) => r.status && r.status !== 'completed')) continue;
-              runs.sort((a, b) => (Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)) || ((b.id || 0) - (a.id || 0)));
-              const latest = runs[0];
-              // Re-run when the gate check on this head is failing: the
-              // latest completed run's conclusion IS that check.
-              if (latest && latest.conclusion === 'failure') {
-                await github.rest.actions.reRunWorkflowFailedJobs({
-                  owner,
-                  repo,
-                  run_id: latest.id,
+              // Caller-level skips (unrelated label events) conclude
+              // 'skipped' and attach no gate check — ignore them.
+              const evaluated = runs
+                .filter((r) => r.conclusion !== 'skipped')
+                .sort((a, b) => (Date.parse(b.created_at || 0) - Date.parse(a.created_at || 0)) || ((b.id || 0) - (a.id || 0)));
+              const capped = (r) => (r.run_attempt || 1) >= MAX_ATTEMPTS;
+              const latest = evaluated[0];
+              if (!latest) continue;
+              if (latest.conclusion === 'failure' && !capped(latest)
+                  && (pr.labels || []).some((l) => l.name === QA_LABEL)) {
+                const events = await github.paginate(github.rest.issues.listEvents, {
+                  owner, repo, issue_number: pr.number, per_page: 100,
                 });
-                rerun += 1;
-                core.info(
-                  `PR #${pr.number}: re-running failed jobs of run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`
-                );
+                const lastLabeled = events
+                  .filter((e) => e.event === 'labeled' && e.label?.name === QA_LABEL && e.created_at)
+                  .map((e) => Date.parse(e.created_at))
+                  .sort((a, b) => b - a)[0];
+                const evaluatedAt = Date.parse(latest.run_started_at || latest.created_at || 0);
+                if (lastLabeled && Number.isFinite(evaluatedAt) && lastLabeled > evaluatedAt) {
+                  await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: latest.id });
+                  rerun += 1;
+                  core.info(`PR #${pr.number}: "${QA_LABEL}" applied after run ${latest.id} evaluated — re-running its failed jobs (head ${sha.slice(0, 7)})`);
+                  continue;
+                }
               }
-              // A CANCELLED run (concurrency cancel-in-progress between
-              // events) leaves its own cancelled check run on the head, and
-              // branch protection can treat that as the required check's
-              // result even when another run succeeded. A cancelled run is
-              // never the final word: re-run it so it re-evaluates the
-              // current state (the gate reads live API state, not the
-              // event).
-              for (const r of runs) {
-                if (r.conclusion !== 'cancelled') continue;
-                await github.rest.actions.reRunWorkflow({ owner, repo, run_id: r.id });
+              const cancelled = evaluated.find((r) => r.conclusion === 'cancelled' && !capped(r));
+              if (cancelled) {
+                await github.rest.actions.reRunWorkflow({ owner, repo, run_id: cancelled.id });
                 rerun += 1;
-                core.info(`PR #${pr.number}: re-running cancelled run ${r.id} (${r.event}, head ${sha.slice(0, 7)})`);
+                core.info(`PR #${pr.number}: re-running cancelled run ${cancelled.id} (${cancelled.event}, head ${sha.slice(0, 7)})`);
               }
             }
             core.info(
-              `QA Gate Refresh done: ${scanned} open non-draft PR(s) scanned, ${rerun} failing gate run(s) re-run`
+              `QA Gate Refresh done: ${scanned} open non-draft PR(s) scanned, ${rerun} gate run(s) re-run`
             );

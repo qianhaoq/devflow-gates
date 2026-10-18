@@ -585,52 +585,129 @@ const UNL_KW = 'This is a security problem.';
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
-  // Refresh: dispatch runs on the PR branch count (crawl PRs created with GITHUB_TOKEN).
-  for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
-    const refresh = scripts(file)[1];
-    async function runRefresh(runsByEvent) {
-      const reran = [];
-      const github = {
-        rest: {
-          actions: {
-            getWorkflowRun: async () => ({ data: { workflow_id: 7, name: 'Gate' } }),
-            listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
-            reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
-            reRunWorkflow: async (a) => { reran.push(`all:${a.run_id}`); },
-          },
-          pulls: { list: async () => ({}) },
+  // Refresh (both gates): never blind re-runs; one re-run per PR; cap.
+  const RH = 'feedfacefeedfacefeedfacefeedfacefeedface';
+  const SUMMARY_DONE = { user: { login: 'chatgpt-codex-connector[bot]' }, updated_at: '2026-10-16T03:00:00Z', body: `<!-- codex-pull-request-review-summary -->\n**Completed** — reviewed ${RH}` };
+  const SUMMARY_RUNNING = { ...SUMMARY_DONE, body: '<!-- codex-pull-request-review-summary -->\n**Running**' };
+  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [] } = {}) {
+    const reran = [];
+    const prList = prs || [{ number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: labels.map((name) => ({ name })) }];
+    const github = {
+      rest: {
+        actions: {
+          getWorkflowRun: async () => ({ data: { workflow_id: 7, name: 'Gate' } }),
+          listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
+          reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
+          reRunWorkflow: async (a) => { reran.push(`all:${a.run_id}`); },
         },
-        paginate: async () => [{ number: 9, draft: false, head: { sha: 'h1', ref: 'crawl/auto' } }],
-      };
-      const core = { info() {}, warning() {}, setFailed(m) { throw new Error(m); } };
-      const context = { runId: 1, repo: { owner: 'o', repo: 'r' }, payload: {} };
-      await new AsyncFunction('github', 'context', 'core', 'process', refresh)(github, context, core, { env: {} });
-      return reran;
-    }
-    await t(`${file} refresh: re-runs failed workflow_dispatch run on the PR branch`, async () => {
-      const r = await runRefresh({ workflow_dispatch: [{ id: 5, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'crawl/auto', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }] });
+        pulls: {
+          list: async () => ({}),
+          get: async (a) => ({ data: { ...prList.find((p) => p.number === a.pull_number), merged: false } }),
+          listReviewComments: async () => ({}),
+        },
+        issues: { listComments: async () => ({}), listEvents: async () => ({}) },
+        repos: { getCommit: async () => ({ data: { commit: { committer: { date: '2026-10-16T00:00:00Z' } } } }) },
+      },
+      graphql: async () => ({ repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } }),
+      paginate: async (fn) => {
+        if (fn === github.rest.issues.listComments) return summary ? [summary] : [];
+        if (fn === github.rest.issues.listEvents) return labelEvents;
+        if (fn === github.rest.pulls.list) return prList;
+        return [];
+      },
+    };
+    const core = { info(m) { if (process.env.DEBUG_T) console.log('  info:', m); }, warning() {}, setFailed(m) { if (mode !== 'refresh') { failed.push(m); return; } throw new Error(m); }, summary: { addRaw() { return this; }, write: async () => {} } };
+    const context = { runId: 1, eventName, repo: { owner: 'o', repo: 'r' }, payload };
+    const src = scripts(file)[mode === 'refresh' ? 1 : 0];
+    await new AsyncFunction('github', 'context', 'core', 'process', 'exec', src)(github, context, core, { env: { GATE_MODE: mode, QA_LABEL: 'qa-passed' } }, {});
+    return reran;
+  }
+  const run = (id, event, conclusion, created_at, extra = {}) => ({ id, event, head_sha: RH, head_branch: 'crawl/auto', status: 'completed', conclusion, created_at, run_started_at: created_at, run_attempt: 1, ...extra });
+
+  await t('codex-gate: evaluator and refresh jobs run the IDENTICAL script', () => {
+    const [a, b] = scripts('codex-gate.yml');
+    assert.ok(a && b);
+    assert.strictEqual(a, b);
+  });
+  await t('codex-gate evaluate mode: verdict decides the job conclusion', async () => {
+    const pass = [];
+    const p = { eventName: 'pull_request_target', payload: { pull_request: { number: 9 } }, mode: 'evaluate' };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', {}, { ...p, failed: pass }), []);
+    assert.deepStrictEqual(pass, []);
+    const fail = [];
+    await runRefresh('codex-gate.yml', {}, { ...p, summary: SUMMARY_RUNNING, failed: fail });
+    assert.strictEqual(fail.length, 1);
+    assert.match(fail[0], /still Running/);
+    const fail2 = [];
+    await runRefresh('codex-gate.yml', {}, { eventName: 'workflow_dispatch', payload: { inputs: { pr_number: 'x' } }, mode: 'evaluate', failed: fail2 });
+    assert.match(fail2[0] || '', /pr_number is invalid/);
+  });
+  await t('codex-gate refresh: failed head run re-run only when the gate would now pass', async () => {
+    const runs = { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs), [5]);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: SUMMARY_RUNNING }), []);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: null }), []);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { labels: ['skip-codex-gate'] }), []);
+  });
+  await t('codex-gate refresh: run_attempt cap (3) stops re-runs', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
+    assert.deepStrictEqual(r, []);
+  });
+  await t('codex-gate refresh: caller-skipped newest run is ignored', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')], pull_request_review: [run(6, 'pull_request_review', 'skipped', '2026-10-16T02:00:00Z')] });
+    assert.deepStrictEqual(r, [5]);
+  });
+  await t('codex-gate refresh: at most one re-run per PR (failed-would-pass wins over cancelled)', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T02:00:00Z'), run(4, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z'), run(3, 'pull_request_target', 'cancelled', '2026-10-16T00:30:00Z')] });
+    assert.deepStrictEqual(r, [5]);
+  });
+  await t('codex-gate refresh: issue_comment refreshes only that PR; non-PR comment does nothing', async () => {
+    const prs = [{ number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: [] }];
+    const runs = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { eventName: 'issue_comment', payload: { issue: { number: 9, pull_request: {} } }, prs }), [5]);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { eventName: 'issue_comment', payload: { issue: { number: 9 } }, prs }), []);
+  });
+  await t('qa-gate refresh: legitimately red gate (no label) is NEVER re-run', async () => {
+    const r = await runRefresh('qa-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')] });
+    assert.deepStrictEqual(r, []);
+  });
+  await t('qa-gate refresh: re-runs a failed run only when the label was applied after it evaluated', async () => {
+    const runs = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')] };
+    const after = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-16T01:30:00Z' }];
+    const before = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-16T01:10:00Z' }];
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: ['qa-passed'], labelEvents: after }), [5]);
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: ['qa-passed'], labelEvents: before }), []);
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: [], labelEvents: after }), []);
+    const capped = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] };
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', capped, { labels: ['qa-passed'], labelEvents: after }), []);
+  });
+  for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
+    await t(`${file} refresh: re-runs failed workflow_dispatch run on the PR branch (when input changed)`, async () => {
+      const r = await runRefresh(file, { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] },
+        { labels: ['qa-passed'], labelEvents: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-16T01:30:00Z' }] });
       assert.deepStrictEqual(r, [5]);
     });
     await t(`${file} refresh: ignores dispatch on another branch`, async () => {
-      const r = await runRefresh({ workflow_dispatch: [{ id: 6, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'main', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }] });
+      const r = await runRefresh(file, { workflow_dispatch: [run(6, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z', { head_branch: 'main' })] });
       assert.deepStrictEqual(r, []);
     });
-    await t(`${file} refresh: a cancelled run on the head is re-run even if a later run succeeded`, async () => {
-      const r = await runRefresh({
-        pull_request_review: [{ id: 11, event: 'pull_request_review', head_sha: 'h1', status: 'completed', conclusion: 'cancelled', created_at: '2026-10-16T01:00:00Z' }],
-        pull_request_target: [{ id: 12, event: 'pull_request_target', head_sha: 'h1', status: 'completed', conclusion: 'success', created_at: '2026-10-16T02:00:00Z' }] });
+    await t(`${file} refresh: the newest cancelled run on the head is re-run even if a later run succeeded`, async () => {
+      const ev = file === 'qa-gate.yml' ? 'pull_request_target' : 'pull_request_review';
+      const r = await runRefresh(file, {
+        [ev]: [run(11, ev, 'cancelled', '2026-10-16T01:00:00Z'), run(10, ev, 'cancelled', '2026-10-16T00:50:00Z')],
+        workflow_dispatch: [run(12, 'workflow_dispatch', 'success', '2026-10-16T02:00:00Z')] });
       assert.deepStrictEqual(r, ['all:11']);
     });
     await t(`${file} refresh: nothing is re-run while a run on the head is still in progress`, async () => {
-      const r = await runRefresh({
-        pull_request_target: [{ id: 13, event: 'pull_request_target', head_sha: 'h1', status: 'completed', conclusion: 'cancelled', created_at: '2026-10-16T01:00:00Z' },
-          { id: 14, event: 'pull_request_target', head_sha: 'h1', status: 'in_progress', conclusion: null, created_at: '2026-10-16T02:00:00Z' }] });
+      const r = await runRefresh(file, {
+        pull_request_target: [run(13, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z'),
+          run(14, 'pull_request_target', null, '2026-10-16T02:00:00Z', { status: 'in_progress' })] });
       assert.deepStrictEqual(r, []);
     });
-    await t(`${file} refresh: newest run decides (later target success wins)`, async () => {
-      const r = await runRefresh({
-        workflow_dispatch: [{ id: 5, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'crawl/auto', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }],
-        pull_request_target: [{ id: 8, event: 'pull_request_target', head_sha: 'h1', conclusion: 'success', created_at: '2026-10-16T02:00:00Z' }] });
+    await t(`${file} refresh: newest run decides (later success, older failure → nothing)`, async () => {
+      const r = await runRefresh(file, {
+        workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')],
+        pull_request_target: [run(8, 'pull_request_target', 'success', '2026-10-16T02:00:00Z')] });
       assert.deepStrictEqual(r, []);
     });
   }

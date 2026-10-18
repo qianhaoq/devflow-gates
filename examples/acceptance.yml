@@ -12,7 +12,8 @@
 # MUST be `pull_request` (never pull_request_target): the Measure job
 # executes PR code. `edited` re-evaluates after PR body changes
 # (evidence / no-test-needed reason); `labeled`/`unlabeled` pick up
-# `no-test-needed`. The gate never adds or removes labels.
+# `no-test-needed` (other labels are skipped by the job `if:`). The gate
+# never adds or removes labels.
 
 name: Acceptance
 
@@ -24,6 +25,11 @@ permissions: {}
 
 jobs:
   acceptance:
+    # Saves Actions minutes: label events for other labels skip without
+    # booting a runner (Measure runs the PR's tests).
+    if: >-
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+      github.event.label.name == 'no-test-needed'
     permissions:
       contents: read
       pull-requests: write   # sticky report comment

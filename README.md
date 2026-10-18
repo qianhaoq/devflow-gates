@@ -25,9 +25,9 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 | --- | --- | --- |
 | `examples/ci.yml` | `ci` | `ci / Build & Test`、`ci / Secret Scan` |
 | `examples/codex-gate.yml` | `codex` | `codex / Codex Review Gate` |
-| `examples/codex-gate.yml` | `codex-refresh` | `codex-refresh / Codex Gate Refresh`（仅 schedule 运行，**不**挂在 PR 检查上） |
+| `examples/codex-gate.yml` | `codex-refresh` | `codex-refresh / Codex Gate Refresh`（仅 Codex 评论 / `/recheck` 评论触发，**不**挂在 PR 检查上） |
 | `examples/qa-gate.yml` | `qa` | `qa / QA Gate` |
-| `examples/qa-gate.yml` | `qa-refresh` | `qa-refresh / QA Gate Refresh`（仅 schedule 运行，**不**挂在 PR 检查上） |
+| `examples/qa-gate.yml` | `qa-refresh` | `qa-refresh / QA Gate Refresh`（可选，示例默认注释掉；仅 schedule 运行，**不**挂在 PR 检查上） |
 | `examples/auto-merge.yml` | `auto-merge` | `auto-merge / Auto Merge` |
 | `examples/smoke.yml` | `smoke` | `smoke / Post-deploy Smoke` |
 | `examples/acceptance.yml` | `acceptance` | `acceptance / Acceptance Gate`（另有辅助检查 `Acceptance Config` / `Acceptance Measure`；M1 仅观察，**不要**加入分支保护） |
@@ -60,9 +60,15 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
   `pull_request_target`）触发，令牌保持只读。
 - 可复用工作流里的 `permissions` 只能收紧、不能放大权限；所需写权限必须由
   调用方授予。
-- 唯一的 `actions: write` 出现在两个门禁的 **schedule 刷新路径**（见下文
-  "定时刷新"）：只授予调用方的 `codex-refresh` / `qa-refresh` job，且只在
-  schedule 事件上运行；评审/评估 job 本身保持只读。
+- 唯一需要 `actions: write` 的是两个门禁的**刷新 job**（见下文"刷新"）：
+  可复用工作流里评估 job 自己的令牌保持只读；GitHub 会按调用方 job 的权限
+  上限校验被调文件里的每个 job，所以调用方的 `codex` / `qa` job 也要授予
+  `actions: write`（只作为上限，评估 job 内部收紧）。
+- **省 Actions 分钟（私有仓库按分钟计费、每个 job 至少按 1 分钟计）**：
+  不相关事件用**调用方 job 级 `if:`** 过滤（跳过时不启动 runner，且被跳过的
+  检查名是调用方 job 名，例如 `codex`，**不是**必需检查名；若在可复用文件
+  内部跳过，会在 PR head 上挂一个 skipped（= 视为通过）的必需检查，所以
+  可复用文件从不跳过挂在 head 上的事件）；不再有 `*/15` 定时盲目重跑。
 
 ## 各工作流说明
 
@@ -105,37 +111,46 @@ Job：
 
 调用方触发事件（完整列表见 [examples/codex-gate.yml](examples/codex-gate.yml)）：
 `pull_request_target` [opened, synchronize, reopened, ready_for_review,
-converted_to_draft, labeled, unlabeled]、`issue_comment` [created, edited]、
-`pull_request_review` [submitted]、`pull_request_review_comment`
-[created, edited]、`workflow_dispatch(pr_number)`、`schedule`（cron
-`*/15 * * * *`）。`converted_to_draft` 让退回草稿的 PR 立刻重新评估并把检查
-置为失败（否则旧的绿色检查会一直挂着）。
+converted_to_draft, labeled, unlabeled]（labeled/unlabeled 只对
+`skip-codex-gate` 评估，其他标签由调用方 `if:` 跳过）、`pull_request_review`
+[submitted]（只评估 `chatgpt-codex-connector[bot]` 的 review）、
+`issue_comment` [created, edited]（只走刷新 job：Codex 的评论或 `/recheck`）、
+`workflow_dispatch(pr_number)`。**不再**使用 `pull_request_review_comment`
+（一次带 N 条行内评论的 Codex review 会多触发 N 次运行；线程回复也会以
+review 形式提交）和 `schedule`。`converted_to_draft` 让退回草稿的 PR 立刻
+重新评估并把检查置为失败（否则旧的绿色检查会一直挂着）。
+
+并发（示例）：push 类事件（opened / synchronize / reopened）每 PR 一组且
+`cancel-in-progress`——新提交只取消**旧 head** 的评估；相关的刷新运行每 PR
+排队；其余运行（label、Codex review、dispatch、被跳过的事件）各自独立成组，
+既不会被取消也不会取消别人。Gate 运行约 15 秒、读实时状态、幂等。
 
 > ⚠️ 线程解决（resolve）**不会**直接重跑本门禁：`pull_request_review_thread`
 > 只是 webhook 事件，GitHub Actions 不支持用它触发工作流（把它写进 `on:`
 > 无效，评估 job 的 `if` 里也不列它）。解决完 Codex 线程后：
-> 下一次定时刷新（每 15 分钟，见下）会自动重跑失败的 Gate；或手动
-> `workflow_dispatch(pr_number)` / 重跑一次 pull_request_target 来源的 Gate
-> 运行来刷新 head SHA 上的必需检查。
+> 在 PR 上评论 `/recheck`（或等下一次 Codex 评论 / push），刷新 job 会在
+> Gate **现在能通过**时重跑 head 上失败的 Gate 运行；也可以在 UI 里重跑一次
+> pull_request_target 来源的 Gate 运行。
 
-**定时刷新（Codex Gate Refresh）**：schedule / workflow_dispatch 运行的 job
-结论**不会**挂到任何 PR head 检查上，所以定时路径从不自己评估。示例调用方的
-`schedule: cron '*/15 * * * *'` 触发可复用工作流里仅 schedule 运行的
-`Codex Gate Refresh` job：对每个**开放、非草稿、且 head 检查为失败**的 PR，
-用 `actions.reRunWorkflowFailedJobs` 重跑该 PR head 上**最近一次失败的
-pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_target
-事件，因此新的结论会**重新挂回 PR head 检查**；若 Codex 已完成/线程已解决，
-必需检查转绿，Auto Merge 随即通过 workflow_run 接管。要点：
+**刷新（Codex Gate Refresh）**：issue_comment / schedule / 从 main 发起的
+workflow_dispatch 的 job 结论**不会**挂到 PR head 检查上，所以刷新 job 从不
+自己评估成检查。触发：Codex 在 PR 上发/改评论（Summary、"no major issues"）
+或有人评论 `/recheck`（可选再加低频 schedule）。对每个目标 PR，只看当前
+head 上**最近一次实际评估过的** Gate 运行（pull_request_target /
+pull_request_review(_comment) / PR 分支上的 workflow_dispatch；被调用方跳过的
+`skipped` 运行不算）：
 
-- 该 API 需要 `actions: write`，**只**授予调用方的 `codex-refresh` job
-  （schedule 路径专属）；评估 job 保持只读。
-- 副作用：检查仍为红的 PR 每 15 分钟会被重跑一次，直到转绿或关闭。
-- **被取消的运行不是最终结论**：head 上任何 `cancelled` 的 Gate 运行
-  （pull_request_target / pull_request_review / pull_request_review_comment /
-  分支上的 workflow_dispatch；例如 review 事件之间的 cancel-in-progress）会被
-  `actions.reRunWorkflow` 整体重跑一次，避免分支保护把残留的 cancelled
-  必需检查当作结果（405 "Required status check … is cancelled"）。该 head
-  上仍有排队/运行中的运行时本轮不重跑。QA Gate Refresh 同样适用。
+- head 上仍有排队/运行中的运行 → 不动。
+- 最近一次为 `failure` → 用与评估 job **完全相同的脚本**（`GATE_MODE`
+  切换，测试强制两份脚本一致）算 `verdict()`；**只有现在能通过**才
+  `reRunWorkflowFailedJobs`。仍会失败的 Gate（例如合法地等人工处理）**绝不**
+  重跑——不再有盲目的周期性重跑。
+- 否则若 head 上有 `cancelled` 运行 → 只整体重跑**最新的那一个**（避免分支
+  保护把残留的 cancelled 必需检查当结果：405 "Required status check … is
+  cancelled"）。
+- 每个 PR 每次刷新最多重跑 1 个运行；`run_attempt >= 3` 的运行不再自动重跑
+  （人工仍可在 UI 重跑）。
+- 需要 `actions: write`（调用方授予）。
 - 检查缺失 / 最近一次 pull_request_target 运行仍在跑 / 已成功 → 不动。
 
 判定规则（fail-closed）：
@@ -174,9 +189,8 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
 - GraphQL 线程查询失败且有 Codex 评审评论 → fail-closed 失败。
 
 权限：评估 job 只读（`contents: read`、`pull-requests: read`、
-`issues: read`）；仅 schedule 刷新 job 需要 `actions: write`（由调用方
-`codex-refresh` job 授予）。并发由调用方设置：每 PR 一个 group，
-`cancel-in-progress: true`（schedule 运行落到唯一 run_id group）。
+`issues: read`）；仅刷新 job 需要 `actions: write`（由调用方授予）。并发由
+调用方设置（见上文"并发"与 examples/codex-gate.yml）。
 
 ### 3. `.github/workflows/qa-gate.yml` — 人工 QA 门禁
 
@@ -238,19 +252,20 @@ pull_request_target 来源** Gate 运行 —— 重跑保留原始 pull_request_
 ⚠️ **调用方必须授予 `pull-requests: write` 和 `issues: write`**（移除标签
 需要写权限；可复用工作流自己无法提权）。触发事件：`pull_request_target`
 [opened, synchronize, reopened, ready_for_review, converted_to_draft,
-labeled, unlabeled] + `workflow_dispatch(pr_number)` + `schedule`（cron
-`*/15 * * * *`，示例里也带了定时刷新）。`converted_to_draft` 让退回草稿的
+labeled, unlabeled] + `workflow_dispatch(pr_number)`；其他标签的
+labeled/unlabeled 由调用方 `if:` 跳过（不启动 runner），synchronize 从不过滤。
+**没有 schedule**：QA 的每个输入变化（push、打/撤标签、草稿/就绪）本身就是
+pull_request_target 事件。`converted_to_draft` 让退回草稿的
 PR 立刻把检查置为失败。
 
-**定时刷新（QA Gate Refresh）**：与 Codex Gate 同机制 —— schedule /
-workflow_dispatch 的结论不挂 PR 检查，所以定时路径只重跑：对每个开放、
-非草稿、head 检查为失败的 PR，`actions.reRunWorkflowFailedJobs` 重跑其最近
-一次失败的 pull_request_target 来源 Gate 运行，让新结论重新挂回 head 检查
-（例如时序竞态留下的红检查）。需要 `actions: write`，只授予调用方的
-`qa-refresh` job；仍红的 PR 每 15 分钟重跑一次。并发（示例）：synchronize
-运行按 head SHA 单独成组且**不会被取消**（`cancel-in-progress` 对 push 为
-false），label/unlabel 等其他 `pull_request_target` 事件每 PR 一组互相取消，
-`workflow_dispatch` 另成一组；门禁本身不依赖这一点（见第 2 步）。见 [examples/qa-gate.yml](examples/qa-gate.yml)。
+**刷新（QA Gate Refresh，可选）**：仅 schedule 路径，示例默认不启用。
+不盲目重跑：只有 head 上最近一次评估失败、且 QA 标签存在并在该运行开始
+**之后**才打上（输入变了）时才重跑；否则最多整体重跑最新的 cancelled 运行；
+每 PR 最多 1 个、`run_attempt >= 3` 不再重跑；合法地等人工 QA 的红检查绝不
+重跑。并发（示例）：push 类事件（opened / synchronize / reopened）每 PR 一组
+`cancel-in-progress`，新提交只取消旧 head 的评估；其余事件（label、草稿、
+dispatch、被跳过的事件）各自独立成组，**label 事件永远无法取消 push 评估**；
+门禁本身也不依赖这一点（见第 2 步）。见 [examples/qa-gate.yml](examples/qa-gate.yml)。
 
 ### 4. `.github/workflows/auto-merge.yml` — 自动合并
 
@@ -389,8 +404,8 @@ Config 解析失败时 Gate 被跳过（跳过 = 通过）。
    `required_checks`（与示例 job id 一致则可原样使用）、`merge_method`、
    `require_copilot`；需要时改 `qa_label`。
 3. 确认 `qa-gate.yml` 调用方授予 `pull-requests: write` + `issues: write`；
-   `codex-gate.yml` / `qa-gate.yml` 示例自带的 `codex-refresh` / `qa-refresh`
-   job（仅 schedule 运行）按示例授予 `actions: write`，评估 job 保持只读；
+   `codex-gate.yml` / `qa-gate.yml` 调用方 job 按示例授予 `actions: write`
+   （刷新 job 需要；评估 job 内部收紧为只读）；
    其余按示例保持最小权限。
 4. 更新分支保护 / Rulesets 的必需检查名为新的 `"<调用方 job> / <被调 job>"`
    形式：`ci / Build & Test`、`codex / Codex Review Gate`、`qa / QA Gate`。

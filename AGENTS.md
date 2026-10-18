@@ -27,8 +27,21 @@ in [README.md](README.md).
 - Anything that executes PR code runs from a `pull_request` caller with
   read-only permissions and no secrets; gates on `pull_request_target`
   must never check out or run PR code.
-- Minimal permissions per job, `timeout-minutes` on every job, and a
-  concurrency group with `cancel-in-progress` per PR/ref.
+- Minimal permissions per job, `timeout-minutes` on every job.
+- Actions minutes (private callers pay; every job bills >= 1 min):
+  - Filter irrelevant events with a CALLER job-level `if:` (no runner, and
+    the skipped check is named after the caller job). Never skip a
+    head-attached event INSIDE a reusable file: that attaches a skipped
+    (= passing) required check.
+  - No blind periodic re-runs. Refresh jobs re-run a failed gate run only
+    when its input changed (Codex: the shared `verdict()` would now pass;
+    QA: label applied after the run), else at most the newest cancelled
+    run; one re-run per PR per refresh; never at `run_attempt >= 3`.
+  - Concurrency: `cancel-in-progress` only within the push class
+    (opened/synchronize/reopened) per PR, so a new commit cancels only the
+    older head's evaluation. Label / review / dispatch runs get their own
+    group: a label or review event must never cancel a push evaluation, and
+    a cancelled required check must never be the final word.
 - Gates other than the QA gate never add or remove labels. Only the editor /
   QA owner applies `qa-passed` / `editorial-approved` — agents never do.
 - QA gate `keep_qa_on_clean_main_update` (opt-in, default `false`): the only
