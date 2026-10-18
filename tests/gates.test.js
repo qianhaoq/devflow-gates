@@ -832,18 +832,38 @@ const UNL_KW = 'This is a security problem.';
       const capped = { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z', { run_attempt: 3 }), run(10, 'pull_request_target', 'cancelled', '2026-10-16T00:30:00Z')] };
       assert.deepStrictEqual(await runRefresh(file, capped, wr), ['all:10']);
     });
-    await t(`${file} refresh: workflow_run(cancelled) whose run is no longer on the head / no open PR → nothing`, async () => {
+    await t(`${file} refresh: heal keys off the ASSOCIATED PR, not wr.head_sha (base SHA for pull_request_target)`, async () => {
+      // The production bug: workflow_run.head_sha of a pull_request_target
+      // run is the BASE SHA — requiring candPr.head.sha === wr.head_sha
+      // never matched, so a cancelled run was never healed.
+      const base = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: 'base000000000000000000000000000000000000', pull_requests: [{ number: 9 }] } } };
+      const cancelled = { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z')] };
+      assert.deepStrictEqual(await runRefresh(file, cancelled, base), ['all:21']);
+      // The head-SHA fallback stays valid for `pull_request` runs (the one
+      // event whose head_sha IS the PR head) when the association is
+      // unindexed right after the cancel.
+      const unindexed = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request', head_sha: RH, pull_requests: [] } } };
+      assert.deepStrictEqual(await runRefresh(file, cancelled, unindexed), ['all:21']);
+    });
+    await t(`${file} refresh: workflow_run(cancelled) with no open PR / healed head → nothing`, async () => {
       // The cancelled run was already re-run to success elsewhere: latest is
       // success and verdict ok → no re-run at all.
       const healed = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: RH, pull_requests: [{ number: 9 }] } } };
       assert.deepStrictEqual(await runRefresh(file, { pull_request_target: [run(12, 'pull_request_target', 'success', '2026-10-16T02:00:00Z')] }, healed), []);
-      // No open PR matches the cancelled run's head SHA → nothing to heal
-      // (pull_requests candidate fails the head-sha check; list fallback too).
-      const stray = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: 'dead000000000000000000000000000000000000', pull_requests: [{ number: 9 }] } } };
-      assert.deepStrictEqual(await runRefresh(file, { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z')] }, stray), []);
+      // No associated PR: a pull_request_target run's head_sha is the BASE
+      // SHA and must NOT be matched against PR heads → nothing to heal.
+      const cancelled = { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z')] };
+      const stray = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: 'dead000000000000000000000000000000000000', pull_requests: [] } } };
+      assert.deepStrictEqual(await runRefresh(file, cancelled, stray), []);
+      // Same head SHA but a `pull_request` run: the head-SHA fallback runs
+      // yet finds no open PR with that head → still nothing.
+      const strayPr = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request', head_sha: 'dead000000000000000000000000000000000000', pull_requests: [] } } };
+      assert.deepStrictEqual(await runRefresh(file, cancelled, strayPr), []);
+      // Associated PR exists but is CLOSED → nothing to heal.
+      assert.deepStrictEqual(await runRefresh(file, cancelled, { ...healed, prs: [{ number: 9, state: 'closed', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: [] }] }), []);
       // A non-cancelled workflow_run trigger heals nothing.
       const success = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'success', event: 'pull_request_target', head_sha: RH, pull_requests: [{ number: 9 }] } } };
-      assert.deepStrictEqual(await runRefresh(file, { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z')] }, success), []);
+      assert.deepStrictEqual(await runRefresh(file, cancelled, success), []);
     });
   }
 

@@ -545,23 +545,32 @@ jobs:
               prs = [one];
             } else if (context.eventName === 'workflow_run') {
               // Cancel-heal trigger: resolve ONLY the PR(s) behind the
-              // cancelled run (no sweep). A run triggered by pull_request_target
-              // / review / comment / dispatch-on-PR-branch carries the PR head
-              // SHA; push runs are filtered out by the caller job's if.
+              // cancelled run (no sweep). The PR set comes from the run's
+              // associated pull_requests entries, NOT from wr.head_sha: for
+              // pull_request_target / review / comment runs head_sha is the
+              // BASE SHA (see auto-merge.yml's candidate resolution), never
+              // the PR head; push runs are filtered out by the caller job's
+              // if.
               const wr = context.payload.workflow_run;
               if (!wr || wr.conclusion !== 'cancelled') {
                 core.info('workflow_run trigger is not a cancelled run — nothing to heal');
                 return;
               }
-              // pull_requests entries carry no state/head fields: re-read each.
+              // pull_requests entries carry no state/head fields: re-read
+              // each and keep every OPEN PR — its own head.sha (used below)
+              // is the head, never wr.head_sha.
               prs = [];
               for (const cand of wr.pull_requests || []) {
                 const { data: candPr } = await github.rest.pulls.get({ owner, repo, pull_number: cand.number });
-                if (candPr.state === 'open' && candPr.head.sha === wr.head_sha) prs.push(candPr);
+                if (candPr.state === 'open') prs.push(candPr);
               }
-              if (prs.length === 0) {
-                // Fallback: the PR association can be unindexed right after a
-                // cancel; match open PRs by head SHA instead.
+              if (prs.length === 0 && wr.event === 'pull_request') {
+                // Fallback: the PR association can be unindexed right after
+                // a cancel; match open PRs by head SHA — valid ONLY for
+                // `pull_request` runs, the one event whose head_sha is the
+                // PR head (auto-merge.yml does the same). Every other event
+                // carries the base SHA there; matching it would heal PRs
+                // unrelated to the cancel, so those runs stay PR-less.
                 const open = await github.paginate(github.rest.pulls.list, {
                   owner,
                   repo,
@@ -1108,23 +1117,32 @@ jobs:
               prs = [one];
             } else if (context.eventName === 'workflow_run') {
               // Cancel-heal trigger: resolve ONLY the PR(s) behind the
-              // cancelled run (no sweep). A run triggered by pull_request_target
-              // / review / comment / dispatch-on-PR-branch carries the PR head
-              // SHA; push runs are filtered out by the caller job's if.
+              // cancelled run (no sweep). The PR set comes from the run's
+              // associated pull_requests entries, NOT from wr.head_sha: for
+              // pull_request_target / review / comment runs head_sha is the
+              // BASE SHA (see auto-merge.yml's candidate resolution), never
+              // the PR head; push runs are filtered out by the caller job's
+              // if.
               const wr = context.payload.workflow_run;
               if (!wr || wr.conclusion !== 'cancelled') {
                 core.info('workflow_run trigger is not a cancelled run — nothing to heal');
                 return;
               }
-              // pull_requests entries carry no state/head fields: re-read each.
+              // pull_requests entries carry no state/head fields: re-read
+              // each and keep every OPEN PR — its own head.sha (used below)
+              // is the head, never wr.head_sha.
               prs = [];
               for (const cand of wr.pull_requests || []) {
                 const { data: candPr } = await github.rest.pulls.get({ owner, repo, pull_number: cand.number });
-                if (candPr.state === 'open' && candPr.head.sha === wr.head_sha) prs.push(candPr);
+                if (candPr.state === 'open') prs.push(candPr);
               }
-              if (prs.length === 0) {
-                // Fallback: the PR association can be unindexed right after a
-                // cancel; match open PRs by head SHA instead.
+              if (prs.length === 0 && wr.event === 'pull_request') {
+                // Fallback: the PR association can be unindexed right after
+                // a cancel; match open PRs by head SHA — valid ONLY for
+                // `pull_request` runs, the one event whose head_sha is the
+                // PR head (auto-merge.yml does the same). Every other event
+                // carries the base SHA there; matching it would heal PRs
+                // unrelated to the cancel, so those runs stay PR-less.
                 const open = await github.paginate(github.rest.pulls.list, {
                   owner,
                   repo,

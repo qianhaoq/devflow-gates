@@ -45,9 +45,12 @@
 #     the OLDER head only (that cancelled check sits on the old SHA).
 #   - relevant refresh runs (Codex / "/recheck" comments) queue per PR
 #     (a running one is never cancelled).
-#   - cancel-heal runs (workflow_run cancelled) share one 'heal' group,
-#     never cancelled — a heal must not be cancelled by a newer push (the
-#     re-run preserves the ORIGINAL event and never joins the push group).
+#   - cancel-heal runs (workflow_run cancelled) each get their OWN
+#     'heal-<triggering run id>' group: workflow_run payloads carry no PR
+#     number, so a shared group would let a newly queued heal silently
+#     replace an older still-pending one. Never cancelled — a heal must not
+#     be cancelled by a newer push (the re-run preserves the ORIGINAL event
+#     and never joins the push group).
 #   - every other run (labels, Codex reviews, dispatch, skipped events)
 #     gets its own group: never cancelled, never cancels. Gate runs are
 #     ~15 s, read live state, and are idempotent.
@@ -91,7 +94,7 @@ concurrency:
     (github.event_name == 'issue_comment' &&
       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector' ||
        startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
-    (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled') && 'heal' ||
+    (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled') && format('heal-{0}', github.event.workflow_run.id) ||
     format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
 
