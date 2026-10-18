@@ -23,6 +23,11 @@
 #   - Every name in `required_checks` exists as a check run on the head SHA
 #     and its LATEST attempt completed with conclusion success. Missing,
 #     pending, or failed → skip (fail closed; no combined-status fallback).
+#     A LATEST attempt that is 'cancelled' is neither a pass nor a final
+#     red: auto-merge heals it (re-runs that workflow run — needs
+#     actions:write, attempt cap 3) and skips this round; an OLDER success
+#     never overrides the newest run (branch protection gates on the
+#     latest check run per name; same rule here).
 #   - Optional Copilot requirement (`require_copilot: true`): the
 #     "copilot-pull-request-reviewer" check must exist and succeed on the
 #     head SHA; the latest Copilot review for the head SHA must be APPROVED
@@ -130,7 +135,9 @@ permissions:
   contents: write
   pull-requests: write
   checks: read
-  actions: read
+  # Write is used ONLY to re-run a CANCELLED required-check run (heal
+  # before merge); nothing else in this workflow calls the Actions API.
+  actions: write
 
 jobs:
   auto-merge:
@@ -138,14 +145,18 @@ jobs:
     runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
     timeout-minutes: 10
     # workflow_run runs whose event is 'push' are the ONLY skip (they have
-    # no resolvable PR). Any submitted review re-evaluates (the script's
-    # own gates decide; runs from non-Copilot reviewers are harmless
+    # no resolvable PR). Cancelled completions (non-push) also evaluate:
+    # the script's required-check heal re-runs the cancelled gate run and
+    # skips merging this round (a cancelled required check is never the
+    # final word). Any submitted review re-evaluates (the script's own
+    # gates decide; runs from non-Copilot reviewers are harmless
     # re-checks).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event_name == 'pull_request_review' ||
       (github.event_name == 'workflow_run' &&
-        github.event.workflow_run.conclusion == 'success' &&
+        (github.event.workflow_run.conclusion == 'success' ||
+         github.event.workflow_run.conclusion == 'cancelled') &&
         github.event.workflow_run.event != 'push')
     steps:
       - name: Resolve PR(s) and decide merge
@@ -314,6 +325,59 @@ jobs:
                 };
               }
               return { ok: true, msg: note };
+            }
+
+            // Workflow run id behind an Actions check run (its details/html
+            // URL), or null for non-Actions check runs (commit statuses).
+            function workflowRunIdFromCheck(c) {
+              const m = String((c && (c.details_url || c.html_url)) || '').match(/\/runs\/(\d+)/);
+              return m ? Number(m[1]) : null;
+            }
+
+            // Pure classification of a required check's LATEST run (unit-tested
+            // in tests/gates.test.js). latest: the newest check run for the
+            // name on the head SHA (latestPerName), or null when none exists
+            // yet. Branch protection gates on exactly that latest run, so an
+            // OLDER success must never override a NEWER cancelled run. Returns
+            // { state, ... }:
+            //   'missing'   no check run yet (expected hole) — wait, not a pass
+            //   'expected'  status !== completed (queued/in_progress/…)
+            //   'cancelled' latest attempt cancelled — NOT a verdict: heal
+            //               (re-run) and skip; never a pass, never final red
+            //   'success'   green
+            //   'bad'       failure/timed_out/skipped/… — ordinary red, no heal
+            function classifyRequiredCheck(latest) {
+              if (!latest) return { state: 'missing' };
+              if (latest.status !== 'completed') return { state: 'expected', status: latest.status };
+              if (latest.conclusion === 'success') return { state: 'success' };
+              if (latest.conclusion === 'cancelled') return { state: 'cancelled' };
+              return { state: 'bad', conclusion: latest.conclusion };
+            }
+
+            // A cancelled latest run is healed, not counted as red: find its
+            // workflow run and re-run it (attempt cap 3 — past that a human
+            // re-runs in the UI or pushes). Merge is skipped this round either
+            // way. The gate callers' own cancel-heal (A1) usually fires first;
+            // this is the belt-and-suspenders path when they race.
+            async function healCancelledCheck(prNumber, name, check) {
+              const runId = workflowRunIdFromCheck(check);
+              if (!runId) {
+                core.info(`PR #${prNumber}: ${name} latest is cancelled but has no workflow run link — cannot heal — skip`);
+                return;
+              }
+              try {
+                const { data: wr } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId });
+                if ((wr.run_attempt || 1) >= 3) {
+                  core.info(`PR #${prNumber}: ${name} latest is cancelled at attempt ${wr.run_attempt} (cap 3) — not re-running — skip this round`);
+                  return;
+                }
+                await github.rest.actions.reRunWorkflow({ owner, repo, run_id: runId });
+                core.info(`PR #${prNumber}: ${name} latest is cancelled — triggered heal re-run ${runId} — skip this round`);
+              } catch (err) {
+                // e.g. 409 conflict when the A1 heal already re-ran it: the
+                // re-run's completion re-triggers evaluation.
+                core.warning(`PR #${prNumber}: could not heal cancelled ${name} (run ${runId}): ${err.message} — skip this round`);
+              }
             }
 
             async function candidatePrNumbers() {
@@ -568,28 +632,42 @@ jobs:
               const relevantChecks = latestChecks.filter((c) => !isIgnoredCheck(c.name));
 
               // Required named gates: every configured check-run name must
-              // exist on the head SHA and its latest attempt must be success.
-              // Missing is fail-closed (not optional).
+              // exist on the head SHA and its latest attempt must be success
+              // (relevantChecks is latestPerName output, so each name has at
+              // most one — the newest — run; the newest verdict is the one
+              // branch protection uses, an older success never overrides it).
+              // Missing is fail-closed (not optional). Cancelled heals and
+              // skips (see classifyRequiredCheck / healCancelledCheck).
+              const byName = new Map(relevantChecks.map((c) => [c.name || '', c]));
               const missingChecks = [];
               const badChecks = [];
+              let cancelledSeen = false;
               for (const name of REQUIRED_CHECK_NAMES) {
-                const runs = relevantChecks.filter((c) => (c.name || '') === name);
-                if (runs.length === 0) {
+                const cls = classifyRequiredCheck(byName.get(name));
+                if (cls.state === 'missing') {
                   missingChecks.push(name);
                   continue;
                 }
-                const pending = runs.filter((c) => c.status !== 'completed');
-                if (pending.length > 0) {
-                  badChecks.push(`${name} (pending: ${pending.map((c) => c.status).join(', ')})`);
+                if (cls.state === 'expected') {
+                  badChecks.push(`${name} (pending: ${cls.status})`);
                   continue;
                 }
-                const notSuccess = runs.filter((c) => c.conclusion !== 'success');
-                if (notSuccess.length > 0) {
-                  badChecks.push(`${name} (${notSuccess.map((c) => c.conclusion).join(', ')})`);
+                if (cls.state === 'cancelled') {
+                  await healCancelledCheck(prNumber, name, byName.get(name));
+                  cancelledSeen = true;
+                  continue;
+                }
+                if (cls.state === 'bad') {
+                  badChecks.push(`${name} (${cls.conclusion})`);
                 }
               }
+              if (cancelledSeen) {
+                // A cancelled required check means this round cannot merge; the
+                // heal re-run's completion re-triggers evaluation.
+                return;
+              }
               if (missingChecks.length > 0) {
-                core.info(`Required check(s) missing on head SHA: ${missingChecks.join(', ')} — skip`);
+                core.info(`Required check(s) missing on head SHA: ${missingChecks.join(', ')} — skip (waiting for check to appear; do not merge)`);
                 return;
               }
               if (badChecks.length > 0) {

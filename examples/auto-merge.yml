@@ -16,6 +16,9 @@
 #     every other origin (pull_request_target / issue_comment / review /
 #     schedule / dispatch) triggers a sweep of ALL open non-draft PRs
 #     targeting the default branch (cap 30).
+#   - CANCELLED completions (non-push) also enter evaluation: a cancelled
+#     LATEST required check is healed (re-run, attempt cap 3) and merging
+#     is skipped for that round — never a pass, never final red (A2).
 #
 # Concurrency is the caller's job (a reusable workflow cannot own the
 # caller's event stream). Use exactly the group below with
@@ -46,7 +49,9 @@ permissions:
   contents: write
   pull-requests: write
   checks: read
-  actions: read
+  # Write is used ONLY by the reusable workflow's required-check heal
+  # (re-running a cancelled check's workflow run); nothing else widens.
+  actions: write
 
 concurrency:
   group: ${{ (github.event_name == 'workflow_dispatch' && format('auto-merge-pr-{0}', github.event.inputs.pr_number)) || (github.event_name == 'pull_request_review' && format('auto-merge-pr-{0}', github.event.pull_request.number)) || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' && format('auto-merge-pr-{0}', github.event.workflow_run.head_sha)) || 'auto-merge-sweep' }}
