@@ -166,7 +166,10 @@ pull_request_review(_comment) / PR 分支上的 workflow_dispatch；被调用方
   workflow_run 链条限制在 3 层内，所以自听不会循环）。某次运行被取消
   （非 push 来源）时，`codex-cancel-heal` job 走同一刷新逻辑，**只重跑被取消
   的那次运行**——被取消的运行自己跑不了 post 步骤，只能靠完成事件来触发
-  补救；同样的上限（每 PR 一次、`run_attempt 3`、进行中不动）。
+  补救；同样的上限（每 PR 一次、`run_attempt 3`、进行中不动）。重跑前若发现
+  同 PR 已有**更新的** success / 进行中运行，则让位不重跑（先看 headRuns 结果，
+  再按 PR 关联做无 head_sha 的兜底扫描，因为 pull_request_target 运行对
+  headRuns 不可见）——迟到的 heal 不能把绿/进行中的必需检查顶回 pending/红。
 - 需要 `actions: write`（调用方授予）。
 - 检查缺失 / 最近一次 pull_request_target 运行仍在跑 / 已成功 → 不动。
 
@@ -290,7 +293,10 @@ dispatch、被跳过的事件）各自独立成组，**label 事件永远无法�
 内，所以自听不会循环）。某次运行被取消（非 push 来源）时，`qa-cancel-heal`
 job 走同一刷新逻辑，**只重跑被取消的那次运行**（被取消的运行自己跑不了
 post 步骤）；同样的上限（每 PR 一次、`run_attempt 3`、进行中不动），heal
-所在并发组永不取消、绝不进入 push 的 cancel-in-progress 组。
+所在并发组永不取消、绝不进入 push 的 cancel-in-progress 组。重跑前若发现
+同 PR 已有**更新的** success / 进行中运行，则让位不重跑（先看 headRuns
+结果，再按 PR 关联做无 head_sha 的兜底扫描）——迟到的 heal 不能把绿/
+进行中的必需检查顶回 pending/红。
 
 已知局限（P3）：如果有人**手动取消** push（synchronize）触发的 QA Gate 运行，
 移除过期 `qa-passed` 的那次评估就没有发生：标签暂时保留，`qa / QA Gate`

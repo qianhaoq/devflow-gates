@@ -511,7 +511,11 @@ jobs:
             //   - otherwise the newest CANCELLED run on the head (if any) is re-run
             //     (a cancelled required check is never the final word); on a
             //     cancel-heal (workflow_run) refresh the TRIGGERING cancelled run
-            //     takes priority over the newest one;
+            //     takes priority over the newest one — unless a NEWER success /
+            //     in-flight run on the PR supersedes it (checked in `evaluated`
+            //     and, because headRuns can miss pull_request_target runs, in a
+            //     PR-associated workflow-wide sweep): a delayed heal must never
+            //     knock a green or pending required check back;
             //   - at most one re-run per PR per refresh, and never a red→green or
             //     cancelled re-run at run_attempt >= 3 (a human can still re-run in
             //     the UI or push). The ONLY uncapped re-run is the fail-closed
@@ -668,6 +672,34 @@ jobs:
                   }
                 }
                 if (triggered) {
+                  // Re-run ONLY when no NEWER green / in-flight peer on this PR
+                  // supersedes the cancelled trigger: a delayed cancel-heal that
+                  // re-runs an old trigger shares the head's concurrency group
+                  // and would knock a green or pending required check back to
+                  // pending/red. Same latest-attempt clock as `evaluated`.
+                  const triggeredAt = attemptAt(triggered);
+                  const supersedes = (r) => attemptAt(r) > triggeredAt
+                    && (r.conclusion === 'success' || (r.status && r.status !== 'completed'));
+                  const peer = evaluated.find(supersedes);
+                  // headRuns() indexes runs by the PR head SHA while a
+                  // pull_request_target run's own head_sha is the BASE SHA,
+                  // so the newer run can be missing from `evaluated` entirely:
+                  // sweep the workflow's recent runs (no head_sha filter) and
+                  // match by PR association before healing.
+                  const sweep = peer ? [] : await github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner,
+                    repo,
+                    workflow_id: workflowId,
+                    per_page: 100,
+                  });
+                  // (the r.id check drops THIS refresh run — in flight in the
+                  // sweep, never a gate check)
+                  const newer = peer || (sweep || []).find((r) => r.id !== context.runId && supersedes(r)
+                    && (r.pull_requests || []).some((p) => p.number === pr.number));
+                  if (newer) {
+                    core.info(`PR #${pr.number}: newer ${newer.conclusion === 'success' ? 'success' : 'in-flight'} run ${newer.id} on this PR supersedes cancelled trigger ${triggered.id} — not re-running`);
+                    continue;
+                  }
                   await github.rest.actions.reRunWorkflow({ owner, repo, run_id: triggered.id });
                   rerun += 1;
                   core.info(`PR #${pr.number}: cancel-heal — re-running triggered run ${triggered.id} (attempt ${triggered.run_attempt || 1}, ${triggered.event}, head ${sha.slice(0, 7)})`);
@@ -1110,7 +1142,11 @@ jobs:
             //   - otherwise the newest CANCELLED run on the head (if any) is re-run
             //     (a cancelled required check is never the final word); on a
             //     cancel-heal (workflow_run) refresh the TRIGGERING cancelled run
-            //     takes priority over the newest one;
+            //     takes priority over the newest one — unless a NEWER success /
+            //     in-flight run on the PR supersedes it (checked in `evaluated`
+            //     and, because headRuns can miss pull_request_target runs, in a
+            //     PR-associated workflow-wide sweep): a delayed heal must never
+            //     knock a green or pending required check back;
             //   - at most one re-run per PR per refresh, and never a red→green or
             //     cancelled re-run at run_attempt >= 3 (a human can still re-run in
             //     the UI or push). The ONLY uncapped re-run is the fail-closed
@@ -1267,6 +1303,34 @@ jobs:
                   }
                 }
                 if (triggered) {
+                  // Re-run ONLY when no NEWER green / in-flight peer on this PR
+                  // supersedes the cancelled trigger: a delayed cancel-heal that
+                  // re-runs an old trigger shares the head's concurrency group
+                  // and would knock a green or pending required check back to
+                  // pending/red. Same latest-attempt clock as `evaluated`.
+                  const triggeredAt = attemptAt(triggered);
+                  const supersedes = (r) => attemptAt(r) > triggeredAt
+                    && (r.conclusion === 'success' || (r.status && r.status !== 'completed'));
+                  const peer = evaluated.find(supersedes);
+                  // headRuns() indexes runs by the PR head SHA while a
+                  // pull_request_target run's own head_sha is the BASE SHA,
+                  // so the newer run can be missing from `evaluated` entirely:
+                  // sweep the workflow's recent runs (no head_sha filter) and
+                  // match by PR association before healing.
+                  const sweep = peer ? [] : await github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner,
+                    repo,
+                    workflow_id: workflowId,
+                    per_page: 100,
+                  });
+                  // (the r.id check drops THIS refresh run — in flight in the
+                  // sweep, never a gate check)
+                  const newer = peer || (sweep || []).find((r) => r.id !== context.runId && supersedes(r)
+                    && (r.pull_requests || []).some((p) => p.number === pr.number));
+                  if (newer) {
+                    core.info(`PR #${pr.number}: newer ${newer.conclusion === 'success' ? 'success' : 'in-flight'} run ${newer.id} on this PR supersedes cancelled trigger ${triggered.id} — not re-running`);
+                    continue;
+                  }
                   await github.rest.actions.reRunWorkflow({ owner, repo, run_id: triggered.id });
                   rerun += 1;
                   core.info(`PR #${pr.number}: cancel-heal — re-running triggered run ${triggered.id} (attempt ${triggered.run_attempt || 1}, ${triggered.event}, head ${sha.slice(0, 7)})`);
