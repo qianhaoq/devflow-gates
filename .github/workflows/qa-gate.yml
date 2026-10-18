@@ -262,10 +262,18 @@ jobs:
             // 'labeled' event has its own run, which evaluates it.
             async function removeLabelUnlessResigned(why) {
               try {
-                const seen = lastLabelEventId(await issueEvents());
-                const fresh = lastLabelEventId(await github.paginate(github.rest.issues.listEvents, {
-                  owner, repo, issue_number: prNumber, per_page: 100,
-                }));
+                let fresh = null;
+                let seen = null;
+                try {
+                  seen = lastLabelEventId(await issueEvents());
+                  fresh = lastLabelEventId(await github.paginate(github.rest.issues.listEvents, {
+                    owner, repo, issue_number: prNumber, per_page: 100,
+                  }));
+                } catch (err) {
+                  // Fail safe: if the race re-read fails, still strip.
+                  core.warning(`Could not re-read label events (${err.message}) — removing "${QA_LABEL}" anyway`);
+                  fresh = null;
+                }
                 if (fresh && fresh.event === 'labeled' && (!seen || fresh.id !== seen.id)) {
                   core.info(`"${QA_LABEL}" was re-applied while this run evaluated — leaving it for that label event's own run`);
                   return;
@@ -751,7 +759,9 @@ jobs:
                   .filter((e) => e.event === 'labeled' && e.label?.name === QA_LABEL && e.created_at)
                   .map((e) => Date.parse(e.created_at))
                   .sort((a, b) => b - a)[0];
-                const evaluatedAt = Date.parse(latest.run_started_at || latest.created_at || 0);
+                // Label must postdate the run's COMPLETION: a label applied while it
+                // ran was already evaluated by it (or by its own label run).
+                const evaluatedAt = Date.parse(latest.updated_at || latest.run_started_at || latest.created_at || 0);
                 if (lastLabeled && Number.isFinite(evaluatedAt) && lastLabeled > evaluatedAt) {
                   await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: latest.id });
                   rerun += 1;

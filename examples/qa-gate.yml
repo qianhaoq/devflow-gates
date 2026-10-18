@@ -48,12 +48,15 @@ permissions:
   pull-requests: write
   issues: write
 
+# Re-run attempts (run_attempt > 1, e.g. from a refresh) never join the
+# cancelling push group: a re-run of an OLD head's synchronize run would
+# otherwise cancel the newest head's evaluation.
 concurrency:
   group: >-
     qa-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || 'none' }}-${{
-    (github.event_name == 'pull_request_target' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
+    (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
     format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
 
 jobs:
   qa:

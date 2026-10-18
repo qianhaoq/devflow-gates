@@ -715,6 +715,9 @@ const UNL_KW = 'This is a security problem.';
     assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: ['qa-passed'], labelEvents: after }), [5]);
     assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: ['qa-passed'], labelEvents: before }), []);
     assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: [], labelEvents: after }), []);
+    // Label applied while the run was still evaluating (before completion) is NOT new input.
+    const during = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { updated_at: '2026-10-16T01:35:00Z' })] };
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', during, { labels: ['qa-passed'], labelEvents: after }), []);
     const capped = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] };
     assert.deepStrictEqual(await runRefresh('qa-gate.yml', capped, { labels: ['qa-passed'], labelEvents: after }), []);
   });
