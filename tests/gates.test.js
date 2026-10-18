@@ -100,18 +100,34 @@ const UNL_KW = 'This is a security problem.';
 
   // QA gate dry-run.
   const qa = scripts('qa-gate.yml')[0];
-  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt }) {
-    const calls = { removed: [], failed: null };
+  const HEAD = 'abcdef1234567abcdef1234567abcdef12345678';
+  const PREV = '1111111111111111111111111111111111111111';
+  // Default head observations: HEAD's run long before any label below.
+  const RUNS0 = [[HEAD, '2026-01-15T00:00:00Z']];
+  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt, runs = RUNS0, timeline = [], headRepo = 'o/r', runPrs = [1], dispatch = [], eventsLater }) {
+    let evCalls = 0;
+    const calls = { removed: [], failed: null, info: [] };
+    const mkRun = (event) => ([sha, at, extra = {}], i) => ({ id: i + 1, event, head_sha: sha, head_branch: 'feat', head_repository: { full_name: headRepo }, pull_requests: runPrs.map((number) => ({ number })), created_at: at, ...extra });
     const github = {
       rest: {
-        pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft, head: { sha: 'abcdef1234567' }, labels: labels.map((name) => ({ name })) } }) },
+        pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft, head: { sha: HEAD, ref: 'feat', repo: { full_name: headRepo } }, base: { ref: 'main' }, labels: labels.map((name) => ({ name })) } }) },
         issues: { removeLabel: async (a) => { calls.removed.push(a.name); }, listEvents: async () => ({}), listEventsForTimeline: async () => ({}) },
-        repos: { getCommit: async () => ({ data: { commit: { committer: { date: '2026-01-01T00:00:00Z' } } } }) },
+        actions: { getWorkflowRun: async () => ({ data: { workflow_id: 7 } }), listWorkflowRuns: async () => ({}) },
+        repos: { getCommit: async () => { throw new Error('committer dates must not be consulted'); } },
       },
-      paginate: async (fn) => (fn === github.rest.issues.listEvents ? events : []),
+      paginate: async (fn, args) => {
+        if (fn === github.rest.issues.listEvents) return (evCalls++ > 0 && eventsLater) ? eventsLater : events;
+        if (fn === github.rest.issues.listEventsForTimeline) return timeline;
+        if (fn === github.rest.actions.listWorkflowRuns) {
+          if (runs === null) throw new Error('Resource not accessible by integration');
+          return args.event === 'pull_request_target' ? runs.map(mkRun('pull_request_target'))
+            : dispatch.map(mkRun('workflow_dispatch')).map((r) => ({ ...r, pull_requests: [], head_repository: { full_name: 'o/r' } }));
+        }
+        return [];
+      },
     };
-    const core = { info() {}, warning() {}, setFailed: (m) => { calls.failed = m; } };
-    const context = { eventName: 'pull_request_target', payload: { action, pull_request: { number: 1, head: { sha: 'abcdef1234567' }, updated_at: updatedAt } }, repo: { owner: 'o', repo: 'r' } };
+    const core = { info: (m) => calls.info.push(m), warning() {}, setFailed: (m) => { calls.failed = m; }, summary: { addRaw() { return this; }, async write() {} } };
+    const context = { eventName: 'pull_request_target', runId: 99, payload: { action, pull_request: { number: 1, head: { sha: HEAD }, updated_at: updatedAt } }, repo: { owner: 'o', repo: 'r' } };
     await new AsyncFunction('github', 'context', 'core', 'process', qa)(github, context, core, { env: { QA_LABEL: 'qa-passed', ALLOWED_LABELERS: allowed } });
     return calls;
   }
@@ -119,6 +135,14 @@ const UNL_KW = 'This is a security problem.';
     const c = await runQa({ draft: true, action: 'synchronize', labels: ['qa-passed'] });
     assert.deepStrictEqual(c.removed, ['qa-passed']);
     assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: label re-applied while the run evaluated is not stripped (fresh re-read)', async () => {
+    const old = { id: 1, event: 'labeled', label: { name: 'qa-passed' }, actor: { login: 'qianhaoq' }, created_at: '2026-01-01T00:00:00Z' };
+    const un = { id: 2, event: 'unlabeled', label: { name: 'qa-passed' }, actor: { login: 'qianhaoq' }, created_at: '2026-01-20T00:00:00Z' };
+    const again = { id: 3, event: 'labeled', label: { name: 'qa-passed' }, actor: { login: 'qianhaoq' }, created_at: '2026-01-20T00:00:05Z' };
+    const c = await runQa({ draft: true, action: 'synchronize', labels: ['qa-passed'], events: [old], eventsLater: [old, un, again] });
+    assert.deepStrictEqual(c.removed, []);
+    assert.ok(c.failed, 'run still fails');
   });
   await t('qa-gate: draft without push still fails as draft', async () => {
     const c = await runQa({ draft: true, action: 'labeled', labels: ['qa-passed'] });
@@ -164,16 +188,99 @@ const UNL_KW = 'This is a security problem.';
   });
 
   await t('qa-gate: label applied after the push survives synchronize (race)', async () => {
+    // The synchronize payload itself observes HEAD at the push (16:57:25);
+    // its run may not even be listed yet.
     const c = await runQa({ draft: false, action: 'synchronize', labels: ['qa-passed'], allowed: 'qianhaoq',
+      runs: [[PREV, '2026-02-01T16:40:00Z']],
       updatedAt: '2026-02-01T16:57:25Z', events: [at('labeled', 'qianhaoq', '2026-02-01T16:57:34Z')] });
     assert.deepStrictEqual(c.removed, []);
     assert.strictEqual(c.failed, null, c.failed);
   });
   await t('qa-gate: label applied before the push is stripped on synchronize', async () => {
     const c = await runQa({ draft: false, action: 'synchronize', labels: ['qa-passed'],
+      runs: [[PREV, '2026-02-01T16:40:00Z'], [HEAD, '2026-02-01T16:57:26Z']],
       updatedAt: '2026-02-01T16:57:25Z', events: [at('labeled', 'qianhaoq', '2026-02-01T16:50:00Z')] });
     assert.deepStrictEqual(c.removed, ['qa-passed']);
     assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
+  });
+
+  // ---- P1 regression: backdated committer date + label event that
+  // cancels the synchronize run (qa-gate-sandbox-91 PR #17). QA signed
+  // off PREV at 17:00; the author pushes HEAD (committer date backdated,
+  // irrelevant now) at 17:10 and adds "wip" 0.3s later; the synchronize
+  // run is cancelled, the labeled run evaluates.
+  const exploit = { draft: false, labels: ['qa-passed', 'wip'], allowed: 'qianhaoq',
+    events: [at('labeled', 'qianhaoq', '2026-02-01T17:00:00Z')],
+    runs: [[PREV, '2026-02-01T16:55:00Z'], [HEAD, '2026-02-01T17:10:01Z', { conclusion: 'cancelled' }], [HEAD, '2026-02-01T17:10:01Z']],
+    updatedAt: '2026-02-01T17:10:01Z' };
+  await t('qa-gate: backdated push + label event cancelling the synchronize run → stripped, fails', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled' });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed && /predates the latest push/.test(c.failed) && /head was 1111111 at sign-off/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: same exploit, label added BEFORE the push (labeled run sees the old head) → later run strips', async () => {
+    const c = await runQa({ ...exploit, action: 'unlabeled', runs: [[PREV, '2026-02-01T16:55:00Z'], [PREV, '2026-02-01T17:10:00Z'], [HEAD, '2026-02-01T17:10:00Z', { conclusion: 'cancelled' }]] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed, 'gate must fail');
+  });
+  await t('qa-gate: same exploit even when no run for the new head is listed (payload only) → stripped', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [[PREV, '2026-02-01T16:55:00Z']] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed);
+  });
+  await t('qa-gate: no head observation before the label at all → stripped (fail closed)', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [], updatedAt: '2026-02-01T17:10:01Z' });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed && /no head observation before the label/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: control — label applied on the tested head stays green on later events', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [[HEAD, '2026-02-01T16:55:00Z'], [HEAD, '2026-02-01T17:10:01Z']] });
+    assert.deepStrictEqual(c.removed, []);
+    assert.strictEqual(c.failed, null, c.failed);
+  });
+  await t('qa-gate: a run in the same second as the label does not count (strictly before)', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [[PREV, '2026-02-01T16:55:00Z'], [HEAD, '2026-02-01T17:00:00Z']] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+  });
+  await t('qa-gate: force push TO the head before the label is fine; to another SHA rejects', async () => {
+    const runs = [[HEAD, '2026-02-01T16:55:00Z']];
+    const ok = await runQa({ ...exploit, action: 'labeled', runs,
+      timeline: [{ event: 'head_ref_force_pushed', commit_id: HEAD, created_at: '2026-02-01T16:55:00Z' }] });
+    assert.strictEqual(ok.failed, null, ok.failed);
+    const bad = await runQa({ ...exploit, action: 'labeled', runs,
+      timeline: [{ event: 'head_ref_force_pushed', commit_id: PREV, created_at: '2026-02-01T16:58:00Z' }] });
+    assert.deepStrictEqual(bad.removed, ['qa-passed']);
+    assert.ok(/force push/.test(bad.failed), bad.failed);
+  });
+  await t('qa-gate: fork PR (runs carry no PR association) binds on head repo + branch', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', headRepo: 'fork/r', runPrs: [], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
+    assert.strictEqual(c.failed, null, c.failed);
+    const c2 = await runQa({ ...exploit, action: 'labeled', headRepo: 'fork/r', runPrs: [] });
+    assert.deepStrictEqual(c2.removed, ['qa-passed']);
+  });
+  await t('qa-gate: same-repo run without PR association / of another PR does not count', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runPrs: [], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    const c2 = await runQa({ ...exploit, action: 'labeled', runPrs: [2], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
+    assert.deepStrictEqual(c2.removed, ['qa-passed']);
+  });
+  await t('qa-gate: run listing error (e.g. no actions: read) strips and fails closed', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: null });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed && /could not verify/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: cancelled push then converted_to_draft → stale label stripped, fails', async () => {
+    const c = await runQa({ ...exploit, draft: true, action: 'converted_to_draft' });
+    assert.deepStrictEqual(c.removed, ['qa-passed']);
+    assert.ok(c.failed && /predates the latest push/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: draft without label fails as draft', async () => {
+    const c = await runQa({ draft: true, action: 'converted_to_draft', labels: [] });
+    assert.ok(c.failed && /draft/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: workflow_dispatch run on the PR branch counts as a head observation', async () => {
+    const c = await runQa({ ...exploit, action: 'labeled', runs: [], dispatch: [[HEAD, '2026-02-01T16:55:00Z']] });
+    assert.strictEqual(c.failed, null, c.failed);
   });
 
   // ---- keep_qa_on_clean_main_update: real git in temp repos ----------
@@ -244,6 +351,7 @@ const UNL_KW = 'This is a security problem.';
         paginate: async (fn, args) => {
           if (fn === github.rest.issues.listEvents) return [{ event: 'labeled', label: { name: 'qa-passed' }, actor: { login: labeler }, created_at: iso(labeledAt) }];
           if (fn === github.rest.actions.listWorkflowRuns) {
+            if (args.event !== 'pull_request_target') return [];
             const mk = (sha, at, i) => ({ id: i, event: 'pull_request_target', head_sha: sha, head_branch: 'feat', head_repository: { full_name: 'o/r' }, pull_requests: runPr ? [{ number: runPr }] : [], created_at: iso(at) });
             const list = [[B, runAt], ...extraRuns.map(([sha, at]) => [sha === 'A' ? f.m0 : sha, at]), ...pushed.map((sha) => [sha, 4])];
             return list.map(([sha, at], i) => mk(sha, at, i + 1));
@@ -425,7 +533,7 @@ const UNL_KW = 'This is a security problem.';
     });
     await t('qa-gate keep: B committed before the label but pushed after it (no run proof) → stripped', async () => {
       const c = await scenario((f) => ({ H: mergeMain(f) }), { runAt: 2.5 });
-      stripped(c, /no pull_request_target run .* proves/);
+      stripped(c, /no gate run proves/);
     });
     await t('qa-gate keep: non-sync run with a stale label on an unreviewed commit strips it', async () => {
       const c = await scenario((f) => {
@@ -463,17 +571,17 @@ const UNL_KW = 'This is a security problem.';
     });
     await t('qa-gate keep: run proof from another PR (same branch/SHA) or no PR association → stripped', async () => {
       const c = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 2 });
-      stripped(c, /no pull_request_target run .* proves/);
+      stripped(c, /no gate run proves/);
       const c2 = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 0 });
-      stripped(c2, /no pull_request_target run .* proves/);
+      stripped(c2, /no gate run proves/);
     });
     await t('qa-gate keep: SHA replayed after sign-off (B → reset to A, QA on A, fast-forward to B) → stripped', async () => {
       // B ran at 1.1, then a run for A at 1.5 (head moved back), label at 2.
       const c = await scenario((f) => ({ H: mergeMain(f) }), { extraRuns: [['A', 1.5]] });
-      stripped(c, /no pull_request_target run .* proves/);
+      stripped(c, /no gate run proves/);
       // Same, but the reset produced no run: the force-push event alone rejects.
       const c2 = await scenario((f) => ({ H: mergeMain(f) }), { forcePushAt: 1.5 });
-      stripped(c2, /no pull_request_target run .* proves|label predates/);
+      stripped(c2, /no gate run proves/);
     });
     await t('qa-gate keep: race guard still keeps a label applied after the push', async () => {
       const c = await scenario((f) => {
@@ -486,39 +594,160 @@ const UNL_KW = 'This is a security problem.';
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
-  // Refresh: dispatch runs on the PR branch count (crawl PRs created with GITHUB_TOKEN).
-  for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
-    const refresh = scripts(file)[1];
-    async function runRefresh(runsByEvent) {
-      const reran = [];
-      const github = {
-        rest: {
-          actions: {
-            getWorkflowRun: async () => ({ data: { workflow_id: 7, name: 'Gate' } }),
-            listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
-            reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
-          },
-          pulls: { list: async () => ({}) },
+  // Refresh (both gates): never blind re-runs; one re-run per PR; cap.
+  const RH = 'feedfacefeedfacefeedfacefeedfacefeedface';
+  const SUMMARY_DONE = { user: { login: 'chatgpt-codex-connector[bot]' }, updated_at: '2026-10-16T03:00:00Z', body: `<!-- codex-pull-request-review-summary -->\n**Completed** — reviewed ${RH}` };
+  const SUMMARY_RUNNING = { ...SUMMARY_DONE, body: '<!-- codex-pull-request-review-summary -->\n**Running**' };
+  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [] } = {}) {
+    const reran = [];
+    const prList = prs || [{ number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: labels.map((name) => ({ name })) }];
+    const github = {
+      rest: {
+        actions: {
+          getWorkflowRun: async () => ({ data: { workflow_id: 7, name: 'Gate' } }),
+          listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
+          reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
+          reRunWorkflow: async (a) => { reran.push(`all:${a.run_id}`); },
         },
-        paginate: async () => [{ number: 9, draft: false, head: { sha: 'h1', ref: 'crawl/auto' } }],
-      };
-      const core = { info() {}, warning() {}, setFailed(m) { throw new Error(m); } };
-      const context = { runId: 1, repo: { owner: 'o', repo: 'r' }, payload: {} };
-      await new AsyncFunction('github', 'context', 'core', 'process', refresh)(github, context, core, { env: {} });
-      return reran;
-    }
-    await t(`${file} refresh: re-runs failed workflow_dispatch run on the PR branch`, async () => {
-      const r = await runRefresh({ workflow_dispatch: [{ id: 5, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'crawl/auto', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }] });
+        pulls: {
+          list: async () => ({}),
+          get: async (a) => ({ data: { ...prList.find((p) => p.number === a.pull_number), merged: false } }),
+          listReviewComments: async () => ({}),
+        },
+        issues: { listComments: async () => ({}), listEvents: async () => ({}) },
+        repos: { getCommit: async () => ({ data: { commit: { committer: { date: '2026-10-16T00:00:00Z' } } } }) },
+      },
+      graphql: async () => ({ repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } }),
+      paginate: async (fn, args = {}) => {
+        if (fn === github.rest.issues.listComments) return summary ? [summary] : [];
+        if (fn === github.rest.issues.listEvents) return labelEvents;
+        if (fn === github.rest.pulls.list) return prList;
+        if (fn === github.rest.actions.listWorkflowRuns) return runsByEvent[args.event] || [];
+        return [];
+      },
+    };
+    const core = { info(m) { if (process.env.DEBUG_T) console.log('  info:', m); }, warning() {}, setFailed(m) { if (mode !== 'refresh') { failed.push(m); return; } throw new Error(m); }, summary: { addRaw() { return this; }, write: async () => {} } };
+    const context = { runId: 1, eventName, repo: { owner: 'o', repo: 'r' }, payload };
+    const src = scripts(file)[mode === 'refresh' ? 1 : 0];
+    await new AsyncFunction('github', 'context', 'core', 'process', 'exec', src)(github, context, core, { env: { GATE_MODE: mode, QA_LABEL: 'qa-passed', REFRESH_POLL_MS: '0' } }, {});
+    return reran;
+  }
+  const run = (id, event, conclusion, created_at, extra = {}) => ({ id, event, head_sha: RH, head_branch: 'crawl/auto', status: 'completed', conclusion, created_at, run_started_at: created_at, run_attempt: 1, ...extra });
+
+  await t('codex-gate: evaluator and refresh jobs run the IDENTICAL script', () => {
+    const [a, b] = scripts('codex-gate.yml');
+    assert.ok(a && b);
+    assert.strictEqual(a, b);
+  });
+  await t('codex-gate evaluate mode: verdict decides the job conclusion', async () => {
+    const pass = [];
+    const p = { eventName: 'pull_request_target', payload: { pull_request: { number: 9 } }, mode: 'evaluate' };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', {}, { ...p, failed: pass }), []);
+    assert.deepStrictEqual(pass, []);
+    const fail = [];
+    await runRefresh('codex-gate.yml', {}, { ...p, summary: SUMMARY_RUNNING, failed: fail });
+    assert.strictEqual(fail.length, 1);
+    assert.match(fail[0], /still Running/);
+    const fail2 = [];
+    await runRefresh('codex-gate.yml', {}, { eventName: 'workflow_dispatch', payload: { inputs: { pr_number: 'x' } }, mode: 'evaluate', failed: fail2 });
+    assert.match(fail2[0] || '', /pr_number is invalid/);
+  });
+  await t('codex-gate refresh: failed head run re-run only when the gate would now pass', async () => {
+    const runs = { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs), [5]);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: SUMMARY_RUNNING }), []);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: null }), []);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { labels: ['skip-codex-gate'] }), []);
+  });
+  await t('codex-gate refresh: run_attempt cap (3) stops red→green re-runs', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
+    assert.deepStrictEqual(r, []);
+  });
+  await t('codex-gate refresh: caller-skipped newest run is ignored', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')], pull_request_review: [run(6, 'pull_request_review', 'skipped', '2026-10-16T02:00:00Z')] });
+    assert.deepStrictEqual(r, [5]);
+  });
+  await t('codex-gate refresh: at most one re-run per PR (failed-would-pass wins over cancelled)', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T02:00:00Z'), run(4, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z'), run(3, 'pull_request_target', 'cancelled', '2026-10-16T00:30:00Z')] });
+    assert.deepStrictEqual(r, [5]);
+  });
+  await t('codex-gate refresh: issue_comment refreshes only that PR; non-PR comment does nothing', async () => {
+    const prs = [{ number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: [] }];
+    const runs = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { eventName: 'issue_comment', payload: { issue: { number: 9, pull_request: {} } }, prs }), [5]);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { eventName: 'issue_comment', payload: { issue: { number: 9 } }, prs }), []);
+  });
+  await t('codex-gate refresh: green head check is re-run when the verdict turned false (fail closed)', async () => {
+    const runs = { pull_request_target: [run(5, 'pull_request_target', 'success', '2026-10-16T01:20:00Z', { run_attempt: 3 })] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: SUMMARY_RUNNING }), ['all:5']);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs), []);
+  });
+  for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
+    await t(`${file} refresh: newest = latest ATTEMPT start (a re-run older run beats a later-created success)`, async () => {
+      const r = await runRefresh(file, { pull_request_target: [
+        run(8, 'pull_request_target', 'success', '2026-10-16T02:00:00Z'),
+        run(4, 'pull_request_target', 'failure', '2026-10-16T01:00:00Z', { run_started_at: '2026-10-16T03:00:00Z', run_attempt: 2 })] },
+        { labels: ['qa-passed'], labelEvents: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-16T03:10:00Z' }] });
+      assert.deepStrictEqual(r, [4]);
+    });
+  }
+  await t('codex-gate refresh: red→green and cancelled re-runs capped at attempt 3; timed_out retried', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
+    assert.deepStrictEqual(r, []);
+    const to = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'timed_out', '2026-10-16T01:20:00Z')] });
+    assert.deepStrictEqual(to, [5]);
+    const c = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'cancelled', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
+    assert.deepStrictEqual(c, []);
+  });
+  await t('codex-gate refresh: runs beyond the first page are considered (paginated)', async () => {
+    const many = Array.from({ length: 30 }, (_, i) => run(100 + i, 'pull_request_target', 'success', `2026-10-16T01:${String(i).padStart(2, '0')}:00Z`));
+    many.push(run(7, 'pull_request_target', 'failure', '2026-10-15T00:00:00Z', { run_started_at: '2026-10-16T05:00:00Z', run_attempt: 2 }));
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', { pull_request_target: many }), [7]);
+  });
+  await t('qa-gate refresh: legitimately red gate (no label) is NEVER re-run', async () => {
+    const r = await runRefresh('qa-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')] });
+    assert.deepStrictEqual(r, []);
+  });
+  await t('qa-gate refresh: re-runs a failed run only when the label was applied after it evaluated', async () => {
+    const runs = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')] };
+    const after = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-16T01:30:00Z' }];
+    const before = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-16T01:10:00Z' }];
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: ['qa-passed'], labelEvents: after }), [5]);
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: ['qa-passed'], labelEvents: before }), []);
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', runs, { labels: [], labelEvents: after }), []);
+    // Label applied while the run was still evaluating (before completion) is NOT new input.
+    const during = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { updated_at: '2026-10-16T01:35:00Z' })] };
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', during, { labels: ['qa-passed'], labelEvents: after }), []);
+    const capped = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] };
+    assert.deepStrictEqual(await runRefresh('qa-gate.yml', capped, { labels: ['qa-passed'], labelEvents: after }), []);
+  });
+  for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
+    await t(`${file} refresh: re-runs failed workflow_dispatch run on the PR branch (when input changed)`, async () => {
+      const r = await runRefresh(file, { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] },
+        { labels: ['qa-passed'], labelEvents: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-16T01:30:00Z' }] });
       assert.deepStrictEqual(r, [5]);
     });
     await t(`${file} refresh: ignores dispatch on another branch`, async () => {
-      const r = await runRefresh({ workflow_dispatch: [{ id: 6, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'main', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }] });
+      const r = await runRefresh(file, { workflow_dispatch: [run(6, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z', { head_branch: 'main' })] });
       assert.deepStrictEqual(r, []);
     });
-    await t(`${file} refresh: newest run decides (later target success wins)`, async () => {
-      const r = await runRefresh({
-        workflow_dispatch: [{ id: 5, event: 'workflow_dispatch', head_sha: 'h1', head_branch: 'crawl/auto', conclusion: 'failure', created_at: '2026-10-16T01:20:00Z' }],
-        pull_request_target: [{ id: 8, event: 'pull_request_target', head_sha: 'h1', conclusion: 'success', created_at: '2026-10-16T02:00:00Z' }] });
+    await t(`${file} refresh: the newest cancelled run on the head is re-run even if a later run succeeded`, async () => {
+      const ev = file === 'qa-gate.yml' ? 'pull_request_target' : 'pull_request_review';
+      const r = await runRefresh(file, {
+        [ev]: [run(11, ev, 'cancelled', '2026-10-16T01:00:00Z'), run(10, ev, 'cancelled', '2026-10-16T00:50:00Z')],
+        workflow_dispatch: [run(12, 'workflow_dispatch', 'success', '2026-10-16T02:00:00Z')] });
+      assert.deepStrictEqual(r, ['all:11']);
+    });
+    await t(`${file} refresh: nothing is re-run while a run on the head is still in progress`, async () => {
+      const r = await runRefresh(file, {
+        pull_request_target: [run(13, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z'),
+          run(14, 'pull_request_target', null, '2026-10-16T02:00:00Z', { status: 'in_progress' })] });
+      assert.deepStrictEqual(r, []);
+    });
+    await t(`${file} refresh: newest run decides (later success, older failure → nothing)`, async () => {
+      const r = await runRefresh(file, {
+        workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')],
+        pull_request_target: [run(8, 'pull_request_target', 'success', '2026-10-16T02:00:00Z')] });
       assert.deepStrictEqual(r, []);
     });
   }

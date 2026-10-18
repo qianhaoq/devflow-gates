@@ -1,5 +1,6 @@
 # Self-lint for this repo — actionlint over every workflow (reusable +
-# examples) on push and pull_request. Catches broken expressions, invalid
+# examples) on pull_request and on push to main (no duplicate runs for
+# PR branches). Catches broken expressions, invalid
 # input types, and shellcheck issues in run blocks before callers copy
 # anything.
 
@@ -7,7 +8,12 @@ name: Self Lint
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: self-lint-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
