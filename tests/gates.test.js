@@ -856,6 +856,10 @@ const UNL_KW = 'This is a security problem.';
       const runs = { pull_request_target: [run(12, 'pull_request_target', 'success', '2026-10-16T02:00:00Z')] };
       const byId = { 21: { id: 21, workflow_id: 7, conclusion: 'cancelled', event: 'pull_request_target', run_attempt: 1, pull_requests: [{ number: 9 }] } };
       assert.deepStrictEqual(await runRefresh(file, runs, { ...wr, runById: byId }), ['all:21']);
+      // The triggering run can be the PR's ONLY gate run: runsByEvent empty →
+      // `evaluated` empty. The heal must not be short-circuited by the
+      // `!latest` guard — the BY-ID fetch still has to re-run it.
+      assert.deepStrictEqual(await runRefresh(file, {}, { ...wr, runById: byId }), ['all:21']);
     });
     await t(`${file} refresh: workflow_run(cancelled) with no open PR / healed head → nothing`, async () => {
       // The cancelled run was already re-run to success elsewhere: latest is

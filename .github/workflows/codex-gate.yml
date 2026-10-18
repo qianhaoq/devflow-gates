@@ -634,12 +634,15 @@ jobs:
                 .filter((r) => r.conclusion !== 'skipped')
                 .sort((a, b) => (attemptAt(b) - attemptAt(a)) || ((b.id || 0) - (a.id || 0)));
               const capped = (r, max) => (r.run_attempt || 1) >= max;
-              const latest = evaluated[0];
-              if (!latest) continue;
               // Cancel-heal priority: when a cancelled COMPLETION triggered this
               // refresh, re-run THAT run first if it is still an uncapped
               // cancelled run on this head — before the generic newest-cancelled
-              // fallback below. Still at most one re-run per PR per refresh.
+              // fallback below. Handled BEFORE the `latest` guard on purpose:
+              // headRuns() indexes runs by PR head SHA while a pull_request_target
+              // run's own head_sha is the BASE SHA, so the triggering run can be
+              // the PR's ONLY gate run and `evaluated` can be EMPTY — an empty
+              // headRuns must never short-circuit the heal.
+              // Still at most one re-run per PR per refresh.
               if (triggeredId) {
                 let triggered = evaluated.find((r) => r.id === triggeredId
                   && r.conclusion === 'cancelled' && !capped(r, MAX_ATTEMPTS));
@@ -672,6 +675,9 @@ jobs:
                 }
                 core.info(`PR #${pr.number}: triggered run ${triggeredId} is not (or no longer) an uncapped cancelled run on this head — falling back to the newest-cancelled logic`);
               }
+              // The generic fallbacks below all key off the newest evaluated run.
+              const latest = evaluated[0];
+              if (!latest) continue;
               // At most ONE re-run per PR per refresh, so re-runs can never cancel
               // each other through a shared concurrency group.
               if (latest.conclusion === 'success') {
@@ -1227,12 +1233,15 @@ jobs:
                 .filter((r) => r.conclusion !== 'skipped')
                 .sort((a, b) => (attemptAt(b) - attemptAt(a)) || ((b.id || 0) - (a.id || 0)));
               const capped = (r, max) => (r.run_attempt || 1) >= max;
-              const latest = evaluated[0];
-              if (!latest) continue;
               // Cancel-heal priority: when a cancelled COMPLETION triggered this
               // refresh, re-run THAT run first if it is still an uncapped
               // cancelled run on this head — before the generic newest-cancelled
-              // fallback below. Still at most one re-run per PR per refresh.
+              // fallback below. Handled BEFORE the `latest` guard on purpose:
+              // headRuns() indexes runs by PR head SHA while a pull_request_target
+              // run's own head_sha is the BASE SHA, so the triggering run can be
+              // the PR's ONLY gate run and `evaluated` can be EMPTY — an empty
+              // headRuns must never short-circuit the heal.
+              // Still at most one re-run per PR per refresh.
               if (triggeredId) {
                 let triggered = evaluated.find((r) => r.id === triggeredId
                   && r.conclusion === 'cancelled' && !capped(r, MAX_ATTEMPTS));
@@ -1265,6 +1274,9 @@ jobs:
                 }
                 core.info(`PR #${pr.number}: triggered run ${triggeredId} is not (or no longer) an uncapped cancelled run on this head — falling back to the newest-cancelled logic`);
               }
+              // The generic fallbacks below all key off the newest evaluated run.
+              const latest = evaluated[0];
+              if (!latest) continue;
               // At most ONE re-run per PR per refresh, so re-runs can never cancel
               // each other through a shared concurrency group.
               if (latest.conclusion === 'success') {
