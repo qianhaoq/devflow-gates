@@ -52,6 +52,29 @@ in [README.md](README.md).
     older head's evaluation. Label / review / dispatch runs get their own
     group: a label or review event must never cancel a push evaluation, and
     a cancelled required check must never be the final word.
+- Cancelled required checks are healed, never bypassed (A1/A2, 2026-10):
+  branch protection gates on the LATEST check run per required name on the
+  head SHA, so a stuck cancelled/expected check blocks merge even when the
+  change is substantively green (jobs-qianhao-ai #4).
+  - A1: the gate callers self-listen via `workflow_run(completed)` (fires
+    from the default branch only; GitHub caps workflow_run chains at 3
+    levels, so self-listening cannot loop) and run a `*-cancel-heal` job
+    (QA's is DEFAULT ON) that routes to the reusable refresh job, which
+    re-runs the TRIGGERING cancelled run — a cancelled run cannot run its
+    own post steps. Same caps: one re-run per PR, attempt 3, never while a
+    run is in flight. Heal/refresh concurrency groups are never
+    cancelled and never join the push cancel-in-progress group.
+  - A2: auto-merge classifies the LATEST run per required name
+    (`classifyRequiredCheck`): missing/pending → skip, cancelled → re-run
+    that run (`actions: write`, cap 3) and skip merging this round,
+    failure → ordinary red. An OLDER success never overrides the newest
+    run (same rule as branch protection).
+  - If a merge is still stuck on expected/cancelled, run
+    `./scripts/heal-required-checks.sh owner/repo PR` first — do NOT
+    temporarily remove branch protection. The extreme fallback (manual
+    protection removal) must come with an issue.
+  - B (a "Ready to Merge" rollup check) is deliberately NOT done this
+    week (2026-W42); it is next week's work.
 - Gates other than the QA gate never add or remove labels. Only the editor /
   QA owner applies `qa-passed` / `editorial-approved` — agents never do.
 - QA gate `keep_qa_on_clean_main_update` (opt-in, default `false`): the only

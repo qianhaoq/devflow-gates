@@ -141,6 +141,36 @@ const UNL_KW = 'This is a security problem.';
     assert.strictEqual(copilot([crev('COMMENTED', CH, '2026-10-17T01:00:00Z')], [cchk('in_progress', null)], CH, 1, 'head').ok, false);
   });
 
+  // Required-check classification (A2: a cancelled LATEST run heals + skips —
+  // never a pass, never a final red; missing/expected skip; only success passes).
+  const required = (() => {
+    const src = scripts('auto-merge.yml')[0];
+    const start = src.indexOf('function workflowRunIdFromCheck');
+    const end = src.indexOf('async function candidatePrNumbers', start);
+    assert.ok(start >= 0 && end > start, 'auto-merge.yml: required-check region not found');
+    return new Function(src.slice(start, end) + '\nreturn { classifyRequiredCheck, workflowRunIdFromCheck };')();
+  })();
+  await t('auto-merge: classifyRequiredCheck — cancelled heals, missing/expected skip, only success passes', () => {
+    assert.strictEqual(required.classifyRequiredCheck(null).state, 'missing');
+    assert.strictEqual(required.classifyRequiredCheck({ status: 'queued', conclusion: null }).state, 'expected');
+    assert.strictEqual(required.classifyRequiredCheck({ status: 'in_progress' }).state, 'expected');
+    assert.strictEqual(required.classifyRequiredCheck({ status: 'completed', conclusion: 'success' }).state, 'success');
+    // A cancelled latest run is NOT treated as a permanent failure (heal+skip)…
+    assert.strictEqual(required.classifyRequiredCheck({ status: 'completed', conclusion: 'cancelled' }).state, 'cancelled');
+    // …and not as success either — Codex/QA are never bypassed by a cancel.
+    assert.notStrictEqual(required.classifyRequiredCheck({ status: 'completed', conclusion: 'cancelled' }).state, 'success');
+    for (const c of ['failure', 'timed_out', 'skipped', 'startup_failure']) {
+      assert.strictEqual(required.classifyRequiredCheck({ status: 'completed', conclusion: c }).state, 'bad');
+    }
+  });
+  await t('auto-merge: workflowRunIdFromCheck parses the run id from details/html URL', () => {
+    assert.strictEqual(required.workflowRunIdFromCheck({ details_url: 'https://github.com/o/r/actions/runs/1111/job/2222', html_url: 'https://github.com/o/r/actions/runs/1111' }), 1111);
+    assert.strictEqual(required.workflowRunIdFromCheck({ html_url: 'https://github.com/o/r/actions/runs/98765' }), 98765);
+    assert.strictEqual(required.workflowRunIdFromCheck({ html_url: 'https://example.com/no-run-id' }), null);
+    assert.strictEqual(required.workflowRunIdFromCheck({}), null);
+    assert.strictEqual(required.workflowRunIdFromCheck(null), null);
+  });
+
   // QA gate dry-run.
   const qa = scripts('qa-gate.yml')[0];
   const HEAD = 'abcdef1234567abcdef1234567abcdef12345678';
@@ -792,6 +822,28 @@ const UNL_KW = 'This is a security problem.';
         workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')],
         pull_request_target: [run(8, 'pull_request_target', 'success', '2026-10-16T02:00:00Z')] });
       assert.deepStrictEqual(r, []);
+    });
+    await t(`${file} refresh: workflow_run(cancelled) heal re-runs the TRIGGERING run for that PR only`, async () => {
+      const wr = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: RH, head_branch: 'crawl/auto', pull_requests: [{ number: 9 }] } } };
+      const runs = { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z'), run(10, 'pull_request_target', 'cancelled', '2026-10-16T00:30:00Z')] };
+      // The triggering run takes priority over the older cancelled one…
+      assert.deepStrictEqual(await runRefresh(file, runs, wr), ['all:21']);
+      // …but never past the attempt cap: falls back to the newest uncapped cancelled.
+      const capped = { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z', { run_attempt: 3 }), run(10, 'pull_request_target', 'cancelled', '2026-10-16T00:30:00Z')] };
+      assert.deepStrictEqual(await runRefresh(file, capped, wr), ['all:10']);
+    });
+    await t(`${file} refresh: workflow_run(cancelled) whose run is no longer on the head / no open PR → nothing`, async () => {
+      // The cancelled run was already re-run to success elsewhere: latest is
+      // success and verdict ok → no re-run at all.
+      const healed = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: RH, pull_requests: [{ number: 9 }] } } };
+      assert.deepStrictEqual(await runRefresh(file, { pull_request_target: [run(12, 'pull_request_target', 'success', '2026-10-16T02:00:00Z')] }, healed), []);
+      // No open PR matches the cancelled run's head SHA → nothing to heal
+      // (pull_requests candidate fails the head-sha check; list fallback too).
+      const stray = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: 'dead000000000000000000000000000000000000', pull_requests: [{ number: 9 }] } } };
+      assert.deepStrictEqual(await runRefresh(file, { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z')] }, stray), []);
+      // A non-cancelled workflow_run trigger heals nothing.
+      const success = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'success', event: 'pull_request_target', head_sha: RH, pull_requests: [{ number: 9 }] } } };
+      assert.deepStrictEqual(await runRefresh(file, { pull_request_target: [run(21, 'pull_request_target', 'cancelled', '2026-10-16T01:00:00Z')] }, success), []);
     });
   }
 
