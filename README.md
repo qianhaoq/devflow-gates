@@ -153,8 +153,10 @@ pull_request_review(_comment) / PR 分支上的 workflow_dispatch；被调用方
 - 否则若 head 上有 `cancelled` 运行 → 只整体重跑**最新的那一个**（避免分支
   保护把残留的 cancelled 必需检查当结果：405 "Required status check … is
   cancelled"）。
-- 每个 PR 每次刷新最多重跑 1 个运行；`run_attempt >= 3` 的运行不再自动重跑
-  （人工仍可在 UI 重跑）。
+- 每个 PR 每次刷新最多重跑 1 个运行；盲重跑（cancelled）到 `run_attempt 3` 为止，
+  由 verdict 翻转驱动的重跑上限 20（避免把一个现在能通过的检查卡成红）。
+  列表分页读取；head 上有进行中的运行（多为几秒内即 skipped 的调用方过滤）时
+  先等待最多约 40 秒。
 - 需要 `actions: write`（调用方授予）。
 - 检查缺失 / 最近一次 pull_request_target 运行仍在跑 / 已成功 → 不动。
 

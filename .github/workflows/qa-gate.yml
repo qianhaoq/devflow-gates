@@ -657,6 +657,8 @@ jobs:
             const repo = context.repo.repo;
             const QA_LABEL = (process.env.QA_LABEL || 'qa-passed').trim() || 'qa-passed';
             const MAX_ATTEMPTS = 3;
+            const POLL_MS = Number(process.env.REFRESH_POLL_MS ?? 10000);
+            const POLL_TRIES = 4;
 
             // The run belongs to the CALLER workflow; identify it so we
             // re-run its (not some other workflow's) gate runs.
@@ -685,22 +687,34 @@ jobs:
               // (e.g. crawl.yml for a GITHUB_TOKEN-created PR, where no
               // pull_request(_target) event ever fires). A dispatch on
               // another ref has a different head_sha and is excluded.
-              const runs = [];
-              for (const event of ['pull_request_target', 'workflow_dispatch']) {
-                const { data: runsData } = await github.rest.actions.listWorkflowRuns({
-                  owner,
-                  repo,
-                  workflow_id: workflowId,
-                  head_sha: sha,
-                  event,
-                  per_page: 20,
-                });
-                runs.push(...(runsData.workflow_runs || []).filter((r) => r.head_sha === sha
-                  && (event !== 'workflow_dispatch' || r.head_branch === pr.head.ref)));
+              // ALL runs on the head (paginated): an older-created run that was
+              // re-run recently may be the freshest check.
+              async function headRuns() {
+                const out = [];
+                for (const event of ['pull_request_target', 'workflow_dispatch']) {
+                  const list = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner,
+                    repo,
+                    workflow_id: workflowId,
+                    head_sha: sha,
+                    event,
+                    per_page: 100,
+                  });
+                  out.push(...(list || []).filter((r) => r.head_sha === sha
+                    && (event !== 'workflow_dispatch' || r.head_branch === pr.head.ref)));
+                }
+                return out;
               }
-              // Something is still queued/running on this head: its result
-              // will land on the check; re-running now could race it.
-              if (runs.some((r) => r.status && r.status !== 'completed')) continue;
+              // Something still queued/running on this head (often a caller-level
+              // skip resolving in seconds): wait briefly; if it persists its result
+              // will land on the check and re-running now could race it.
+              const inFlight = (rs) => rs.some((r) => r.status && r.status !== 'completed');
+              let runs = await headRuns();
+              for (let i = 0; i < POLL_TRIES && inFlight(runs); i++) {
+                await new Promise((res) => setTimeout(res, POLL_MS));
+                runs = await headRuns();
+              }
+              if (inFlight(runs)) continue;
               // Caller-level skips (unrelated label events) conclude
               // 'skipped' and attach no gate check — ignore them.
               // Newest by the LATEST ATTEMPT's start (a re-run of an older

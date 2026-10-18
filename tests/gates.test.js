@@ -609,17 +609,18 @@ const UNL_KW = 'This is a security problem.';
         repos: { getCommit: async () => ({ data: { commit: { committer: { date: '2026-10-16T00:00:00Z' } } } }) },
       },
       graphql: async () => ({ repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } }),
-      paginate: async (fn) => {
+      paginate: async (fn, args = {}) => {
         if (fn === github.rest.issues.listComments) return summary ? [summary] : [];
         if (fn === github.rest.issues.listEvents) return labelEvents;
         if (fn === github.rest.pulls.list) return prList;
+        if (fn === github.rest.actions.listWorkflowRuns) return runsByEvent[args.event] || [];
         return [];
       },
     };
     const core = { info(m) { if (process.env.DEBUG_T) console.log('  info:', m); }, warning() {}, setFailed(m) { if (mode !== 'refresh') { failed.push(m); return; } throw new Error(m); }, summary: { addRaw() { return this; }, write: async () => {} } };
     const context = { runId: 1, eventName, repo: { owner: 'o', repo: 'r' }, payload };
     const src = scripts(file)[mode === 'refresh' ? 1 : 0];
-    await new AsyncFunction('github', 'context', 'core', 'process', 'exec', src)(github, context, core, { env: { GATE_MODE: mode, QA_LABEL: 'qa-passed' } }, {});
+    await new AsyncFunction('github', 'context', 'core', 'process', 'exec', src)(github, context, core, { env: { GATE_MODE: mode, QA_LABEL: 'qa-passed', REFRESH_POLL_MS: '0' } }, {});
     return reran;
   }
   const run = (id, event, conclusion, created_at, extra = {}) => ({ id, event, head_sha: RH, head_branch: 'crawl/auto', status: 'completed', conclusion, created_at, run_started_at: created_at, run_attempt: 1, ...extra });
@@ -649,8 +650,8 @@ const UNL_KW = 'This is a security problem.';
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: null }), []);
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { labels: ['skip-codex-gate'] }), []);
   });
-  await t('codex-gate refresh: run_attempt cap (3) stops re-runs', async () => {
-    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
+  await t('codex-gate refresh: gated run_attempt cap (20) stops re-runs', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 20 })] });
     assert.deepStrictEqual(r, []);
   });
   await t('codex-gate refresh: caller-skipped newest run is ignored', async () => {
@@ -681,6 +682,17 @@ const UNL_KW = 'This is a security problem.';
       assert.deepStrictEqual(r, [4]);
     });
   }
+  await t('codex-gate refresh: gated re-runs are not stranded by the blind cap (attempt 4 red → re-run when verdict passes)', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 4 })] });
+    assert.deepStrictEqual(r, [5]);
+    const c = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'cancelled', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
+    assert.deepStrictEqual(c, []);
+  });
+  await t('codex-gate refresh: runs beyond the first page are considered (paginated)', async () => {
+    const many = Array.from({ length: 30 }, (_, i) => run(100 + i, 'pull_request_target', 'success', `2026-10-16T01:${String(i).padStart(2, '0')}:00Z`));
+    many.push(run(7, 'pull_request_target', 'failure', '2026-10-15T00:00:00Z', { run_started_at: '2026-10-16T05:00:00Z', run_attempt: 2 }));
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', { pull_request_target: many }), [7]);
+  });
   await t('qa-gate refresh: legitimately red gate (no label) is NEVER re-run', async () => {
     const r = await runRefresh('qa-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z')] });
     assert.deepStrictEqual(r, []);
