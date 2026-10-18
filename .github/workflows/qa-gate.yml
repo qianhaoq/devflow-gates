@@ -246,6 +246,36 @@ jobs:
               }
               return { ok: true, labeledTime: new Date(last.created_at).getTime() };
             }
+            // Id of the newest labeled/unlabeled event for QA_LABEL in a list.
+            function lastLabelEventId(evs) {
+              const l = evs
+                .filter((e) => (e.event === 'labeled' || e.event === 'unlabeled') && e.label?.name === QA_LABEL && e.created_at)
+                .sort((a, b) => new Date(a.created_at) - new Date(b.created_at) || (a.id || 0) - (b.id || 0));
+              const x = l[l.length - 1];
+              return x ? { id: x.id, event: x.event } : null;
+            }
+            // Remove the label only if no NEWER sign-off happened while this
+            // run evaluated (re-read the events right before deleting). A
+            // removal made with GITHUB_TOKEN triggers no new run, so deleting
+            // a fresh label would leave its passing check unopposed while the
+            // label is gone — or, worse, strip a valid re-sign-off. A newer
+            // 'labeled' event has its own run, which evaluates it.
+            async function removeLabelUnlessResigned(why) {
+              try {
+                const seen = lastLabelEventId(await issueEvents());
+                const fresh = lastLabelEventId(await github.paginate(github.rest.issues.listEvents, {
+                  owner, repo, issue_number: prNumber, per_page: 100,
+                }));
+                if (fresh && fresh.event === 'labeled' && (!seen || fresh.id !== seen.id)) {
+                  core.info(`"${QA_LABEL}" was re-applied while this run evaluated — leaving it for that label event's own run`);
+                  return;
+                }
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: QA_LABEL });
+                core.info(`Removed ${why}label "${QA_LABEL}" from PR #${prNumber}`);
+              } catch (err) {
+                core.warning(`Could not remove label "${QA_LABEL}" (${err.message}) — the caller workflow must grant pull-requests:write and issues:write`);
+              }
+            }
 
             // ---- keep_qa_on_clean_main_update: git plumbing only ------
             // A throwaway BARE repo under RUNNER_TEMP: objects are fetched,
@@ -537,19 +567,7 @@ jobs:
 
             if (IS_SYNC && !freshLabel && !kept) {
               if (hasLabel) {
-                try {
-                  await github.rest.issues.removeLabel({
-                    owner,
-                    repo,
-                    issue_number: prNumber,
-                    name: QA_LABEL,
-                  });
-                  core.info(`Removed label "${QA_LABEL}" from PR #${prNumber} (new push)`);
-                } catch (err) {
-                  core.warning(
-                    `Could not remove label "${QA_LABEL}" (${err.message}) — the caller workflow must grant pull-requests:write and issues:write`
-                  );
-                }
+                await removeLabelUnlessResigned('(new push) ');
                 if (KEEP_CLEAN) {
                   core.info(`keep_qa_on_clean_main_update: not kept — ${keepReason}`);
                   await summary(`### QA Gate\n\`${QA_LABEL}\` stripped on push to ${short(sha)} — not a clean \`${baseRef}\` merge: ${keepReason}`);
@@ -611,12 +629,7 @@ jobs:
             // Stale label (e.g. the push's synchronize run was cancelled by
             // a later event): strip it like the synchronize path would, so
             // no automation sees it (fail closed).
-            try {
-              await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: QA_LABEL });
-              core.info(`Removed stale label "${QA_LABEL}" from PR #${prNumber}`);
-            } catch (err) {
-              core.warning(`Could not remove label "${QA_LABEL}" (${err.message})`);
-            }
+            await removeLabelUnlessResigned('stale ');
             await summary(`### QA Gate\n\`${QA_LABEL}\` stripped — it predates the latest push to ${short(sha)}${KEEP_CLEAN ? ` and ${short(sha)} is not a clean \`${baseRef}\` merge of the QA-tested head` : ''}: ${a.reason}`);
             const msg = `QA label "${QA_LABEL}" predates the latest push (applied ${fmt(labeledTime)}, not bound to head ${short(sha)}). Re-run QA on head ${short(sha)} and re-apply the label. (${a.reason})`;
             core.setFailed(msg);
@@ -645,6 +658,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      issues: read
       actions: write
     steps:
       - name: Refresh failing gate checks
@@ -658,7 +672,8 @@ jobs:
             const QA_LABEL = (process.env.QA_LABEL || 'qa-passed').trim() || 'qa-passed';
             const MAX_ATTEMPTS = 3;
             const POLL_MS = Number(process.env.REFRESH_POLL_MS ?? 10000);
-            const POLL_TRIES = 4;
+            // One shared ~40 s wait budget for the whole sweep (not per PR).
+            let pollBudget = 4;
 
             // The run belongs to the CALLER workflow; identify it so we
             // re-run its (not some other workflow's) gate runs.
@@ -710,7 +725,8 @@ jobs:
               // will land on the check and re-running now could race it.
               const inFlight = (rs) => rs.some((r) => r.status && r.status !== 'completed');
               let runs = await headRuns();
-              for (let i = 0; i < POLL_TRIES && inFlight(runs); i++) {
+              while (pollBudget > 0 && inFlight(runs)) {
+                pollBudget -= 1;
                 await new Promise((res) => setTimeout(res, POLL_MS));
                 runs = await headRuns();
               }
@@ -726,7 +742,7 @@ jobs:
               const capped = (r) => (r.run_attempt || 1) >= MAX_ATTEMPTS;
               const latest = evaluated[0];
               if (!latest) continue;
-              if (latest.conclusion === 'failure' && !capped(latest)
+              if ((latest.conclusion === 'failure' || latest.conclusion === 'timed_out') && !capped(latest)
                   && (pr.labels || []).some((l) => l.name === QA_LABEL)) {
                 const events = await github.paginate(github.rest.issues.listEvents, {
                   owner, repo, issue_number: pr.number, per_page: 100,

@@ -104,7 +104,8 @@ const UNL_KW = 'This is a security problem.';
   const PREV = '1111111111111111111111111111111111111111';
   // Default head observations: HEAD's run long before any label below.
   const RUNS0 = [[HEAD, '2026-01-15T00:00:00Z']];
-  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt, runs = RUNS0, timeline = [], headRepo = 'o/r', runPrs = [1], dispatch = [] }) {
+  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt, runs = RUNS0, timeline = [], headRepo = 'o/r', runPrs = [1], dispatch = [], eventsLater }) {
+    let evCalls = 0;
     const calls = { removed: [], failed: null, info: [] };
     const mkRun = (event) => ([sha, at, extra = {}], i) => ({ id: i + 1, event, head_sha: sha, head_branch: 'feat', head_repository: { full_name: headRepo }, pull_requests: runPrs.map((number) => ({ number })), created_at: at, ...extra });
     const github = {
@@ -115,7 +116,7 @@ const UNL_KW = 'This is a security problem.';
         repos: { getCommit: async () => { throw new Error('committer dates must not be consulted'); } },
       },
       paginate: async (fn, args) => {
-        if (fn === github.rest.issues.listEvents) return events;
+        if (fn === github.rest.issues.listEvents) return (evCalls++ > 0 && eventsLater) ? eventsLater : events;
         if (fn === github.rest.issues.listEventsForTimeline) return timeline;
         if (fn === github.rest.actions.listWorkflowRuns) {
           if (runs === null) throw new Error('Resource not accessible by integration');
@@ -134,6 +135,14 @@ const UNL_KW = 'This is a security problem.';
     const c = await runQa({ draft: true, action: 'synchronize', labels: ['qa-passed'] });
     assert.deepStrictEqual(c.removed, ['qa-passed']);
     assert.ok(c.failed && /new push invalidated QA/.test(c.failed), c.failed);
+  });
+  await t('qa-gate: label re-applied while the run evaluated is not stripped (fresh re-read)', async () => {
+    const old = { id: 1, event: 'labeled', label: { name: 'qa-passed' }, actor: { login: 'qianhaoq' }, created_at: '2026-01-01T00:00:00Z' };
+    const un = { id: 2, event: 'unlabeled', label: { name: 'qa-passed' }, actor: { login: 'qianhaoq' }, created_at: '2026-01-20T00:00:00Z' };
+    const again = { id: 3, event: 'labeled', label: { name: 'qa-passed' }, actor: { login: 'qianhaoq' }, created_at: '2026-01-20T00:00:05Z' };
+    const c = await runQa({ draft: true, action: 'synchronize', labels: ['qa-passed'], events: [old], eventsLater: [old, un, again] });
+    assert.deepStrictEqual(c.removed, []);
+    assert.ok(c.failed, 'run still fails');
   });
   await t('qa-gate: draft without push still fails as draft', async () => {
     const c = await runQa({ draft: true, action: 'labeled', labels: ['qa-passed'] });
@@ -650,8 +659,8 @@ const UNL_KW = 'This is a security problem.';
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: null }), []);
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { labels: ['skip-codex-gate'] }), []);
   });
-  await t('codex-gate refresh: gated run_attempt cap (20) stops re-runs', async () => {
-    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 20 })] });
+  await t('codex-gate refresh: run_attempt cap (3) stops red→green re-runs', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
     assert.deepStrictEqual(r, []);
   });
   await t('codex-gate refresh: caller-skipped newest run is ignored', async () => {
@@ -682,9 +691,11 @@ const UNL_KW = 'This is a security problem.';
       assert.deepStrictEqual(r, [4]);
     });
   }
-  await t('codex-gate refresh: gated re-runs are not stranded by the blind cap (attempt 4 red → re-run when verdict passes)', async () => {
-    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 4 })] });
-    assert.deepStrictEqual(r, [5]);
+  await t('codex-gate refresh: red→green and cancelled re-runs capped at attempt 3; timed_out retried', async () => {
+    const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
+    assert.deepStrictEqual(r, []);
+    const to = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'timed_out', '2026-10-16T01:20:00Z')] });
+    assert.deepStrictEqual(to, [5]);
     const c = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'cancelled', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });
     assert.deepStrictEqual(c, []);
   });

@@ -85,5 +85,6 @@ jobs:
   #   permissions:
   #     contents: read
   #     pull-requests: read
+  #     issues: read
   #     actions: write
   #   uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@main

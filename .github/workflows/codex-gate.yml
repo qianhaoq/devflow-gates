@@ -52,8 +52,9 @@
 #     re-runs the latest FAILED head gate run ONLY IF the same verdict()
 #     the evaluator uses says the gate would now pass, re-runs a GREEN
 #     latest run if the verdict is now false (fail closed), else (at
-#     most) the newest CANCELLED head run. One re-run per PR per refresh; blind
-#     (cancelled) re-runs never past run_attempt 3. No blind periodic re-runs: a gate that is
+#     most) the newest CANCELLED head run. One re-run per PR per refresh; red→green
+#     and cancelled re-runs never past run_attempt 3 (the fail-closed
+#     green→red re-run is the only uncapped one). No blind periodic re-runs: a gate that is
 #     legitimately red is left alone. A re-run preserves the original
 #     event, so the fresh conclusion re-attaches to the PR head check.
 #   - Both jobs run the IDENTICAL script (tests enforce it); GATE_MODE
@@ -485,17 +486,17 @@ jobs:
             //     never re-run;
             //   - otherwise the newest CANCELLED run on the head (if any) is re-run
             //     (a cancelled required check is never the final word);
-            //   - at most one re-run per PR per refresh. Caps: a BLIND re-run (the
-            //     cancelled case) never past run_attempt 3; verdict-gated re-runs
-            //     (green→red / red→green, each needs a verdict flip caused by a new
-            //     event) never past attempt 20 — high enough that a gated re-run can
-            //     never strand a check red that verdict() now passes.
-            const MAX_BLIND_ATTEMPTS = 3;
-            const MAX_GATED_ATTEMPTS = 20;
+            //   - at most one re-run per PR per refresh, and never a red→green or
+            //     cancelled re-run at run_attempt >= 3 (a human can still re-run in
+            //     the UI or push). The ONLY uncapped re-run is the fail-closed
+            //     green→red one: it needs a real verdict flip caused by a new Codex
+            //     comment, so it is bounded by Codex activity, and a capped green
+            //     check must never stay green once the gate would fail.
+            const MAX_ATTEMPTS = 3;
             // In-flight runs are usually caller-level skips resolving in seconds;
-            // wait briefly for them instead of giving up on this refresh.
+            // one shared ~40 s wait budget for the whole sweep (not per PR).
             const POLL_MS = Number(process.env.REFRESH_POLL_MS ?? 10000);
-            const POLL_TRIES = 4;
+            let pollBudget = 4;
             const { data: thisRun } = await github.rest.actions.getWorkflowRun({
               owner,
               repo,
@@ -543,7 +544,8 @@ jobs:
               }
               const inFlight = (rs) => rs.some((r) => r.status && r.status !== 'completed');
               let runs = await headRuns();
-              for (let i = 0; i < POLL_TRIES && inFlight(runs); i++) {
+              while (pollBudget > 0 && inFlight(runs)) {
+                pollBudget -= 1;
                 await new Promise((res) => setTimeout(res, POLL_MS));
                 runs = await headRuns();
               }
@@ -567,19 +569,19 @@ jobs:
               if (latest.conclusion === 'success') {
                 // Fail closed: a green head check whose verdict is now false (e.g.
                 // Codex edited the Summary back to Running / Failed on the same SHA)
-                // is re-run so the required check turns red. Gated cap only: the
-                // re-run's failure is re-run again once verdict() passes.
+                // is re-run so the required check turns red. Uncapped on purpose
+                // (see the cap note above).
                 const v = await verdict(pr.number);
-                if (!v.ok && !v.none && !capped(latest, MAX_GATED_ATTEMPTS)) {
+                if (!v.ok && !v.none) {
                   await github.rest.actions.reRunWorkflow({ owner, repo, run_id: latest.id });
                   rerun += 1;
                   core.info(`PR #${pr.number}: head check is green but the gate would now fail (${v.msg}) — re-running run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
                   continue;
                 }
               }
-              if (latest.conclusion === 'failure') {
-                if (capped(latest, MAX_GATED_ATTEMPTS)) {
-                  core.info(`PR #${pr.number}: run ${latest.id} is at attempt ${latest.run_attempt} (cap ${MAX_GATED_ATTEMPTS}) — not re-running`);
+              if (latest.conclusion === 'failure' || latest.conclusion === 'timed_out') {
+                if (capped(latest, MAX_ATTEMPTS)) {
+                  core.info(`PR #${pr.number}: run ${latest.id} is at attempt ${latest.run_attempt} (cap ${MAX_ATTEMPTS}) — not re-running; re-run it in the UI or push`);
                 } else {
                   const v = await verdict(pr.number);
                   if (v.ok) {
@@ -595,7 +597,7 @@ jobs:
               // branch protection / the merge API can treat as the required check's
               // result even when a later run succeeded — never the final word.
               // Re-run the newest one (it re-evaluates live state).
-              const cancelled = evaluated.find((r) => r.conclusion === 'cancelled' && !capped(r, MAX_BLIND_ATTEMPTS));
+              const cancelled = evaluated.find((r) => r.conclusion === 'cancelled' && !capped(r, MAX_ATTEMPTS));
               if (cancelled) {
                 await github.rest.actions.reRunWorkflow({ owner, repo, run_id: cancelled.id });
                 rerun += 1;
@@ -990,17 +992,17 @@ jobs:
             //     never re-run;
             //   - otherwise the newest CANCELLED run on the head (if any) is re-run
             //     (a cancelled required check is never the final word);
-            //   - at most one re-run per PR per refresh. Caps: a BLIND re-run (the
-            //     cancelled case) never past run_attempt 3; verdict-gated re-runs
-            //     (green→red / red→green, each needs a verdict flip caused by a new
-            //     event) never past attempt 20 — high enough that a gated re-run can
-            //     never strand a check red that verdict() now passes.
-            const MAX_BLIND_ATTEMPTS = 3;
-            const MAX_GATED_ATTEMPTS = 20;
+            //   - at most one re-run per PR per refresh, and never a red→green or
+            //     cancelled re-run at run_attempt >= 3 (a human can still re-run in
+            //     the UI or push). The ONLY uncapped re-run is the fail-closed
+            //     green→red one: it needs a real verdict flip caused by a new Codex
+            //     comment, so it is bounded by Codex activity, and a capped green
+            //     check must never stay green once the gate would fail.
+            const MAX_ATTEMPTS = 3;
             // In-flight runs are usually caller-level skips resolving in seconds;
-            // wait briefly for them instead of giving up on this refresh.
+            // one shared ~40 s wait budget for the whole sweep (not per PR).
             const POLL_MS = Number(process.env.REFRESH_POLL_MS ?? 10000);
-            const POLL_TRIES = 4;
+            let pollBudget = 4;
             const { data: thisRun } = await github.rest.actions.getWorkflowRun({
               owner,
               repo,
@@ -1048,7 +1050,8 @@ jobs:
               }
               const inFlight = (rs) => rs.some((r) => r.status && r.status !== 'completed');
               let runs = await headRuns();
-              for (let i = 0; i < POLL_TRIES && inFlight(runs); i++) {
+              while (pollBudget > 0 && inFlight(runs)) {
+                pollBudget -= 1;
                 await new Promise((res) => setTimeout(res, POLL_MS));
                 runs = await headRuns();
               }
@@ -1072,19 +1075,19 @@ jobs:
               if (latest.conclusion === 'success') {
                 // Fail closed: a green head check whose verdict is now false (e.g.
                 // Codex edited the Summary back to Running / Failed on the same SHA)
-                // is re-run so the required check turns red. Gated cap only: the
-                // re-run's failure is re-run again once verdict() passes.
+                // is re-run so the required check turns red. Uncapped on purpose
+                // (see the cap note above).
                 const v = await verdict(pr.number);
-                if (!v.ok && !v.none && !capped(latest, MAX_GATED_ATTEMPTS)) {
+                if (!v.ok && !v.none) {
                   await github.rest.actions.reRunWorkflow({ owner, repo, run_id: latest.id });
                   rerun += 1;
                   core.info(`PR #${pr.number}: head check is green but the gate would now fail (${v.msg}) — re-running run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
                   continue;
                 }
               }
-              if (latest.conclusion === 'failure') {
-                if (capped(latest, MAX_GATED_ATTEMPTS)) {
-                  core.info(`PR #${pr.number}: run ${latest.id} is at attempt ${latest.run_attempt} (cap ${MAX_GATED_ATTEMPTS}) — not re-running`);
+              if (latest.conclusion === 'failure' || latest.conclusion === 'timed_out') {
+                if (capped(latest, MAX_ATTEMPTS)) {
+                  core.info(`PR #${pr.number}: run ${latest.id} is at attempt ${latest.run_attempt} (cap ${MAX_ATTEMPTS}) — not re-running; re-run it in the UI or push`);
                 } else {
                   const v = await verdict(pr.number);
                   if (v.ok) {
@@ -1100,7 +1103,7 @@ jobs:
               // branch protection / the merge API can treat as the required check's
               // result even when a later run succeeded — never the final word.
               // Re-run the newest one (it re-evaluates live state).
-              const cancelled = evaluated.find((r) => r.conclusion === 'cancelled' && !capped(r, MAX_BLIND_ATTEMPTS));
+              const cancelled = evaluated.find((r) => r.conclusion === 'cancelled' && !capped(r, MAX_ATTEMPTS));
               if (cancelled) {
                 await github.rest.actions.reRunWorkflow({ owner, repo, run_id: cancelled.id });
                 rerun += 1;
