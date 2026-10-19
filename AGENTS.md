@@ -6,7 +6,7 @@ in [README.md](README.md).
 ## Layout
 
 - `.github/workflows/*.yml` — reusable workflows (`on: workflow_call`):
-  `ci.yml`, `codex-gate.yml`, `qa-gate.yml`, `auto-merge.yml`,
+  `ci.yml`, `codex-gate.yml`, `qa-gate.yml`, `understand-gate.yml`, `auto-merge.yml`,
   `post-deploy-smoke.yml`, `acceptance.yml`. `self-lint.yml` is this repo's
   own CI.
 - `examples/` — caller files to copy into product repos.
@@ -21,7 +21,7 @@ in [README.md](README.md).
 - Run before pushing: `actionlint .github/workflows/*.yml examples/*.yml`,
   `node tests/gates.test.js`, `python3 tests/acceptance_test.py`.
 - Check names are API: never rename a called job (`Build & Test`,
-  `Secret Scan`, `Codex Review Gate`, `QA Gate`, `Auto Merge`,
+  `Secret Scan`, `Codex Review Gate`, `QA Gate`, `Diff Quiz Gate`, `Auto Merge`,
   `Post-deploy Smoke`, `Acceptance Gate`) without updating every caller's
   branch protection.
 - Anything that executes PR code runs from a `pull_request` caller with

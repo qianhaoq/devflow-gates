@@ -915,6 +915,58 @@ const UNL_KW = 'This is a security problem.';
     });
   }
 
+
+  // ---------- Diff Quiz / understand-gate pure helpers ----------
+  {
+    const lib = require('../scripts/understand-gate-lib.js');
+    await t('understand: light diff docs/promo/lock → 1 question', async () => {
+      assert.strictEqual(lib.nQuestionsFor([{ filename: 'README.md' }]), 1);
+      assert.strictEqual(lib.nQuestionsFor([{ filename: 'docs/guide.md' }]), 1);
+      assert.strictEqual(lib.nQuestionsFor([{ filename: 'promo/banner.tsx' }]), 1);
+      assert.strictEqual(lib.nQuestionsFor([{ filename: 'package-lock.json' }]), 1);
+      assert.strictEqual(lib.nQuestionsFor([
+        { filename: '.github/workflows/ci.yml', patch: '-    uses: actions/checkout@v3\n+    uses: actions/checkout@v4\n' },
+      ]), 1);
+    });
+    await t('understand: code change → 2 questions', async () => {
+      assert.strictEqual(lib.nQuestionsFor([{ filename: 'src/app.ts' }]), 2);
+      assert.strictEqual(lib.nQuestionsFor([
+        { filename: 'README.md' },
+        { filename: 'src/app.ts' },
+      ]), 2);
+    });
+    await t('understand: parse Answer / Override', async () => {
+      assert.deepStrictEqual(lib.parseAnswerComment('## Diff Quiz Answer\n1. A\n2. hello world\n'), { 1: 'A', 2: 'hello world' });
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：试验误判，已人工确认无风险'), '理由：试验误判，已人工确认无风险');
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n'), null);
+      assert.strictEqual(lib.parseAnswerComment('nope'), null);
+    });
+    await t('understand: gradeChoice + extractQuizMeta', async () => {
+      assert.strictEqual(lib.gradeChoice('A', 'a'), true);
+      assert.strictEqual(lib.gradeChoice('B', 'A'), false);
+      const body = lib.formatQuizComment({
+        sha: 'abc1234deadbeef',
+        questions: [{ type: 'choice', prompt: '改了什么？', choices: [{ id: 'A', text: 'x' }, { id: 'B', text: 'y' }], answer: 'A', rubric: '' }],
+      });
+      assert.ok(body.includes(lib.QUIZ_MARKER));
+      const meta = lib.extractQuizMeta(body);
+      assert.strictEqual(meta.sha, 'abc1234deadbeef');
+      assert.strictEqual(meta.questions[0].answer, 'A');
+    });
+    await t('understand: workflow job name is Diff Quiz Gate', async () => {
+      const yml = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/understand-gate.yml'), 'utf8');
+      assert.ok(/\n    name: Diff Quiz Gate\n/.test(yml), 'evaluate job name must be exactly Diff Quiz Gate');
+      assert.ok(yml.includes("name: Diff Quiz Gate Refresh"), 'refresh job name');
+      const ex = fs.readFileSync(path.join(__dirname, '..', 'examples/understand-gate.yml'), 'utf8');
+      assert.ok(/^  understand:\n/m.test(ex), 'caller job id must be understand');
+      const onBlock = ex.split(/^jobs:/m)[0];
+      const typesLine = (onBlock.match(/pull_request_target:[\s\S]*?types:\s*\[([^\]]+)\]/) || [])[1] || '';
+      assert.ok(!/labeled|unlabeled/.test(typesLine), 'caller must not listen labeled/unlabeled');
+      assert.ok(!/skip-understanding-gate/.test(yml) || yml.includes('禁止'), 'no skip label support');
+    });
+  }
+
+
   if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
   console.log('all passed');
 })();
