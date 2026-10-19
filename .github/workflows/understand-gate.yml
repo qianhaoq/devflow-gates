@@ -1,0 +1,614 @@
+# Diff Quiz Gate — reusable "understand before merge" status check.
+#
+# Called from a repo's own gate workflow (see examples/understand-gate.yml):
+#   uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@<sha>
+#
+# Check name on a PR is "<caller job name> / <called job name>"; with the
+# example caller (job id `understand`) this produces:
+#   "understand / Diff Quiz Gate"
+# Use that exact string in branch protection / Rulesets and in
+# auto-merge.yml's `required_checks` input.
+#
+# Two-week trial product rules:
+#   - 2 quiz questions per PR (1 if docs-only / lock pin / promo-only /
+#     workflow pin-bump). Prefer multiple choice; short answer allowed.
+#   - Questions target "what changed / what could break" (+ affected modules).
+#   - CI generates via 智谱 GLM (Anthropic-compatible). Secrets: GLM_API_KEY
+#     or ZHIPU_API_KEY (never commit keys).
+#   - Author (or reviewer) answers in a PR comment:
+#       ## Diff Quiz Answer
+#       1. ...
+#       2. ...
+#   - All questions must pass. Choice = exact match; short = same-model
+#     semantic grade (unsure → fail). Escape hatch: comment
+#       ## Diff Quiz Override
+#       理由: ...
+#     (NO skip-understanding-gate label.)
+#   - Fail closed on missing secret / LLM error / incomplete answers.
+#
+# Security:
+#   - Caller uses pull_request_target so YAML + secrets come from the trusted
+#     base branch. This job never checks out the PR head and never runs PR
+#     code; diff is read via pulls.listFiles only.
+#   - issue_comment / workflow_run conclusions do not attach to the PR head
+#     check — the Refresh job re-runs a head-attached evaluate run instead.
+#
+# Cancel-heal (A1): caller self-listens workflow_run(completed) and routes
+# cancelled completions to the refresh job (same caps as QA/Codex).
+
+name: Reusable Diff Quiz Gate
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: >-
+          Runner for jobs (default ubuntu-latest). Pass a single label or a
+          JSON array string such as ["self-hosted","linux","x64"].
+        required: false
+        type: string
+        default: ubuntu-latest
+      glm_model:
+        description: '智谱模型名（Anthropic 兼容端点）'
+        required: false
+        type: string
+        default: 'glm-5.3-flash'
+      glm_base_url:
+        description: 'Anthropic-compatible messages endpoint'
+        required: false
+        type: string
+        default: 'https://open.bigmodel.cn/api/anthropic/v1/messages'
+      max_diff_chars:
+        description: 'Diff 送入出题模型的最大字符数'
+        required: false
+        type: number
+        default: 80000
+    secrets:
+      GLM_API_KEY:
+        description: '智谱 GLM Coding Plan / BigModel API key（优先）'
+        required: false
+      ZHIPU_API_KEY:
+        description: '备用：与 GLM_API_KEY 同义'
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  understand-gate:
+    name: Diff Quiz Gate
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: read
+    # Head-attached events only. issue_comment / workflow_run go to refresh.
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Evaluate Diff Quiz
+        uses: actions/github-script@v7
+        env:
+          GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          GLM_MODEL: ${{ inputs.glm_model }}
+          GLM_BASE_URL: ${{ inputs.glm_base_url }}
+          MAX_DIFF_CHARS: ${{ inputs.max_diff_chars }}
+        with:
+          script: |
+            const QUIZ_MARKER = '<!-- diff-quiz-gate:quiz -->';
+            const ANSWER_HEADER = '## Diff Quiz Answer';
+            const OVERRIDE_HEADER = '## Diff Quiz Override';
+            const META_RE = /<!--\s*diff-quiz-meta:([\s\S]*?)-->/;
+            const DOC_RE = /(?:^|\/)(?:README[^/]*|LICENSE[^/]*|CHANGELOG[^/]*|.*\.mdx?)$/i;
+            const DOCS_DIR_RE = /(?:^|\/)docs\//;
+            const LOCK_RE = /(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|uv\.lock|poetry\.lock|Pipfile\.lock|composer\.lock)$/;
+            const PROMO_RE = /(?:^|\/)(?:promo|marketing)(?:\/|$)/i;
+            const WORKFLOW_RE = /^\.github\/workflows\/[^/]+\.ya?ml$/i;
+
+            function isDocPath(p) {
+              const s = String(p || '').replace(/\\/g, '/');
+              return DOC_RE.test(s) || DOCS_DIR_RE.test(s);
+            }
+            function isLockPath(p) { return LOCK_RE.test(String(p || '').replace(/\\/g, '/')); }
+            function isPromoPath(p) { return PROMO_RE.test(String(p || '').replace(/\\/g, '/')); }
+            function isWorkflowPath(p) { return WORKFLOW_RE.test(String(p || '').replace(/\\/g, '/')); }
+            function isPinBumpPatch(patch) {
+              if (!patch) return false;
+              const lines = String(patch).split('\n').filter((l) => /^[+-]/.test(l) && !/^[+-]{3}/.test(l));
+              if (lines.length === 0) return false;
+              return lines.every((l) => /uses:\s*\S+@[\w./-]+/.test(l) || /^\+\+\+|^---/.test(l));
+            }
+            function isLightDiff(files) {
+              const list = Array.isArray(files) ? files : [];
+              if (list.length === 0) return true;
+              const paths = list.map((f) => f.filename || f.path || '');
+              if (paths.every(isDocPath)) return true;
+              if (paths.every(isPromoPath)) return true;
+              if (paths.every(isLockPath)) return true;
+              if (paths.every((p, i) => isWorkflowPath(p) && isPinBumpPatch(list[i].patch || ''))) return true;
+              return paths.every((p, i) =>
+                isDocPath(p) || isPromoPath(p) || isLockPath(p) ||
+                (isWorkflowPath(p) && isPinBumpPatch(list[i].patch || '')));
+            }
+            function nQuestionsFor(files) { return isLightDiff(files) ? 1 : 2; }
+            function normalizeChoice(s) {
+              return String(s || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+            }
+            function parseAnswerComment(body) {
+              const text = String(body || '');
+              if (!text.includes(ANSWER_HEADER)) return null;
+              const after = text.split(ANSWER_HEADER).slice(1).join(ANSWER_HEADER);
+              const answers = {};
+              const re = /^\s*(\d+)\s*[.):、]\s*(.+?)\s*$/gm;
+              let m;
+              while ((m = re.exec(after)) !== null) answers[Number(m[1])] = m[2].trim();
+              return Object.keys(answers).length ? answers : null;
+            }
+            function parseOverrideComment(body) {
+              const text = String(body || '');
+              if (!text.includes(OVERRIDE_HEADER)) return null;
+              const reason = text.split(OVERRIDE_HEADER).slice(1).join(OVERRIDE_HEADER).replace(/^#+\s*/gm, '').trim();
+              if (!reason || reason.length < 3) return null;
+              return reason;
+            }
+            function extractQuizMeta(body) {
+              const m = META_RE.exec(String(body || ''));
+              if (!m) return null;
+              try { return JSON.parse(m[1].trim()); } catch { return null; }
+            }
+            function gradeChoice(expected, given) {
+              return normalizeChoice(expected) === normalizeChoice(given);
+            }
+            function truncateDiff(text, maxChars) {
+              const s = String(text || '');
+              const lim = maxChars || 80000;
+              if (s.length <= lim) return s;
+              return s.slice(0, lim) + `\n\n…[diff truncated at ${lim} chars]`;
+            }
+            function buildDiffText(files) {
+              const parts = [];
+              for (const f of files || []) {
+                const name = f.filename || f.path || 'unknown';
+                parts.push(`--- a/${name}\n+++ b/${name}`);
+                if (f.patch) parts.push(f.patch);
+                else parts.push(`(no patch; status=${f.status || 'unknown'} additions=${f.additions || 0} deletions=${f.deletions || 0})`);
+                parts.push('');
+              }
+              return truncateDiff(parts.join('\n'), Number(process.env.MAX_DIFF_CHARS || 80000));
+            }
+            function formatQuizComment({ sha, questions }) {
+              const n = questions.length;
+              const shortSha = String(sha).slice(0, 7);
+              const lines = [
+                QUIZ_MARKER,
+                `## Diff Quiz — 推送前理解门禁`,
+                '',
+                `Head: \`${shortSha}\` · 共 **${n}** 题`,
+                '',
+                '请确认你理解「这次改了什么 / 可能影响或破坏什么（含可能受影响的模块）」。',
+                '在本 PR 评论按下列格式作答（作者或评审人均可）：',
+                '',
+                '```',
+                ANSWER_HEADER,
+                ...questions.map((q, i) => `${i + 1}. ${q.type === 'choice' ? 'A' : '…'}`),
+                '```',
+                '',
+                '试验期逃生（必须留痕；**禁止** skip-understanding-gate label）：',
+                '```',
+                OVERRIDE_HEADER,
+                '理由：…',
+                '```',
+                '',
+              ];
+              for (let i = 0; i < questions.length; i++) {
+                const q = questions[i];
+                lines.push(`### ${i + 1}. ${q.prompt}`);
+                if (q.type === 'choice' && Array.isArray(q.choices)) {
+                  for (const c of q.choices) {
+                    lines.push(`- **${c.id || c.label}**. ${c.text || c.body || ''}`);
+                  }
+                } else {
+                  lines.push('_（短答）_');
+                }
+                lines.push('');
+              }
+              const meta = {
+                sha,
+                n,
+                questions: questions.map((q, i) => ({
+                  id: i + 1,
+                  type: q.type,
+                  answer: q.answer,
+                  rubric: q.rubric || '',
+                })),
+              };
+              lines.push(`<!-- diff-quiz-meta:${JSON.stringify(meta)} -->`);
+              return lines.join('\n');
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const apiKey = (process.env.GLM_API_KEY || process.env.ZHIPU_API_KEY || '').trim();
+            const model = (process.env.GLM_MODEL || 'glm-5.3-flash').trim();
+            const baseUrl = (process.env.GLM_BASE_URL || 'https://open.bigmodel.cn/api/anthropic/v1/messages').trim();
+
+            async function summary(text) {
+              try { await core.summary.addRaw(text + '\n').write(); }
+              catch (err) { core.info(`(job summary unavailable: ${err.message})`); }
+            }
+            function statsLine(obj) {
+              return '```json\n' + JSON.stringify(obj) + '\n```';
+            }
+
+            async function resolvePrNumber() {
+              if (context.payload.pull_request?.number) return context.payload.pull_request.number;
+              if (context.eventName === 'workflow_dispatch') {
+                const n = Number(context.payload.inputs?.pr_number);
+                return Number.isInteger(n) && n > 0 ? n : null;
+              }
+              return null;
+            }
+
+            async function callGlm(system, user, maxTokens = 2048) {
+              if (!apiKey) {
+                throw new Error('缺少 LLM secret：请在仓库 Settings → Secrets 添加 GLM_API_KEY 或 ZHIPU_API_KEY');
+              }
+              const res = await fetch(baseUrl, {
+                method: 'POST',
+                headers: {
+                  'content-type': 'application/json',
+                  'x-api-key': apiKey,
+                  'anthropic-version': '2023-06-01',
+                },
+                body: JSON.stringify({
+                  model,
+                  max_tokens: maxTokens,
+                  system,
+                  messages: [{ role: 'user', content: user }],
+                }),
+              });
+              const text = await res.text();
+              let data;
+              try { data = JSON.parse(text); } catch {
+                throw new Error(`GLM 响应非 JSON (HTTP ${res.status})`);
+              }
+              if (!res.ok) {
+                const msg = data?.error?.message || data?.msg || text.slice(0, 200);
+                throw new Error(`GLM HTTP ${res.status}: ${msg}`);
+              }
+              const blocks = data.content || [];
+              const out = blocks.filter((b) => b.type === 'text').map((b) => b.text).join('\n').trim();
+              if (!out) throw new Error('GLM 返回空文本');
+              return out;
+            }
+
+            function parseJsonFromModel(text) {
+              const s = String(text || '').trim();
+              const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+              const raw = fence ? fence[1].trim() : s;
+              const start = raw.indexOf('{');
+              const end = raw.lastIndexOf('}');
+              if (start < 0 || end <= start) throw new Error('模型未返回 JSON 对象');
+              return JSON.parse(raw.slice(start, end + 1));
+            }
+
+            async function generateQuiz(diffText, n) {
+              const system = `你是严格的代码评审出题助手。根据 PR diff 出 ${n} 道题，考查作者是否理解「这次改了什么」以及「可能影响或破坏什么（含可能受影响的模块）」。不要 trivia。优先选择题。只输出 JSON。`;
+              const user = [
+                '请输出 JSON，schema:',
+                '{',
+                '  "questions": [',
+                '    {',
+                '      "type": "choice" | "short",',
+                '      "prompt": "题干（中文）",',
+                '      "choices": [{"id":"A","text":"..."},{"id":"B","text":"..."},{"id":"C","text":"..."},{"id":"D","text":"..."}],',
+                '      "answer": "A",',
+                '      "rubric": "短答评分要点（选择题可空）"',
+                '    }',
+                '  ]',
+                '}',
+                `要求：正好 ${n} 题；选择题必须 3–4 选项且 answer 为选项 id；干扰项要合理。`,
+                '--- DIFF ---',
+                diffText,
+              ].join('\n');
+              const raw = await callGlm(system, user, 4096);
+              const parsed = parseJsonFromModel(raw);
+              const qs = Array.isArray(parsed.questions) ? parsed.questions : [];
+              if (qs.length < n) throw new Error(`出题数量不足：得到 ${qs.length}，需要 ${n}`);
+              return qs.slice(0, n).map((q) => {
+                const type = q.type === 'short' ? 'short' : 'choice';
+                if (type === 'choice') {
+                  if (!Array.isArray(q.choices) || q.choices.length < 2) {
+                    throw new Error('选择题缺少选项');
+                  }
+                  if (!q.answer) throw new Error('选择题缺少 answer');
+                }
+                return {
+                  type,
+                  prompt: String(q.prompt || '').trim() || '（无题干）',
+                  choices: q.choices,
+                  answer: String(q.answer || '').trim(),
+                  rubric: String(q.rubric || '').trim(),
+                };
+              });
+            }
+
+            async function gradeShort(question, given) {
+              const system = '你是严格的阅卷助手。只输出 JSON：{"verdict":"pass"|"fail"|"unsure","reason":"..."}。不确定就 unsure。';
+              const user = `题干：${question.prompt}\n评分要点：${question.rubric || question.answer}\n考生作答：${given}\n请判定。`;
+              const raw = await callGlm(system, user, 512);
+              const parsed = parseJsonFromModel(raw);
+              const v = String(parsed.verdict || 'unsure').toLowerCase();
+              if (v === 'pass') return { ok: true, reason: parsed.reason || 'pass' };
+              return { ok: false, reason: parsed.reason || v };
+            }
+
+            const prNumber = await resolvePrNumber();
+            if (context.eventName === 'workflow_dispatch' && prNumber == null) {
+              await summary('### Diff Quiz Gate\n\n未通过理解门禁：workflow_dispatch 的 pr_number 无效。');
+              core.setFailed('未通过理解门禁：invalid pr_number');
+              return;
+            }
+            if (prNumber == null) {
+              core.info('No resolvable PR — nothing to gate');
+              await summary('### Diff Quiz Gate\n\nnothing to gate');
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (pr.state !== 'open') {
+              core.info(`PR #${prNumber} is ${pr.state} — nothing to gate`);
+              await summary(`### Diff Quiz Gate\n\nPR #${prNumber} ${pr.state}`);
+              return;
+            }
+            if (pr.draft) {
+              await summary('### Diff Quiz Gate\n\n未通过理解门禁：草稿 PR 不评估（ready for review 后再测）。\n\n' + statsLine({ result: 'blocked', reason: 'draft', pr: prNumber }));
+              core.setFailed('未通过理解门禁：draft PR');
+              return;
+            }
+
+            const headSha = pr.head.sha;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+            const nQ = nQuestionsFor(files);
+            const diffText = buildDiffText(files);
+
+            // Load issue comments (paginated)
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number: prNumber, per_page: 100,
+            });
+
+            // Newest override wins
+            let overrideReason = null;
+            for (let i = comments.length - 1; i >= 0; i--) {
+              const r = parseOverrideComment(comments[i].body);
+              if (r) { overrideReason = r; break; }
+            }
+            if (overrideReason) {
+              const msg = `Diff Quiz Override 接受（试验期逃生留痕）。理由：${overrideReason.slice(0, 500)}`;
+              core.info(msg);
+              await summary(`### Diff Quiz Gate\n\n✅ 通过（Override）\n\n${msg}\n\n` + statsLine({ result: 'overridden', pr: prNumber, sha: headSha, n_questions: nQ }));
+              return;
+            }
+
+            // Find sticky quiz for this head
+            let quizComment = null;
+            let meta = null;
+            for (let i = comments.length - 1; i >= 0; i--) {
+              const c = comments[i];
+              if (!String(c.body || '').includes(QUIZ_MARKER)) continue;
+              const m = extractQuizMeta(c.body);
+              if (m && m.sha === headSha) { quizComment = c; meta = m; break; }
+            }
+
+            if (!meta) {
+              let questions;
+              try {
+                questions = await generateQuiz(diffText, nQ);
+              } catch (err) {
+                await summary(`### Diff Quiz Gate\n\n未通过理解门禁：出题失败 — ${err.message}\n\n` + statsLine({ result: 'blocked', reason: 'generate_failed', pr: prNumber, sha: headSha, error: String(err.message).slice(0, 200) }));
+                core.setFailed(`未通过理解门禁：出题失败 — ${err.message}`);
+                return;
+              }
+              const body = formatQuizComment({ sha: headSha, questions });
+              // Update an older quiz comment if any, else create
+              let old = null;
+              for (let i = comments.length - 1; i >= 0; i--) {
+                if (String(comments[i].body || '').includes(QUIZ_MARKER)) { old = comments[i]; break; }
+              }
+              if (old) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: old.id, body });
+                core.info(`Updated quiz comment ${old.id} for ${headSha.slice(0, 7)}`);
+              } else {
+                const { data: created } = await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+                core.info(`Posted quiz comment ${created.id} for ${headSha.slice(0, 7)}`);
+              }
+              meta = extractQuizMeta(body);
+              await summary(`### Diff Quiz Gate\n\n未通过理解门禁：已出题（${nQ} 题），等待 \`## Diff Quiz Answer\` 评论。\n\n` + statsLine({ result: 'blocked', reason: 'awaiting_answer', pr: prNumber, sha: headSha, n_questions: nQ }));
+              core.setFailed('未通过理解门禁：等待作答');
+              return;
+            }
+
+            // Parse newest Answer comment
+            let answers = null;
+            for (let i = comments.length - 1; i >= 0; i--) {
+              const a = parseAnswerComment(comments[i].body);
+              if (a) { answers = a; break; }
+            }
+            if (!answers) {
+              await summary(`### Diff Quiz Gate\n\n未通过理解门禁：请按格式评论 \`## Diff Quiz Answer\`。\n\n` + statsLine({ result: 'blocked', reason: 'no_answer', pr: prNumber, sha: headSha, n_questions: meta.n }));
+              core.setFailed('未通过理解门禁：无作答评论');
+              return;
+            }
+
+            const qs = meta.questions || [];
+            const results = [];
+            for (const q of qs) {
+              const given = answers[q.id];
+              if (given == null || String(given).trim() === '') {
+                results.push({ id: q.id, ok: false, reason: '未作答' });
+                continue;
+              }
+              if (q.type === 'choice') {
+                const ok = gradeChoice(q.answer, given);
+                results.push({ id: q.id, ok, reason: ok ? 'choice match' : `期望 ${q.answer}，得到 ${given}` });
+              } else {
+                try {
+                  const g = await gradeShort(q, given);
+                  results.push({ id: q.id, ok: g.ok, reason: g.reason });
+                } catch (err) {
+                  results.push({ id: q.id, ok: false, reason: `短答判分失败：${err.message}` });
+                }
+              }
+            }
+            const allOk = results.length === qs.length && results.every((r) => r.ok);
+            const detail = results.map((r) => `${r.id}: ${r.ok ? '✅' : '❌'} ${r.reason}`).join('\n');
+            if (allOk) {
+              await summary(`### Diff Quiz Gate\n\n✅ 通过理解门禁\n\n${detail}\n\n` + statsLine({ result: 'passed', pr: prNumber, sha: headSha, n_questions: qs.length }));
+              core.info('Diff Quiz passed');
+              return;
+            }
+            await summary(`### Diff Quiz Gate\n\n未通过理解门禁\n\n${detail}\n\n若模型误判，可评论 \`## Diff Quiz Override\` + 理由（试验期逃生，留痕统计）。\n\n` + statsLine({ result: 'blocked', reason: 'grade_failed', pr: prNumber, sha: headSha, n_questions: qs.length, results }));
+            core.setFailed('未通过理解门禁：答题未全部通过');
+
+  understand-gate-refresh:
+    name: Diff Quiz Gate Refresh
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 5
+    if: >-
+      github.event_name == 'issue_comment' ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled')
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: write
+    steps:
+      - name: Refresh Diff Quiz gate checks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ANSWER_HEADER = '## Diff Quiz Answer';
+            const OVERRIDE_HEADER = '## Diff Quiz Override';
+            const MAX_ATTEMPTS = 3;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const triggeredId = context.eventName === 'workflow_run'
+              ? Number(context.payload.workflow_run?.id) || 0 : 0;
+
+            const { data: thisRun } = await github.rest.actions.getWorkflowRun({
+              owner, repo, run_id: context.runId,
+            });
+            const workflowId = thisRun.workflow_id;
+            core.info(`Refreshing Diff Quiz for workflow "${thisRun.name}" (id ${workflowId})`);
+
+            function isAnswerOrOverride(body) {
+              const t = String(body || '');
+              return t.includes(ANSWER_HEADER) || t.includes(OVERRIDE_HEADER) || t.trimStart().startsWith('/recheck');
+            }
+
+            let prs = [];
+            if (context.eventName === 'issue_comment') {
+              if (!context.payload.issue?.pull_request) {
+                core.info('issue_comment not on a PR — nothing');
+                return;
+              }
+              if (!isAnswerOrOverride(context.payload.comment?.body)) {
+                core.info('comment is not Diff Quiz Answer/Override/recheck — nothing');
+                return;
+              }
+              const { data: pr } = await github.rest.pulls.get({
+                owner, repo, pull_number: context.payload.issue.number,
+              });
+              if (pr.state === 'open') prs = [pr];
+            } else if (context.eventName === 'workflow_run') {
+              const wr = context.payload.workflow_run;
+              if (!wr || wr.conclusion !== 'cancelled') {
+                core.info('not a cancelled workflow_run — nothing');
+                return;
+              }
+              for (const cand of wr.pull_requests || []) {
+                const { data: candPr } = await github.rest.pulls.get({ owner, repo, pull_number: cand.number });
+                if (candPr.state === 'open') prs.push(candPr);
+              }
+              if (prs.length === 0 && wr.event === 'pull_request') {
+                const open = await github.paginate(github.rest.pulls.list, { owner, repo, state: 'open', per_page: 100 });
+                prs = open.filter((p) => p.head.sha === wr.head_sha);
+              }
+              if (prs.length === 0) {
+                core.info(`Cancelled run ${wr.id} matches no open PR`);
+                return;
+              }
+            }
+
+            for (const pr of prs) {
+              const headSha = pr.head.sha;
+              // Prefer re-running the triggering cancelled run when present
+              if (triggeredId) {
+                try {
+                  const { data: tr } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: triggeredId });
+                  if (tr.status === 'completed' && tr.conclusion === 'cancelled' && (tr.run_attempt || 1) < MAX_ATTEMPTS) {
+                    // Yield if a newer in-flight or success exists on this head for this workflow
+                    const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                      owner, repo, workflow_id: workflowId, per_page: 30,
+                    });
+                    const newer = runs.find((r) =>
+                      r.id !== triggeredId &&
+                      r.head_sha === headSha &&
+                      (r.status === 'in_progress' || r.status === 'queued' || r.conclusion === 'success') &&
+                      new Date(r.created_at) > new Date(tr.created_at)
+                    );
+                    if (newer) {
+                      core.info(`Yield heal: newer run ${newer.id} on ${headSha.slice(0, 7)}`);
+                      continue;
+                    }
+                    await github.rest.actions.reRunWorkflow({ owner, repo, run_id: triggeredId });
+                    core.info(`Re-ran cancelled run ${triggeredId} for PR #${pr.number}`);
+                    return; // one re-run per refresh
+                  }
+                } catch (err) {
+                  core.warning(`cancel-heal lookup failed: ${err.message}`);
+                }
+              }
+
+              // issue_comment path: re-run latest completed head-attached evaluate run
+              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner, repo, workflow_id: workflowId, per_page: 50,
+              });
+              const headRuns = runs
+                .filter((r) =>
+                  r.head_sha === headSha &&
+                  (r.event === 'pull_request_target' || r.event === 'pull_request' || r.event === 'workflow_dispatch') &&
+                  r.status === 'completed' &&
+                  (r.run_attempt || 1) < MAX_ATTEMPTS
+                )
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+              const inFlight = runs.find((r) =>
+                r.head_sha === headSha && (r.status === 'in_progress' || r.status === 'queued')
+              );
+              if (inFlight) {
+                core.info(`PR #${pr.number}: run already in flight (${inFlight.id})`);
+                continue;
+              }
+
+              // Prefer failed, else cancelled, else success (to re-grade after new answer)
+              const failed = headRuns.find((r) => r.conclusion === 'failure');
+              const cancelled = headRuns.find((r) => r.conclusion === 'cancelled');
+              const success = headRuns.find((r) => r.conclusion === 'success');
+              const target = failed || cancelled || success;
+              if (!target) {
+                core.info(`PR #${pr.number}: no re-runnable head gate run`);
+                continue;
+              }
+              await github.rest.actions.reRunWorkflow({ owner, repo, run_id: target.id });
+              core.info(`Re-ran run ${target.id} (${target.conclusion}) for PR #${pr.number}`);
+              return; // one re-run per refresh
+            }

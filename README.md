@@ -16,7 +16,7 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 可复用工作流里 job 的检查名（check run 名）显示为
 **`<调用方 job 名> / <被调用 job 名>`**。调用方 job 不写 `name:` 时，job 名
 就是 job id。被调用的 job 名固定为：`Build & Test`、`Secret Scan`、
-`Codex Review Gate`、`QA Gate`、`Auto Merge`、`Post-deploy Smoke`。
+`Codex Review Gate`、`QA Gate`、`Diff Quiz Gate`、`Auto Merge`、`Post-deploy Smoke`。
 
 因此 [examples/](examples/) 里的示例调用方（job id 分别为 `ci`、`codex`、
 `qa`）在 PR 上产生的检查名是：
@@ -30,6 +30,9 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 | `examples/qa-gate.yml` | `qa` | `qa / QA Gate` |
 | `examples/qa-gate.yml` | `qa-refresh` | `qa-refresh / QA Gate Refresh`（可选，示例默认注释掉；仅 schedule 运行，**不**挂在 PR 检查上） |
 | `examples/qa-gate.yml` | `qa-cancel-heal` | `qa-cancel-heal / QA Gate Refresh`（自听 `workflow_run`，仅 cancelled 完成时触发，**默认启用**，**不**挂在 PR 检查上） |
+| `examples/understand-gate.yml` | `understand` | `understand / Diff Quiz Gate` |
+| `examples/understand-gate.yml` | `understand-refresh` | `understand-refresh / Diff Quiz Gate Refresh`（Answer/Override 评论触发，**不**挂在 PR 检查上） |
+| `examples/understand-gate.yml` | `understand-cancel-heal` | `understand-cancel-heal / Diff Quiz Gate Refresh`（自听 cancelled，**不**挂在 PR 检查上） |
 | `examples/auto-merge.yml` | `auto-merge` | `auto-merge / Auto Merge` |
 | `examples/smoke.yml` | `smoke` | `smoke / Post-deploy Smoke` |
 | `examples/acceptance.yml` | `acceptance` | `acceptance / Acceptance Gate`（另有辅助检查 `Acceptance Config` / `Acceptance Measure`；M1 仅观察，**不要**加入分支保护） |
@@ -50,6 +53,15 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 
 如果你改了调用方的 job id 或加了 `name:`，检查名会随之改变，上面两处必须
 同步更新。
+
+
+### Diff Quiz Gate（`understand-gate.yml`）— 推送前理解门禁（两周试验）
+
+调用方 job id `understand` → 检查名 **`understand / Diff Quiz Gate`**。
+
+- 对 PR diff 自动出 1–2 道理解题（文档/pin/promo 为 1 题），作者（或评审）在评论用 `## Diff Quiz Answer` 作答；试验期逃生用 `## Diff Quiz Override` + 理由（**禁止** skip label）。
+- 出题模型：智谱 GLM（`secrets.GLM_API_KEY` 或 `ZHIPU_API_KEY`）。门禁用 `pull_request_target`，只通过 API 读 diff，不 checkout PR。
+- 触发不含 `labeled`/`unlabeled`，避免幽灵 expected check。
 
 ## 安全模型
 
