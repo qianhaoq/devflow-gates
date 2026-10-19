@@ -98,3 +98,10 @@ in [README.md](README.md).
 - When a gate turns green on a PR (CI, Codex, QA/editorial, Acceptance),
   notify **the product bot** and **专业测试** with the PR URL, head SHA, and
   which gates are green.
+
+## Coding 工具顺序（2026-10-20 起）
+
+1. **默认用本机 Codex CLI**（ChatGPT 账号登录），模型 `gpt-6.1-sol`（`~/.codex/config.toml`）。
+2. Codex 剩余额度 **≤ 20%**（5h / 周窗口取更紧者）时切回：`coding glm`（一般代码）/ `coding kimi`（前端/交互/UI）。
+3. 查额度：`/home/box/.coding-plans/codex-quota.sh`（退出码 0=codex，1=切 glm/kimi，2=未知；`--json`、`--probe`），或 Codex TUI 内 `/status`。
+4. 凭证 `~/.codex/auth.json` 及任何 API key **绝不打印、外传或提交**；`.codex/`、`auth.json` 已在 `.gitignore`。
