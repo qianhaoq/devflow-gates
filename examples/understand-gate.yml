@@ -69,6 +69,8 @@ jobs:
       ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
 
   understand-refresh:
+    # reusable understand-gate.yml@430987e 顶层/nested 要 issues+pull-requests: write；
+    # caller 只给 read → startup_failure: "only allowed read, requesting write"
     if: >-
       github.event_name == 'issue_comment' && github.event.issue.pull_request &&
       (contains(github.event.comment.body, '## Diff Quiz Answer') ||
@@ -76,8 +78,8 @@ jobs:
        startsWith(github.event.comment.body, '/recheck'))
     permissions:
       contents: read
-      pull-requests: read
-      issues: read
+      pull-requests: write
+      issues: write
       actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@main
     with:

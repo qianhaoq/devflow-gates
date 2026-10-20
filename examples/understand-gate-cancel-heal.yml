@@ -9,6 +9,7 @@
 # 本文件只监听主门禁 "Diff Quiz Gate" 的 completed；仅 cancelled 且
 # 原触发事件不是 push 时跑 heal（与原 understand-cancel-heal job 逻辑一致）。
 # workflow_run 只在默认分支上的文件生效；链条上限 3 层，不会循环。
+# 调用 reusable 的 job 必须 pull-requests/issues: write（read → startup_failure）。
 
 name: Diff Quiz Gate Cancel Heal
 
