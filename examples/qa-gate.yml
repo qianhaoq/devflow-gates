@@ -71,11 +71,11 @@ permissions:
 # cancelling push group: a re-run of an OLD head's synchronize run would
 # otherwise cancel the newest head's evaluation.
 concurrency:
-  # Shared 'prt' group for all pull_request_target (evaluate + label-ack)
-  # so a stale mirror cannot outrank a live evaluator (see mirror workflow).
+  # Unique run-{id} for non-push PRT (incl. label-ack): a shared pending
+  # queue would let triage labels drop a pending qa-passed evaluate.
   group: >-
     qa-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || 'none' }}-${{
-    (github.event_name == 'pull_request_target' && github.run_attempt == '1') && 'prt' ||
+    (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
     (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled') && format('heal-{0}', github.event.workflow_run.id) ||
     format('run-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
@@ -114,6 +114,7 @@ jobs:
     permissions:
       contents: read
       checks: write
+      actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@main
     with:
       check_name: 'qa / QA Gate'

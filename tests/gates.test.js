@@ -1026,12 +1026,16 @@ const UNL_KW = 'This is a security problem.';
       const src = scripts('mirror-required-check.yml')[0];
       const created = [];
       const infos = [];
+      const reruns = [];
       const github = {
         paginate: async () => checks,
         rest: {
           checks: {
             listForRef: {},
             create: async (args) => { created.push(args); return { data: args }; },
+          },
+          actions: {
+            reRunWorkflow: async (args) => { reruns.push(args); return {}; },
           },
         },
       };
@@ -1046,7 +1050,7 @@ const UNL_KW = 'This is a security problem.';
       };
       await new AsyncFunction('github', 'context', 'core', 'process', src)(
         github, context, core, { env: { CHECK_NAME: checkName } });
-      return { created, infos };
+      return { created, infos, reruns };
     }
     await t('mirror: copies latest by created_at (not completed_at)', async () => {
       // Older green finishes AFTER newer red — created_at must win (red).
@@ -1100,15 +1104,32 @@ const UNL_KW = 'This is a security problem.';
       assert.deepStrictEqual(created, []);
       assert.ok(infos.some((m) => /No pull_request/.test(m)));
     });
-    await t('codex/qa callers: PRT evaluate+ack share concurrency group', () => {
+    await t('mirror: cancelled → heal re-run source, never synthetic cancelled', async () => {
+      const { created, infos, reruns } = await runMirror({
+        checks: [{
+          id: 7, status: 'completed', conclusion: 'cancelled', created_at: '2026-10-20T01:00:00Z',
+          details_url: 'https://github.com/o/r/actions/runs/4242',
+        }],
+      });
+      assert.deepStrictEqual(created, []);
+      assert.deepStrictEqual(reruns, [{ owner: 'o', repo: 'r', run_id: 4242 }]);
+      assert.ok(infos.some((m) => /heal re-run/.test(m)));
+    });
+    await t('mirror: cancelled without run URL → no create', async () => {
+      const { created, reruns, infos } = await runMirror({
+        checks: [{ id: 7, status: 'completed', conclusion: 'cancelled', created_at: '2026-10-20T01:00:00Z' }],
+      });
+      assert.deepStrictEqual(created, []);
+      assert.deepStrictEqual(reruns, []);
+      assert.ok(infos.some((m) => /without a workflow run URL/.test(m)));
+    });
+    await t('codex/qa callers: non-push PRT keep unique run-id concurrency (no drop queue)', () => {
       for (const f of ['codex-gate.yml', 'qa-gate.yml']) {
         const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', f), 'utf8');
         const onBlock = ex.split(/^jobs:/m)[0];
-        assert.ok(/&& 'prt'/.test(onBlock) || /&& "prt"/.test(onBlock), f + ' must share prt concurrency for all PRT');
-        // push-class still the only cancel-in-progress case
-        assert.ok(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request_target'/.test(onBlock)
-          || onBlock.includes("cancel-in-progress: ${{ github.event_name == 'pull_request_target'"),
-          f + ' cancel-in-progress still gated');
+        assert.ok(!/&& 'prt'/.test(onBlock), f + ' must NOT share a dropping prt pending queue');
+        assert.ok(/format\('run-\{0\}'/.test(onBlock) || onBlock.includes("format('run-{0}'"),
+          f + ' unique run-id group for non-push');
       }
     });
   }

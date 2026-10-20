@@ -90,13 +90,13 @@ permissions:
 # cancelling push group: a re-run of an OLD head's synchronize run would
 # otherwise cancel the newest head's evaluation.
 concurrency:
-  # All pull_request_target runs (push + labels + ready/draft) share one
-  # 'prt' group so evaluate and label-ack cannot race: a stale mirror must
-  # never become the newest same-named check ahead of a live evaluator.
-  # cancel-in-progress only for push-class (new commit cancels older head).
+  # Label evaluate + label-ack each get their own run-{id} group (never
+  # cancel / replace each other): a shared pending queue would let an
+  # unrelated-label ack silently drop a pending skip-codex-gate evaluate.
+  # Stale-mirror races are handled inside mirror-required-check (revalidate).
   group: >-
     codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || 'none' }}-${{
-    (github.event_name == 'pull_request_target' && github.run_attempt == '1') && 'prt' ||
+    (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
     (github.event_name == 'issue_comment' &&
       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector' ||
        startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
@@ -147,6 +147,7 @@ jobs:
     permissions:
       contents: read
       checks: write
+      actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@main
     with:
       # Keep in sync with the required-check name this caller produces.
