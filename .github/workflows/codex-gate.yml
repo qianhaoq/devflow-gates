@@ -57,9 +57,9 @@
 #     green→red re-run is the only uncapped one). No blind periodic re-runs: a gate that is
 #     legitimately red is left alone. A re-run preserves the original
 #     event, so the fresh conclusion re-attaches to the PR head check.
-#   - Cancel-heal (A1): the CALLER also self-listens for its own runs via
+#   - Cancel-heal (A1): a separately named companion listens for source runs via
 #     workflow_run(completed) (fires from the default branch only; GitHub
-#     caps workflow_run chains at 3 levels, so self-listening cannot loop)
+#     caps workflow_run chains at 3 levels, using a separate companion; self-listening is invalid)
 #     and routes cancelled completions (event != push) to this refresh job,
 #     which re-runs the TRIGGERING cancelled run on that head — a cancelled
 #     run cannot run its own post steps, so its completion event is the
@@ -529,7 +529,7 @@ jobs:
             const MAX_ATTEMPTS = 3;
             // Cancel-heal: the workflow_run.id whose CANCELLED completion
             // triggered this refresh (0 for every other trigger). The caller
-            // self-listens via workflow_run because a cancelled run cannot run
+            // uses a separate companion via workflow_run because a cancelled run cannot run
             // its own post steps.
             const triggeredId = context.eventName === 'workflow_run'
               ? Number(context.payload.workflow_run?.id) || 0 : 0;
@@ -540,7 +540,7 @@ jobs:
             const { data: thisRun } = await github.rest.actions.getWorkflowRun({
               owner,
               repo,
-              run_id: context.runId,
+              run_id: triggeredId || context.runId,
             });
             const workflowId = thisRun.workflow_id;
             let prs;
@@ -1160,7 +1160,7 @@ jobs:
             const MAX_ATTEMPTS = 3;
             // Cancel-heal: the workflow_run.id whose CANCELLED completion
             // triggered this refresh (0 for every other trigger). The caller
-            // self-listens via workflow_run because a cancelled run cannot run
+            // uses a separate companion via workflow_run because a cancelled run cannot run
             // its own post steps.
             const triggeredId = context.eventName === 'workflow_run'
               ? Number(context.payload.workflow_run?.id) || 0 : 0;
@@ -1171,7 +1171,7 @@ jobs:
             const { data: thisRun } = await github.rest.actions.getWorkflowRun({
               owner,
               repo,
-              run_id: context.runId,
+              run_id: triggeredId || context.runId,
             });
             const workflowId = thisRun.workflow_id;
             let prs;

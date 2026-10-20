@@ -26,12 +26,12 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 | `examples/ci.yml` | `ci` | `ci / Build & Test`、`ci / Secret Scan` |
 | `examples/codex-gate.yml` | `codex` | `codex / Codex Review Gate` |
 | `examples/codex-gate.yml` | `codex-refresh` | `codex-refresh / Codex Gate Refresh`（仅 Codex 评论 / `/recheck` 评论触发，**不**挂在 PR 检查上） |
-| `examples/codex-gate.yml` | `codex-cancel-heal` | `codex-cancel-heal / Codex Gate Refresh`（自听 `workflow_run`，仅 cancelled 完成时触发，**不**挂在 PR 检查上） |
+| `examples/codex-gate-cancel-heal.yml` | `codex-cancel-heal` | `codex-cancel-heal / Codex Gate Refresh`（独立 companion 监听 `workflow_run`，仅 cancelled 完成时触发，**不**挂在 PR 检查上） |
 | `examples/codex-gate.yml` | `codex-label-ack` | 侧车 `codex-label-ack / Mirror Required Check`；并通过 Checks API 重挂 **`codex / Codex Review Gate`**（仅无关 label） |
 | `examples/qa-gate.yml` | `qa-label-ack` | 侧车 `qa-label-ack / Mirror Required Check`；并通过 Checks API 重挂 **`qa / QA Gate`**（仅无关 label） |
 | `examples/qa-gate.yml` | `qa` | `qa / QA Gate` |
 | `examples/qa-gate.yml` | `qa-refresh` | `qa-refresh / QA Gate Refresh`（可选，示例默认注释掉；仅 schedule 运行，**不**挂在 PR 检查上） |
-| `examples/qa-gate.yml` | `qa-cancel-heal` | `qa-cancel-heal / QA Gate Refresh`（自听 `workflow_run`，仅 cancelled 完成时触发，**默认启用**，**不**挂在 PR 检查上） |
+| `examples/qa-gate-cancel-heal.yml` | `qa-cancel-heal` | `qa-cancel-heal / QA Gate Refresh`（独立 companion 监听 `workflow_run`，仅 cancelled 完成时触发，**默认启用**，**不**挂在 PR 检查上） |
 | `examples/understand-gate.yml` | `understand` | `understand / Diff Quiz Gate` |
 | `examples/understand-gate.yml` | `understand-refresh` | `understand-refresh / Diff Quiz Gate Refresh`（Answer/Override 评论触发，**不**挂在 PR 检查上） |
 | `examples/understand-gate-cancel-heal.yml` | `understand-cancel-heal` | `understand-cancel-heal / Diff Quiz Gate Refresh`（**独立**工作流 `Diff Quiz Gate Cancel Heal` 监听主门禁 completed；仅 cancelled 时触发；**禁止**写进主文件自听） |
@@ -64,7 +64,7 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 - 对 PR diff 自动出 1–2 道理解题（文档/pin/promo 为 1 题），作者（或评审）在评论用 `## Diff Quiz Answer` 作答；试验期逃生用 `## Diff Quiz Override` + 理由（**禁止** skip label）。
 - 出题模型：智谱 GLM（`secrets.GLM_API_KEY` 或 `ZHIPU_API_KEY`）。门禁用 `pull_request_target`，只通过 API 读 diff，不 checkout PR。
 - 触发不含 `labeled`/`unlabeled`，避免幽灵 expected check。
-- **⛔ 禁止自监听（P0 根治）**：caller `name: Diff Quiz Gate` 时**不得**再写 `on.workflow_run.workflows: ["Diff Quiz Gate"]`——GitHub 不允许，整份工作流 silent 失效（近期 0 秒 failure、jobs 为空即此因）。cancel-heal 必须用独立文件 [examples/understand-gate-cancel-heal.yml](examples/understand-gate-cancel-heal.yml)（`name: Diff Quiz Gate Cancel Heal`，监听主门禁 completed）。Codex/QA 示例虽仍自听且目前能跑，**不要**再复制到 understand。详见 [docs/PITFALLS.md](docs/PITFALLS.md)。
+- **⛔ 禁止自监听（P0 根治）**：caller `name: Diff Quiz Gate` 时**不得**再写 `on.workflow_run.workflows: ["Diff Quiz Gate"]`——GitHub 不允许，整份工作流 silent 失效（近期 0 秒 failure、jobs 为空即此因）。cancel-heal 必须用独立文件 [examples/understand-gate-cancel-heal.yml](examples/understand-gate-cancel-heal.yml)（`name: Diff Quiz Gate Cancel Heal`，监听主门禁 completed）。Codex、QA 同样必须安装各自独立的 `*-cancel-heal.yml` companion，禁止自监听。详见 [docs/PITFALLS.md](docs/PITFALLS.md)。
 - **⛔ refresh/heal 权限（P0）**：调用 reusable 的每个 job 必须 `pull-requests: write` + `issues: write`（含 `understand-refresh`）；只给 read 会 startup_failure（`only allowed read, requesting write`）。见 PITFALLS。
 
 ## 安全模型
@@ -182,9 +182,8 @@ pull_request_review(_comment) / PR 分支上的 workflow_dispatch；被调用方
   由 verdict 翻转驱动的重跑上限 20（避免把一个现在能通过的检查卡成红）。
   列表分页读取；head 上有进行中的运行（多为几秒内即结束的非评估事件）时
   先等待最多约 40 秒。
-- **Cancel-heal（A1，默认启用）**：示例调用方还通过
-  `workflow_run(completed)` **自听**本工作流（只在默认分支生效；GitHub 把
-  workflow_run 链条限制在 3 层内，所以自听不会循环）。某次运行被取消
+- **Cancel-heal（A1，默认启用）**：独立 companion [codex-gate-cancel-heal.yml](examples/codex-gate-cancel-heal.yml)
+  通过 `workflow_run(completed)` 监听主门禁（只在默认分支生效，禁止自监听）。某次运行被取消
   （非 push 来源）时，`codex-cancel-heal` job 走同一刷新逻辑，**只重跑被取消
   的那次运行**——被取消的运行自己跑不了 post 步骤，只能靠完成事件来触发
   补救；同样的上限（每 PR 一次、`run_attempt 3`、进行中不动）。重跑前若发现
@@ -310,9 +309,8 @@ PR 立刻把检查置为失败。
 dispatch、被跳过的事件）各自独立成组，**label 事件永远无法取消 push 评估**；
 门禁本身也不依赖这一点（见第 2 步）。见 [examples/qa-gate.yml](examples/qa-gate.yml)。
 
-**Cancel-heal（A1，默认启用）**：示例调用方通过 `workflow_run(completed)`
-**自听**本工作流（只在默认分支生效；GitHub 把 workflow_run 链条限制在 3 层
-内，所以自听不会循环）。某次运行被取消（非 push 来源）时，`qa-cancel-heal`
+**Cancel-heal（A1，默认启用）**：独立 companion [qa-gate-cancel-heal.yml](examples/qa-gate-cancel-heal.yml)
+通过 `workflow_run(completed)` 监听主门禁（只在默认分支生效，禁止自监听）。某次运行被取消（非 push 来源）时，`qa-cancel-heal`
 job 走同一刷新逻辑，**只重跑被取消的那次运行**（被取消的运行自己跑不了
 post 步骤）；同样的上限（每 PR 一次、`run_attempt 3`、进行中不动），heal
 所在并发组永不取消、绝不进入 push 的 cancel-in-progress 组。重跑前若发现
@@ -476,9 +474,14 @@ Config 解析失败时 Gate 被跳过（跳过 = 通过）。
 
 ## 从单仓库版本迁移
 
-1. 把 [examples/](examples/) 里的 5 个文件复制到目标仓库的
+1. 把 [examples/](examples/) 里所需的调用方文件复制到目标仓库的
    `.github/workflows/`，删除目标仓库里旧的单仓库版
    `codex-gate.yml` / `auto-merge.yml` / CI 文件。
+   Codex / QA / Understand 各需额外安装对应的
+   [codex-gate-cancel-heal.yml](examples/codex-gate-cancel-heal.yml)、
+   [qa-gate-cancel-heal.yml](examples/qa-gate-cancel-heal.yml)、
+   [understand-gate-cancel-heal.yml](examples/understand-gate-cancel-heal.yml)。
+   companion 的名称必须与主门禁不同，监听名称须匹配主门禁；两份文件都需合并到默认分支，禁止主门禁自监听。
 2. 按仓库改输入：`ci.yml` 的 `test_command`（及 node/python 版本、
    `setup_command`、`working_directory`）；`auto-merge.yml` 的
    `required_checks`（与示例 job id 一致则可原样使用）、`merge_method`、

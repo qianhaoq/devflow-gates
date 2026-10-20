@@ -33,7 +33,7 @@
 #   - issue_comment / workflow_run conclusions do not attach to the PR head
 #     check — the Refresh job re-runs a head-attached evaluate run instead.
 #
-# Cancel-heal (A1): caller self-listens workflow_run(completed) and routes
+# Cancel-heal (A1): a separate companion listens workflow_run(completed) and routes
 # cancelled completions to the refresh job (same caps as QA/Codex).
 
 name: Reusable Diff Quiz Gate
@@ -504,7 +504,7 @@ jobs:
               ? Number(context.payload.workflow_run?.id) || 0 : 0;
 
             const { data: thisRun } = await github.rest.actions.getWorkflowRun({
-              owner, repo, run_id: context.runId,
+              owner, repo, run_id: triggeredId || context.runId,
             });
             const workflowId = thisRun.workflow_id;
             core.info(`Refreshing Diff Quiz for workflow "${thisRun.name}" (id ${workflowId})`);
@@ -561,9 +561,10 @@ jobs:
                     });
                     const newer = runs.find((r) =>
                       r.id !== triggeredId &&
-                      r.head_sha === headSha &&
-                      (r.status === 'in_progress' || r.status === 'queued' || r.conclusion === 'success') &&
-                      new Date(r.created_at) > new Date(tr.created_at)
+                      (r.head_sha === headSha || (r.pull_requests || []).some(p => p.number === pr.number)) &&
+                      r.id !== context.runId &&
+                      (r.status !== 'completed' || r.conclusion === 'success') &&
+                      new Date(r.run_started_at || r.created_at) > new Date(tr.run_started_at || tr.created_at)
                     );
                     if (newer) {
                       core.info(`Yield heal: newer run ${newer.id} on ${headSha.slice(0, 7)}`);

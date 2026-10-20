@@ -54,9 +54,9 @@
 # / `qa-cancel-heal`). The example caller ships without a cron: every QA
 # input change is itself a pull_request_target event.
 #
-# Cancel-heal (A1, DEFAULT ON): the caller self-listens for its own runs
+# Cancel-heal (A1, DEFAULT ON): a separately named companion listens for source runs
 # via workflow_run(completed) (default branch only; GitHub caps
-# workflow_run chains at 3 levels, so self-listening cannot loop) and
+# workflow_run chains at 3 levels, using a separate companion; self-listening is invalid) and
 # routes cancelled completions (event != push) to the refresh job, which
 # re-runs the TRIGGERING cancelled run on that head — a cancelled run
 # cannot run its own post steps, so its completion event is the only
@@ -687,7 +687,7 @@ jobs:
   # Nothing is re-run while a run on that head is still in flight. Needs
   # actions:write granted by the CALLER on its schedule-path job.
   # Cancel-heal (A1) also routes here: a workflow_run(cancelled)
-  # completion of the caller workflow (the caller self-listens; a
+  # completion of the caller workflow (a companion listens; a
   # cancelled run cannot run its own post steps) resolves the PR behind
   # the cancelled run — no sweep — and re-runs the TRIGGERING run (same
   # caps: one re-run per PR, attempt 3, never while in flight).
@@ -716,7 +716,7 @@ jobs:
             const MAX_ATTEMPTS = 3;
             // Cancel-heal: the workflow_run.id whose CANCELLED completion
             // triggered this refresh (0 for schedule sweeps). The caller
-            // self-listens via workflow_run because a cancelled run cannot
+            // uses a separate companion via workflow_run because a cancelled run cannot
             // run its own post steps.
             const triggeredId = context.eventName === 'workflow_run'
               ? Number(context.payload.workflow_run?.id) || 0 : 0;
@@ -729,7 +729,7 @@ jobs:
             const { data: thisRun } = await github.rest.actions.getWorkflowRun({
               owner,
               repo,
-              run_id: context.runId,
+              run_id: triggeredId || context.runId,
             });
             const workflowId = thisRun.workflow_id;
             core.info(`Refreshing gate checks for workflow "${thisRun.name}" (id ${workflowId})`);
