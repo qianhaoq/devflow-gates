@@ -33,16 +33,19 @@ permissions:
 # cancelling push group: a re-run of an OLD head's synchronize run would
 # otherwise cancel the newest head's evaluation.
 concurrency:
-  # Label evaluation and acknowledgement never cancel each other.
+  # Shared label-{sha} is the main lock: evaluate and ack cannot run concurrently.
+  # Only relevant-label evaluate cancels running work; unrelated-label ack never does.
+  # Ack may replace a pending evaluate; mirror label-event time validation then
+  # rejects stale success with failure, rather than bypassing that evaluation.
   group: >-
     codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || 'none' }}-${{
     (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
     (github.event_name == 'issue_comment' &&
       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector' ||
        startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
-    (github.event_name == 'pull_request_target' && contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format(contains(fromJSON('["skip-codex-gate","no-auto-merge"]'), github.event.label.name) && 'label-eval-{0}' || 'label-ack-{0}', github.event.pull_request.head.sha) ||
+    (github.event_name == 'pull_request_target' && contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format('label-{0}', github.event.pull_request.head.sha) ||
     format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && ((github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) || contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && ((github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) || (contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && contains(fromJSON('["skip-codex-gate","no-auto-merge"]'), github.event.label.name))) }}
 
 jobs:
   codex:

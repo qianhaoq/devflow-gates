@@ -4,7 +4,7 @@
 
 | 坑 | 状态 | 根治动作 | Owner |
 | --- | --- | --- | --- |
-| Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**；方案 B **本 PR 合入后完成** | B：相关 label 真评估 + 无关 label `mirror-required-check`；PR+SHA `label-eval-{sha}` / `label-ack-{sha}` 分组，ack 不可取消真评估；success 前读取当前相关标签和 issue events，变化或无法确认则 post failure；保留创建前校验；cancelled heal 加 attempt>=3 上限、PR 提示及同 SHA in-flight guard | 专业研发 |
+| Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**；方案 B **本 PR 合入后完成** | B：相关 label 真评估 + 无关 label `mirror-required-check`；PR+SHA 共用 `label-{sha}` 主锁串行化，相关标签 evaluate 可 cancel、无关标签 ack 不 cancel；ack 替换排队 evaluate 时由标签事件时间校验拒绝镜像 success（写 failure）；success 前读取当前相关标签和 issue events，变化或无法确认则 post failure；保留创建前校验；cancelled heal 加 attempt>=3 上限、PR 提示及同 SHA in-flight guard | 专业研发 |
 | 临时撤必需检查才能合 | **已约束** | 只允许清幽灵且合后立刻加回；**禁止 `--admin`**；优先 `heal-required-checks.sh` | 专业研发 |
 | 打无关标签（如 `qa-passed`）触发 codex-gate labeled → 幽灵 | **进行中**（随 B） | codex/qa caller 增加 `*-label-ack`；无关 label 不再 skip-all | 专业研发 |
 | 转仓后 workflow 权限被改成 write / 可批 PR（kilocean） | **待修**/检查单 | **转仓必查**：permissions、branch protection、required checks、App 安装 | 专业研发 |
@@ -35,7 +35,11 @@ Companion 中当前 workflow 是 healer 自己。heal 必须通过
 
 镜像只复制同名真 job 的结论，从不凭空造 success，也不能把旧镜像当成新的
 真实评估。相关标签（包括 no-auto-merge）走真评估，其他标签走 ack；两者用
-label-eval-{sha} / label-ack-{sha} 分组，ack 不能取消评估。镜像 success 前读取
+`label-{sha}` 同组作为主锁串行化，ack 运行期间 evaluator 不能并发启动，反之亦然。
+只有相关标签 evaluate 的 cancel-in-progress 为 true；无关标签 ack 为 false，
+永不取消正在运行的真评估。ack 仍可能替换排队中的 evaluate，此时由 mirror 的
+标签事件时间校验拒绝镜像过期 success（写 failure）。主锁负责互斥，时间校验负责
+排队评估被替换后的保守拒绝。镜像 success 前读取
 PR 当前标签及 issue events；相关标签在源评估之后变化、缺数据或 API 失败时，
 写 failure 并提示重新运行真评估；同秒事件保守拒绝。标签校验保守地以 started_at（缺失时用
 completed_at）为界，避免评估运行途中标签变化产生过期 success。

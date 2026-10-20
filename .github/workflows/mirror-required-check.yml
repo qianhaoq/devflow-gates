@@ -11,8 +11,12 @@
 # Call from the product caller ONLY for irrelevant labels; keep the real
 # gate job for gate-relevant labels (skip-codex-gate / qa-passed / …).
 #
-# Caller evaluate and ack use separate concurrency groups. Validate label history
-# immediately before mirroring success; uncertainty produces failure.
+# Caller evaluate and ack share label-{sha} as the main lock, so neither can
+# start concurrently with the other. Only relevant-label evaluate cancels running
+# work; unrelated-label ack never cancels a running evaluator. Ack can replace a
+# pending evaluate: label-event time validation must then reject stale success
+# with failure. Validate label history immediately before mirroring success;
+# uncertainty produces failure.
 # Only same-named real job verdicts are eligible sources, never earlier mirrors.
 #
 # Check name produced by THIS job's Actions wrapper is

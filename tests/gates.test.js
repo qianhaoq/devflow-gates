@@ -930,7 +930,7 @@ const UNL_KW = 'This is a security problem.';
       { trigger: { created_at: at(1), run_started_at: at(4) }, peer: { created_at: at(2), run_started_at: at(3) }, newer: false },
     ];
     for (const times of cases) {
-      for (const status of ['in_progress', 'queued', 'completed']) {
+      for (const status of ['in_progress', 'queued', 'waiting', 'requested', 'pending', 'completed']) {
         for (const number of [9, 10]) {
           const trigger = { id: 100, workflow_id: 7, status: 'completed', conclusion: 'cancelled', ...times.trigger };
           const reruns = [];
@@ -1343,15 +1343,17 @@ const UNL_KW = 'This is a security problem.';
         assert.ok(!/pull-requests:\s*write/.test(ack));
       }
     });
-    await t('codex/qa callers: labeled evaluate + ack have separate SHA groups', () => {
+    await t('codex/qa callers: labeled evaluate + ack share the SHA lock; ack never cancels', () => {
       for (const f of ['codex-gate.yml', 'qa-gate.yml']) {
         const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', f), 'utf8');
         const concurrency = ex.split(/^concurrency:/m)[1].split(/^jobs:/m)[0];
         assert.ok(!/&& 'prt'/.test(concurrency), f + ' must NOT share a prt pending queue');
-        assert.ok(concurrency.includes("'label-eval-{0}' || 'label-ack-{0}'"));
+        assert.ok(concurrency.includes("format('label-{0}', github.event.pull_request.head.sha)"));
+        assert.ok(!/label-(eval|ack)-/.test(concurrency));
         assert.ok(concurrency.includes('no-auto-merge'));
         const cancel = concurrency.split('cancel-in-progress:')[1];
-        assert.ok(cancel.includes(`|| contains(fromJSON('["labeled","unlabeled"]'), github.event.action)`));
+        const labels = f === 'codex-gate.yml' ? 'skip-codex-gate' : 'qa-passed';
+        assert.ok(cancel.includes(`|| (contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && contains(fromJSON('["${labels}","no-auto-merge"]'), github.event.label.name))`));
         assert.ok(concurrency.includes("&& 'push'"));
         assert.ok(concurrency.includes("format('run-{0}', github.run_id)"));
       }

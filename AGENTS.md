@@ -57,8 +57,11 @@ in [README.md](README.md).
     older head's evaluation. Label / review / dispatch runs get their own
     group: a label or review event must never cancel a push evaluation, and
     a cancelled required check must never be the final word.
-    Label evaluate and ack use separate `label-eval-{sha}` / `label-ack-{sha}`
-    groups: unrelated labels must never cancel real evaluation. Before mirroring
+    Label evaluate and ack share `label-{sha}` as the main lock: neither
+    may run concurrently with the other. Relevant-label evaluate uses
+    `cancel-in-progress: true`; unrelated-label ack uses `false` and never
+    cancels a running evaluator. Ack may replace a pending evaluate; mirror
+    label-event time validation must then reject stale success with failure. Before mirroring
     success, read current relevant labels and their latest issue events; stale
     or unverifiable state must produce failure with an explanation. Mirrors
     copy only same-named real job conclusions, never invent success or use
