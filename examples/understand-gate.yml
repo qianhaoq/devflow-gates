@@ -12,7 +12,13 @@
 #   - pull_request_target: opened / synchronize / reopened only
 #   - issue_comment → refresh when body has Diff Quiz Answer / Override /recheck
 #   - workflow_dispatch(pr_number)
-#   - workflow_run self-listen for cancel-heal (A1)
+#
+# ⛔ 禁止自监听（P0 根治）：本文件 name 为 "Diff Quiz Gate"，不得再写
+#   on.workflow_run.workflows: ["Diff Quiz Gate"]。GitHub 不允许工作流监听
+#   自身同名完成事件——整份 YAML 会 silent 失效，pull_request_target 不出
+#   `understand / Diff Quiz Gate`，Auto Merge 也会 startup_failure。
+#   cancel-heal 必须拆到独立文件，见 examples/understand-gate-cancel-heal.yml
+#   （name 必须与 "Diff Quiz Gate" 不同，例如 "Diff Quiz Gate Cancel Heal"）。
 #
 # Secrets (repo Settings → Secrets and variables → Actions):
 #   GLM_API_KEY  or  ZHIPU_API_KEY  （智谱 GLM Coding Plan）
@@ -30,9 +36,6 @@ on:
         description: 'PR number to evaluate (dispatch on the PR branch to attach the check)'
         required: true
         type: string
-  workflow_run:
-    workflows: ["Diff Quiz Gate"]
-    types: [completed]
 
 permissions:
   contents: read
@@ -75,24 +78,6 @@ jobs:
       contents: read
       pull-requests: read
       issues: read
-      actions: write
-    uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@main
-    with:
-      # runs_on: '["self-hosted", "linux", "x64"]'
-      glm_model: 'glm-5.3-flash'
-    secrets:
-      GLM_API_KEY: ${{ secrets.GLM_API_KEY }}
-      ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
-
-  understand-cancel-heal:
-    if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'cancelled' &&
-      github.event.workflow_run.event != 'push'
-    permissions:
-      contents: read
-      pull-requests: write
-      issues: write
       actions: write
     uses: qianhaoq/devflow-gates/.github/workflows/understand-gate.yml@main
     with:

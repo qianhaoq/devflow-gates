@@ -11,6 +11,7 @@
 | runner 预置 Python 漏 `build` 目录 → pip 缺 `operations` | **已修**/需固化 | runner 镜像/预置含完整 stdlib；CI 用官方 setup-python 或自检 `import operations` | 专业研发 |
 | deploy sparse-checkout 污染共享 workdir（jobs） | **已修**（`.deploy-sparse`） | Deploy 稀疏检出用独立路径，结束后恢复默认 `GITHUB_WORKSPACE` | 专业研发 |
 | AI 同写代码+测试可能一起漏；弱化测试凑绿 | **已约束**（AGENTS「禁止弱化凑绿」） | 独立评审（Codex Gate）+ PR 贴测试证据；禁止 skip/放宽断言凑绿 | 专业研发 + 产品 |
+| understand caller 自监听（`name: Diff Quiz Gate` + `workflow_run.workflows: ["Diff Quiz Gate"]`）→ 整份 workflow silent 失效，不出 `understand / Diff Quiz Gate`，Auto Merge startup_failure | **已修**/根治 | cancel-heal 拆到独立文件 `examples/understand-gate-cancel-heal.yml`（name=`Diff Quiz Gate Cancel Heal`）；主文件禁止自听；**不要**再复制 Codex/QA 的自听写法到 understand | 专业研发 |
 | understand Diff Quiz 第 5 条保护 | **待修** | 等 PR 产出稳定 check 名后再加入 branch protection | 专业研发 |
 
 ## 操作红线（与本文同步）

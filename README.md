@@ -32,7 +32,7 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 | `examples/qa-gate.yml` | `qa-cancel-heal` | `qa-cancel-heal / QA Gate Refresh`（自听 `workflow_run`，仅 cancelled 完成时触发，**默认启用**，**不**挂在 PR 检查上） |
 | `examples/understand-gate.yml` | `understand` | `understand / Diff Quiz Gate` |
 | `examples/understand-gate.yml` | `understand-refresh` | `understand-refresh / Diff Quiz Gate Refresh`（Answer/Override 评论触发，**不**挂在 PR 检查上） |
-| `examples/understand-gate.yml` | `understand-cancel-heal` | `understand-cancel-heal / Diff Quiz Gate Refresh`（自听 cancelled，**不**挂在 PR 检查上） |
+| `examples/understand-gate-cancel-heal.yml` | `understand-cancel-heal` | `understand-cancel-heal / Diff Quiz Gate Refresh`（**独立**工作流 `Diff Quiz Gate Cancel Heal` 监听主门禁 completed；仅 cancelled 时触发；**禁止**写进主文件自听） |
 | `examples/auto-merge.yml` | `auto-merge` | `auto-merge / Auto Merge` |
 | `examples/smoke.yml` | `smoke` | `smoke / Post-deploy Smoke` |
 | `examples/acceptance.yml` | `acceptance` | `acceptance / Acceptance Gate`（另有辅助检查 `Acceptance Config` / `Acceptance Measure`；M1 仅观察，**不要**加入分支保护） |
@@ -62,6 +62,7 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 - 对 PR diff 自动出 1–2 道理解题（文档/pin/promo 为 1 题），作者（或评审）在评论用 `## Diff Quiz Answer` 作答；试验期逃生用 `## Diff Quiz Override` + 理由（**禁止** skip label）。
 - 出题模型：智谱 GLM（`secrets.GLM_API_KEY` 或 `ZHIPU_API_KEY`）。门禁用 `pull_request_target`，只通过 API 读 diff，不 checkout PR。
 - 触发不含 `labeled`/`unlabeled`，避免幽灵 expected check。
+- **⛔ 禁止自监听（P0 根治）**：caller `name: Diff Quiz Gate` 时**不得**再写 `on.workflow_run.workflows: ["Diff Quiz Gate"]`——GitHub 不允许，整份工作流 silent 失效（近期 0 秒 failure、jobs 为空即此因）。cancel-heal 必须用独立文件 [examples/understand-gate-cancel-heal.yml](examples/understand-gate-cancel-heal.yml)（`name: Diff Quiz Gate Cancel Heal`，监听主门禁 completed）。Codex/QA 示例虽仍自听且目前能跑，**不要**再复制到 understand。详见 [docs/PITFALLS.md](docs/PITFALLS.md)。
 
 ## 安全模型
 
