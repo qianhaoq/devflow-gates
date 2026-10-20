@@ -9,10 +9,12 @@
 # never checks out the PR head.
 #
 # Triggers (PR-only, deduplicated to save Actions minutes):
-#   - pull_request_target: push / open / ready / draft, and labeled /
-#     unlabeled for `skip-codex-gate` only (other labels are skipped by the
-#     caller `if:` below — no runner boots, and the skipped check is named
-#     "codex", never the required "codex / Codex Review Gate").
+#   - pull_request_target: push / open / ready / draft, plus labeled /
+#     unlabeled. Gate-relevant label (`skip-codex-gate`) → real evaluate
+#     (job `codex`). Any OTHER label → job `codex-label-ack` mirrors the
+#     latest "codex / Codex Review Gate" conclusion via Checks API (no
+#     runner on the reusable gate; no "is expected" ghost). A run whose
+#     jobs all skip would hang the required check — never do that.
 #   - pull_request_review (submitted) by Codex only. One Codex review with
 #     N inline comments = ONE run.
 #   - pull_request_review_comment by Codex only, and only when it is an
@@ -51,7 +53,11 @@
 #     replace an older still-pending one. Never cancelled — a heal must not
 #     be cancelled by a newer push (the re-run preserves the ORIGINAL event
 #     and never joins the push group).
-#   - every other run (labels, Codex reviews, dispatch, skipped events)
+#   - labeled/unlabeled MUST share label-{head.sha} + cancel-in-progress
+#     (Plan B) across evaluate + ack: this is the primary TOCTOU lock.
+#     Mirror revalidation is defense only. A later triage label
+#     may cancel unfinished skip-codex-gate evaluate; reapply it or /recheck.
+#   - every other run (Codex reviews, dispatch, skipped events)
 #     gets its own group: never cancelled, never cancels. Gate runs are
 #     ~15 s, read live state, and are idempotent.
 
@@ -88,20 +94,24 @@ permissions:
 # cancelling push group: a re-run of an OLD head's synchronize run would
 # otherwise cancel the newest head's evaluation.
 concurrency:
+  # Plan B: serialize label evaluate + ack by PR + SHA to close mirror TOCTOU.
+  # A later triage label can cancel an unfinished relevant-label evaluate;
+  # accepted tradeoff: reapply the relevant label or use /recheck to evaluate.
   group: >-
     codex-gate-pr-${{ github.event.pull_request.number || github.event.issue.number || github.event.inputs.pr_number || 'none' }}-${{
     (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
     (github.event_name == 'issue_comment' &&
       (github.event.comment.user.login == 'chatgpt-codex-connector[bot]' || github.event.comment.user.login == 'chatgpt-codex-connector' ||
        startsWith(github.event.comment.body, '/recheck'))) && 'refresh' ||
+    (github.event_name == 'pull_request_target' && contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format('label-{0}', github.event.pull_request.head.sha) ||
     (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled') && format('heal-{0}', github.event.workflow_run.id) ||
     format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && ((github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) || contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) }}
 
 jobs:
   codex:
-    # Caller-level filter: irrelevant events skip WITHOUT booting a runner
-    # and attach a check named "codex" (not the required one).
+    # Real evaluate: non-label PRT events, or labeled/unlabeled for
+    # skip-codex-gate only. Irrelevant labels go to codex-label-ack.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request_review' &&
@@ -127,6 +137,27 @@ jobs:
       # Default true (policy: unlabeled Codex threads block). Set false to
       # opt out to keyword-only matching for unlabeled threads.
       block_unlabeled: true
+
+
+  # Anti-ghost ack (方案 B): irrelevant labels must NOT skip every job
+  # (that leaves "codex / Codex Review Gate" as "is expected"). Mirror the
+  # latest same-named conclusion via Checks API instead — no false green
+  # (refuses to invent a conclusion when none exists).
+  codex-label-ack:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+      github.event.label.name != 'skip-codex-gate'
+    permissions:
+      contents: read
+      checks: write
+      actions: write
+      issues: write
+    uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@main
+    with:
+      # Keep in sync with the required-check name this caller produces.
+      check_name: 'codex / Codex Review Gate'
+      # runs_on: self-hosted   # keep in sync with codex job above
 
   # Refresh path — Codex comments and "/recheck" only (see header).
   codex-refresh:

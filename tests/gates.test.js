@@ -967,6 +967,238 @@ const UNL_KW = 'This is a security problem.';
   }
 
 
+
+  // ---------- Caller anti-ghost policy (方案 B) ----------
+  // A pull_request_target labeled run whose caller jobs all skip creates a
+  // check suite with no "<job> / <Gate>" check → GitHub hangs on "is expected".
+  // Fix: gate-relevant labels evaluate; irrelevant labels mirror via Checks API.
+  {
+    function callerPrtTypes(exampleFile) {
+      const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', exampleFile), 'utf8');
+      const onBlock = ex.split(/^jobs:/m)[0];
+      return (onBlock.match(/pull_request_target:[\s\S]*?types:\s*\[([^\]]+)\]/) || [])[1] || '';
+    }
+    function callerJobs(exampleFile) {
+      const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', exampleFile), 'utf8');
+      return ex.split(/^jobs:\s*$/m)[1] || '';
+    }
+    function callerJobIf(exampleFile, jobId) {
+      const jobs = callerJobs(exampleFile);
+      const re = new RegExp('^  ' + jobId + ':\\n([\\s\\S]*?)(?=^  [A-Za-z]|(?![\\s\\S]))', 'm');
+      const m = jobs.match(re);
+      assert.ok(m, exampleFile + ': job ' + jobId + ' not found');
+      const ifM = m[1].match(/if:\s*>-\n([\s\S]*?)(?=\n    [a-zA-Z]|\n  [a-zA-Z])/);
+      return ifM ? ifM[1] : m[1];
+    }
+    await t('codex caller: skip-codex-gate evaluates; other labels ack-mirror', () => {
+      const types = callerPrtTypes('codex-gate.yml');
+      assert.ok(/labeled/.test(types) && /unlabeled/.test(types), 'codex must listen labeled for skip-codex-gate');
+      const iff = callerJobIf('codex-gate.yml', 'codex');
+      assert.ok(/skip-codex-gate/.test(iff), 'codex if: evaluates skip-codex-gate labeled');
+      const ackIf = callerJobIf('codex-gate.yml', 'codex-label-ack');
+      assert.ok(/!= 'skip-codex-gate'/.test(ackIf) || /!= "skip-codex-gate"/.test(ackIf),
+        'ack if: only non-skip labels');
+      const jobs = callerJobs('codex-gate.yml');
+      assert.ok(jobs.includes("check_name: 'codex / Codex Review Gate'"), 'ack mirrors exact required name');
+      assert.ok(jobs.includes('mirror-required-check.yml'), 'ack uses reusable mirror');
+    });
+    await t('qa caller: qa-passed evaluates; other labels ack-mirror', () => {
+      const types = callerPrtTypes('qa-gate.yml');
+      assert.ok(/labeled/.test(types) && /unlabeled/.test(types), 'qa needs labeled');
+      const iff = callerJobIf('qa-gate.yml', 'qa');
+      assert.ok(/qa-passed/.test(iff), 'qa if: evaluates qa-passed labeled');
+      const ackIf = callerJobIf('qa-gate.yml', 'qa-label-ack');
+      assert.ok(/!= 'qa-passed'/.test(ackIf), 'ack if: only non-qa-passed labels');
+      const jobs = callerJobs('qa-gate.yml');
+      assert.ok(jobs.includes("check_name: 'qa / QA Gate'"), 'ack mirrors qa required name');
+    });
+    await t('reusable codex header documents anti-ghost mirror policy', () => {
+      const yml = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/codex-gate.yml'), 'utf8');
+      const head = yml.split(/^name:/m)[0];
+      assert.ok(/is expected/.test(head) && /mirror-required-check/.test(head),
+        'reusable header must document mirror anti-ghost');
+    });
+  }
+
+  // ---------- mirror-required-check.yml script ----------
+  {
+    async function runMirror({ runAttempt = 1, workflowRuns = [], checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
+      const src = scripts('mirror-required-check.yml')[0];
+      const created = [];
+      const infos = [];
+      const reruns = [];
+      const comments = [];
+      const github = {
+        paginate: async (method, args) => {
+          if (method === github.rest.actions.listWorkflowRuns) {
+            assert.strictEqual(args.workflow_id, 99);
+            assert.ok(!Object.hasOwn(args, 'head_sha'));
+            assert.strictEqual(args.per_page, 100);
+            return workflowRuns;
+          }
+          return checks;
+        },
+        rest: {
+          checks: {
+            listForRef: {},
+            create: async (args) => { created.push(args); return { data: args }; },
+          },
+          issues: { createComment: async (args) => { comments.push(args); } },
+          actions: {
+            getWorkflowRun: async (args) => {
+              assert.strictEqual(args.run_id, 4242);
+              return { data: { workflow_id: 99, run_attempt: runAttempt } };
+            },
+            listWorkflowRuns: {},
+            reRunWorkflow: async (args) => { reruns.push(args); return {}; },
+          },
+        },
+      };
+      const context = {
+        repo: { owner: 'o', repo: 'r' },
+        eventName: 'pull_request_target',
+        payload: { action, label: { name: label }, pull_request: sha ? { number: 9, head: { sha } } : null },
+      };
+      const core = {
+        info: (m) => infos.push(m),
+        setFailed: (m) => { throw new Error('setFailed: ' + m); },
+      };
+      await new AsyncFunction('github', 'context', 'core', 'process', src)(
+        github, context, core, { env: { CHECK_NAME: checkName } });
+      return { created, infos, reruns, comments };
+    }
+    await t('mirror: copies latest by created_at (not completed_at)', async () => {
+      // Older green finishes AFTER newer red — created_at must win (red).
+      const { created } = await runMirror({
+        checks: [
+          { id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T03:00:00Z' },
+          { id: 2, status: 'completed', conclusion: 'failure', created_at: '2026-10-20T02:00:00Z', completed_at: '2026-10-20T02:30:00Z' },
+        ],
+      });
+      assert.strictEqual(created.length, 1);
+      assert.strictEqual(created[0].name, 'codex / Codex Review Gate');
+      assert.strictEqual(created[0].conclusion, 'failure');
+      assert.strictEqual(created[0].head_sha, 'abc1234000000000000000000000000000000000');
+      assert.strictEqual(created[0].status, 'completed');
+    });
+    await t('mirror: in-flight same-named check → no create (no race)', async () => {
+      const { created, infos } = await runMirror({
+        checks: [{ id: 9, status: 'in_progress', conclusion: null, created_at: '2026-10-20T03:00:00Z' }],
+      });
+      assert.deepStrictEqual(created, []);
+      assert.ok(infos.some((m) => /still in_progress/.test(m)));
+    });
+    await t('mirror: pre-create revalidate aborts if latest changed', async () => {
+      for (const changeOnRead of [2, 3]) {
+        let n = 0;
+        const src = scripts('mirror-required-check.yml')[0];
+        const created = [];
+        const infos = [];
+        const first = [{ id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z' }];
+        const second = [{ id: 2, status: 'in_progress', conclusion: null, created_at: '2026-10-20T02:00:00Z' }];
+        const github = {
+          paginate: async () => (++n < changeOnRead ? first : second),
+          rest: { checks: { listForRef: {}, create: async (args) => { created.push(args); return { data: args }; } } },
+        };
+        const context = {
+          repo: { owner: 'o', repo: 'r' }, eventName: 'pull_request_target',
+          payload: { action: 'labeled', label: { name: 'wip' }, pull_request: { head: { sha: 'abc1234000000000000000000000000000000000' } } },
+        };
+        const core = { info: (m) => infos.push(m), setFailed: (m) => { throw new Error(m); } };
+        await new AsyncFunction('github', 'context', 'core', 'process', src)(
+          github, context, core, { env: { CHECK_NAME: 'codex / Codex Review Gate' } });
+        assert.deepStrictEqual(created, []);
+        assert.ok(infos.some((m) => /pre-create revalidate/i.test(m)));
+      }
+    });
+    await t('mirror: no prior completed check → no invent success', async () => {
+      const { created, infos } = await runMirror({ checks: [] });
+      assert.deepStrictEqual(created, []);
+      assert.ok(infos.some((m) => /not inventing/.test(m)));
+    });
+    await t('mirror: missing PR head → nothing', async () => {
+      const { created, infos } = await runMirror({ sha: null, checks: [{ id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z' }] });
+      assert.deepStrictEqual(created, []);
+      assert.ok(infos.some((m) => /No pull_request/.test(m)));
+    });
+    await t('mirror: cancelled → heal re-run source, never synthetic cancelled', async () => {
+      const { created, infos, reruns } = await runMirror({
+        checks: [{
+          id: 7, status: 'completed', conclusion: 'cancelled', created_at: '2026-10-20T01:00:00Z',
+          details_url: 'https://github.com/o/r/actions/runs/4242',
+        }],
+      });
+      assert.deepStrictEqual(created, []);
+      assert.deepStrictEqual(reruns, [{ owner: 'o', repo: 'r', run_id: 4242 }]);
+      assert.ok(infos.some((m) => /heal re-run/.test(m)));
+    });
+    await t('mirror: cancelled without run URL → no create', async () => {
+      const { created, reruns, infos } = await runMirror({
+        checks: [{ id: 7, status: 'completed', conclusion: 'cancelled', created_at: '2026-10-20T01:00:00Z' }],
+      });
+      assert.deepStrictEqual(created, []);
+      assert.deepStrictEqual(reruns, []);
+      assert.ok(infos.some((m) => /without a workflow run URL/.test(m)));
+    });
+    await t('mirror: cancelled heal at attempt cap comments without rerun or create', async () => {
+      for (const runAttempt of [3, 4]) {
+        const result = await runMirror({ runAttempt, checks: [{
+          id: 7, status: 'completed', conclusion: 'cancelled',
+          details_url: 'https://github.com/o/r/actions/runs/4242',
+        }] });
+        assert.deepStrictEqual(result.reruns, []);
+        assert.deepStrictEqual(result.created, []);
+        assert.strictEqual(result.comments.length, 1);
+        assert.strictEqual(result.comments[0].issue_number, 9);
+        assert.match(result.comments[0].body, /attempt cap.*Actions UI or push/);
+        assert.ok(result.infos.some(m => /attempt cap/.test(m)));
+      }
+    });
+    await t('mirror: PR-associated in-flight PRT peer prevents cancelled heal', async () => {
+      for (const status of ['queued', 'in_progress', 'waiting', 'pending', 'requested', 'completed']) {
+        for (const association of [9, 10, null]) {
+          for (const id of [4242, 4243]) {
+            const result = await runMirror({
+              checks: [{ id: 7, status: 'completed', conclusion: 'cancelled', details_url: 'https://github.com/o/r/actions/runs/4242' }],
+              workflowRuns: [{ id, status, head_sha: 'base-sha',
+                ...(association === null ? {} : { pull_requests: [{ number: association }] }) }],
+            });
+            assert.deepStrictEqual(result.created, []);
+            const blocked = id !== 4242 && association === 9 && status !== 'completed';
+            assert.strictEqual(result.reruns.length, blocked ? 0 : 1);
+            if (blocked) assert.ok(result.infos.some(m => /in-flight/.test(m)));
+          }
+        }
+      }
+    });
+    await t('mirror and label-ack grant issues write without pull-requests write', () => {
+      const mirror = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/mirror-required-check.yml'), 'utf8');
+      assert.ok(!/pull-requests:\s*write/.test(mirror));
+      assert.strictEqual((mirror.match(/issues:\s*write/g) || []).length, 2);
+      for (const gate of ['codex', 'qa']) {
+        const caller = fs.readFileSync(path.join(__dirname, '..', 'examples', gate + '-gate.yml'), 'utf8');
+        const ack = caller.split('  ' + gate + '-label-ack:')[1].split(/^  [a-zA-Z]/m)[0];
+        assert.match(ack, /issues:\s*write/);
+        assert.ok(!/pull-requests:\s*write/.test(ack));
+      }
+    });
+    await t('codex/qa callers: labeled evaluate + ack serialize by SHA and cancel older labels', () => {
+      for (const f of ['codex-gate.yml', 'qa-gate.yml']) {
+        const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', f), 'utf8');
+        const concurrency = ex.split(/^concurrency:/m)[1].split(/^jobs:/m)[0];
+        assert.ok(!/&& 'prt'/.test(concurrency), f + ' must NOT share a prt pending queue');
+        assert.ok(concurrency.includes(`contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format('label-{0}', github.event.pull_request.head.sha)`));
+        const cancel = concurrency.split('cancel-in-progress:')[1];
+        assert.ok(cancel.includes(`|| contains(fromJSON('["labeled","unlabeled"]'), github.event.action)`));
+        assert.ok(concurrency.includes("&& 'push'"));
+        assert.ok(concurrency.includes("format('run-{0}', github.run_id)"));
+      }
+      const mirror = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/mirror-required-check.yml'), 'utf8');
+      assert.ok(mirror.includes('group: mirror-required-${{ github.repository }}-${{ inputs.check_name }}-pr-'));
+      assert.ok(mirror.includes('      cancel-in-progress: true'));
+    });
+  }
+
   if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
   console.log('all passed');
 })();

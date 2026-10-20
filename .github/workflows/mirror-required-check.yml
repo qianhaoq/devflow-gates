@@ -1,0 +1,208 @@
+# Mirror Required Check — anti-ghost ack for irrelevant labeled/unlabeled.
+#
+# When a gate caller listens for labeled/unlabeled but skips the real
+# evaluator for unrelated labels, GitHub still opens a check suite with no
+# run named like the required check ("codex / Codex Review Gate") → hangs
+# on "is expected". This reusable job re-posts the LATEST conclusion for
+# that exact check name on the PR head via the Checks API (no false green:
+# it never invents success when nothing prior exists; it never runs while
+# a same-named check is still in flight).
+#
+# Call from the product caller ONLY for irrelevant labels; keep the real
+# gate job for gate-relevant labels (skip-codex-gate / qa-passed / …).
+#
+# Caller labeled/unlabeled paths MUST share label-{head.sha} concurrency with
+# cancel-in-progress: true across evaluate and ack: this is the primary TOCTOU
+# lock. Mirror revalidation is defense only and cannot provide atomicity.
+#
+# Check name produced by THIS job's Actions wrapper is
+# "<caller job id> / Mirror Required Check" (harmless side check). The
+# required name is created explicitly via checks.create below.
+
+name: Reusable Mirror Required Check
+
+on:
+  workflow_call:
+    inputs:
+      check_name:
+        description: 'Exact required check name to mirror (e.g. "codex / Codex Review Gate")'
+        required: true
+        type: string
+      runs_on:
+        description: 'Runner label or JSON array string'
+        required: false
+        type: string
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+  checks: write
+  actions: write
+  issues: write
+
+jobs:
+  mirror:
+    name: Mirror Required Check
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    concurrency:
+      group: mirror-required-${{ github.repository }}-${{ inputs.check_name }}-pr-${{ github.event.pull_request.number || github.event.issue.number || 'none' }}-${{ github.event.pull_request.head.sha || github.sha }}
+      cancel-in-progress: true
+    timeout-minutes: 2
+    permissions:
+      contents: read
+      checks: write
+      actions: write
+      issues: write
+    steps:
+      - name: Mirror latest required-check conclusion
+        uses: actions/github-script@v7
+        env:
+          CHECK_NAME: ${{ inputs.check_name }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const checkName = (process.env.CHECK_NAME || '').trim();
+            if (!checkName) {
+              core.setFailed('check_name input is empty');
+              return;
+            }
+            const sha = context.payload.pull_request?.head?.sha;
+            if (!sha) {
+              core.info('No pull_request.head.sha on this event — nothing to mirror');
+              return;
+            }
+            const label = context.payload.label?.name || '';
+            const action = context.payload.action || context.eventName;
+
+            // Rank by created_at (+ id), same as auto-merge / heal-required-checks:
+            // an older run can finish after a newer one; completed_at would
+            // wrongly prefer the older conclusion.
+            function byNewestCreated(a, b) {
+              const ta = a.created_at || '';
+              const tb = b.created_at || '';
+              if (ta !== tb) return ta < tb ? 1 : -1;
+              return (b.id || 0) - (a.id || 0);
+            }
+            async function listNamed() {
+              return github.paginate(github.rest.checks.listForRef, {
+                owner,
+                repo,
+                ref: sha,
+                check_name: checkName,
+                per_page: 100,
+              });
+            }
+
+            let runs = await listNamed();
+            let sorted = (runs || []).slice().sort(byNewestCreated);
+            let latest = sorted[0];
+
+            if (latest && latest.status && latest.status !== 'completed') {
+              // An in-flight same-named check already covers the required
+              // name for this head — posting a mirror would race it / become
+              // a newer created_at that outranks the evaluator.
+              core.info(`Latest "${checkName}" is still ${latest.status} (id ${latest.id}) — not mirroring`);
+              return;
+            }
+            if (!latest || !latest.conclusion) {
+              // Do not invent success/neutral: a brand-new head with no
+              // prior gate result must wait for a real evaluate.
+              core.info(`No completed prior "${checkName}" on ${sha.slice(0, 7)} — not inventing a conclusion`);
+              return;
+            }
+
+            const conclusion = latest.conclusion;
+            const sourceId = latest.id;
+
+            // Never create a synthetic cancelled check: Auto Merge /
+            // heal-required-checks can only re-run checks that still point
+            // at a real Actions run URL, and a newer synthetic cancelled
+            // would become the latest (unhealable) required result.
+            if (conclusion === 'cancelled') {
+              const url = latest.details_url || latest.html_url || '';
+              const m = String(url).match(/\/actions\/runs\/(\d+)/);
+              if (!m) {
+                core.info(`Latest "${checkName}" is cancelled without a workflow run URL — not mirroring`);
+                return;
+              }
+              const run_id = Number(m[1]);
+              const { data: run } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id });
+              if ((run.run_attempt || 1) >= 3) {
+                const message = `Cancelled heal for "${checkName}" reached the attempt cap (run ${run_id}, run_attempt=${run.run_attempt || 1}). Please rerun manually in the Actions UI or push a new commit.`;
+                core.info(message);
+                const number = context.payload.pull_request?.number;
+                if (number) {
+                  try {
+                    await github.rest.issues.createComment({ owner, repo, issue_number: number, body: message });
+                  } catch (error) {
+                    core.info(`Could not comment on PR #${number}: ${error.message}`);
+                  }
+                }
+                return;
+              }
+              const workflowRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner, repo, workflow_id: run.workflow_id, per_page: 100,
+              });
+              const activeStatuses = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
+              const prNumber = context.payload.pull_request?.number;
+              // PRT workflow head_sha is the base SHA; match the PR association.
+              if (workflowRuns.some(r => r.id !== run_id && activeStatuses.has(r.status)
+                && (r.pull_requests || []).some(p => p.number === prNumber))) {
+                core.info(`Workflow ${run.workflow_id} already has an in-flight run for PR #${prNumber} — not re-running cancelled run ${run_id}`);
+                return;
+              }
+              await github.rest.actions.reRunWorkflow({ owner, repo, run_id });
+              core.info(`Latest "${checkName}" was cancelled — heal re-run of workflow ${m[1]} instead of mirroring`);
+              return;
+            }
+            // skipped is treated as pass by branch protection but is not a
+            // real gate verdict — do not re-post it as the required check.
+            if (conclusion === 'skipped') {
+              core.info(`Latest "${checkName}" is skipped — not mirroring a non-verdict`);
+              return;
+            }
+
+            const title = `Label ack: mirrored ${conclusion}`;
+            const summary = [
+              `Irrelevant label \`${label || '(none)'}\` (${action}) on head \`${sha.slice(0, 7)}\`.`,
+              `Re-posted previous \`${checkName}\` conclusion (**${conclusion}**, source check ${sourceId}) so this check suite does not leave the required check as "is expected".`,
+              'Gate-relevant labels still run the real evaluator.',
+            ].join('\n\n');
+
+            // Defensive supplement to caller label concurrency (the primary TOCTOU fix).
+            // Revalidate immediately before create: an evaluator may have
+            // started (or finished) since the first list. Never let a stale
+            // mirror become the newest same-named check ahead of a live gate.
+            runs = await listNamed();
+            sorted = (runs || []).slice().sort(byNewestCreated);
+            latest = sorted[0];
+            if (!latest || latest.id !== sourceId || latest.conclusion !== conclusion
+              || (latest.status && latest.status !== 'completed')) {
+              core.info(`Pre-create revalidate: latest "${checkName}" changed (now id ${latest?.id}, status ${latest?.status}, conclusion ${latest?.conclusion}) — not mirroring`);
+              return;
+            }
+
+            // One final Checks read after the preceding revalidation passed.
+            runs = await listNamed();
+            latest = (runs || []).slice().sort(byNewestCreated)[0];
+            if ((runs || []).some(r => r.status && r.status !== 'completed')
+              || !latest || latest.id !== sourceId || latest.conclusion !== conclusion) {
+              core.info(`Final pre-create revalidate: "${checkName}" changed or is in flight — not mirroring`);
+              return;
+            }
+
+            // Atomicity is guaranteed by caller label-{head.sha} concurrency
+            // with cancel-in-progress across labeled evaluate and ack paths.
+            // This pre-create revalidation is defense only: Checks list/create
+            // is not atomic and cannot replace the caller concurrency lock.
+            await github.rest.checks.create({
+              owner,
+              repo,
+              name: checkName,
+              head_sha: sha,
+              status: 'completed',
+              conclusion,
+              output: { title, summary },
+            });
+            core.info(`Mirrored "${checkName}" = ${conclusion} on ${sha.slice(0, 7)} (source ${sourceId})`);

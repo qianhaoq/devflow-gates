@@ -43,6 +43,11 @@ in [README.md](README.md).
     the skipped check is named after the caller job). Never skip a
     head-attached event INSIDE a reusable file: that attaches a skipped
     (= passing) required check.
+  - labeled/unlabeled anti-ghost (方案 B, 2026-10): never let a label run
+    skip EVERY caller job (that leaves the required "<job> / <Gate>" as
+    "is expected"). Gate-relevant labels run the real evaluator;
+    irrelevant labels call `mirror-required-check.yml` to re-post the
+    latest same-named conclusion (never invent success).
   - No blind periodic re-runs. Refresh jobs re-run a failed gate run only
     when its input changed (Codex: the shared `verdict()` would now pass;
     QA: label applied after the run), else at most the newest cancelled
@@ -52,6 +57,8 @@ in [README.md](README.md).
     older head's evaluation. Label / review / dispatch runs get their own
     group: a label or review event must never cancel a push evaluation, and
     a cancelled required check must never be the final word.
+    Plan B label ack and same-SHA labeled evaluate share `label-{sha}` with
+    cancel-in-progress to close the mirror list→create TOCTOU.
 - Cancelled required checks are healed, never bypassed (A1/A2, 2026-10):
   branch protection gates on the LATEST check run per required name on the
   head SHA, so a stuck cancelled/expected check blocks merge even when the

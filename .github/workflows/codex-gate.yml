@@ -82,11 +82,15 @@
 #     only. Only the refresh job needs actions:write.
 #
 # Triggers / filtering / concurrency are the CALLER's job (see
-# examples/codex-gate.yml). Filter irrelevant events with an `if:` on the
-# CALLER job (a skipped caller job attaches a check named after the caller
-# job, e.g. "codex", never the required "codex / Codex Review Gate";
-# a skip INSIDE this file would attach a skipped — i.e. passing — required
-# check, so this file never skips a head-attached event).
+# examples/codex-gate.yml). CRITICAL — never let a labeled/unlabeled run
+# skip EVERY caller job: that opens a check suite with no
+# "codex / Codex Review Gate" → GitHub hangs on "is expected"
+# (docs/PITFALLS.md). Pattern (方案 B): gate-relevant labels
+# (`skip-codex-gate`) run the real evaluator; irrelevant labels call
+# mirror-required-check.yml to re-post the latest same-named conclusion
+# via the Checks API (no false green — refuses to invent a conclusion).
+# A skip INSIDE this file would attach a skipped (= passing) required
+# check, so this file never skips a head-attached event.
 
 name: Reusable Codex Review Gate
 

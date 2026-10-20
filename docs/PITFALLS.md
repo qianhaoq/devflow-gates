@@ -4,9 +4,9 @@
 
 | 坑 | 状态 | 根治动作 | Owner |
 | --- | --- | --- | --- |
-| Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**（cancel-heal 已合）；方案 B **待修** | B：labeled 不产新 suite，或 skipped 也挂同名 required check（下周） | 专业研发 |
+| Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**；方案 B **本 PR 合入后完成** | B：相关 label 真评估 + 无关 label `mirror-required-check`；PR+SHA `label-{sha}` concurrency 串行化并 cancel-in-progress 修复 list→create TOCTOU，保留创建前校验；cancelled heal 加 attempt>=3 上限、PR 提示及同 SHA in-flight guard | 专业研发 |
 | 临时撤必需检查才能合 | **已约束** | 只允许清幽灵且合后立刻加回；**禁止 `--admin`**；优先 `heal-required-checks.sh` | 专业研发 |
-| 打无关标签（如 `qa-passed`）触发 codex-gate labeled → 幽灵 | **待修**/流程 | 勿用无关标签触发 Gate；caller `if:` 过滤无关 label；勿在 Gate 路径打 `qa-passed` | 专业研发 |
+| 打无关标签（如 `qa-passed`）触发 codex-gate labeled → 幽灵 | **进行中**（随 B） | codex/qa caller 增加 `*-label-ack`；无关 label 不再 skip-all | 专业研发 |
 | 转仓后 workflow 权限被改成 write / 可批 PR（kilocean） | **待修**/检查单 | **转仓必查**：permissions、branch protection、required checks、App 安装 | 专业研发 |
 | runner 预置 Python 漏 `build` 目录 → pip 缺 `operations` | **已修**/需固化 | runner 镜像/预置含完整 stdlib；CI 用官方 setup-python 或自检 `import operations` | 专业研发 |
 | deploy sparse-checkout 污染共享 workdir（jobs） | **已修**（`.deploy-sparse`） | Deploy 稀疏检出用独立路径，结束后恢复默认 `GITHUB_WORKSPACE` | 专业研发 |
