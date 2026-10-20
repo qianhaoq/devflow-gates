@@ -63,6 +63,7 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 - 出题模型：智谱 GLM（`secrets.GLM_API_KEY` 或 `ZHIPU_API_KEY`）。门禁用 `pull_request_target`，只通过 API 读 diff，不 checkout PR。
 - 触发不含 `labeled`/`unlabeled`，避免幽灵 expected check。
 - **⛔ 禁止自监听（P0 根治）**：caller `name: Diff Quiz Gate` 时**不得**再写 `on.workflow_run.workflows: ["Diff Quiz Gate"]`——GitHub 不允许，整份工作流 silent 失效（近期 0 秒 failure、jobs 为空即此因）。cancel-heal 必须用独立文件 [examples/understand-gate-cancel-heal.yml](examples/understand-gate-cancel-heal.yml)（`name: Diff Quiz Gate Cancel Heal`，监听主门禁 completed）。Codex/QA 示例虽仍自听且目前能跑，**不要**再复制到 understand。详见 [docs/PITFALLS.md](docs/PITFALLS.md)。
+- **⛔ refresh/heal 权限（P0）**：调用 reusable 的每个 job 必须 `pull-requests: write` + `issues: write`（含 `understand-refresh`）；只给 read 会 startup_failure（`only allowed read, requesting write`）。见 PITFALLS。
 
 ## 安全模型
 
