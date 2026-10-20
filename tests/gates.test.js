@@ -967,6 +967,49 @@ const UNL_KW = 'This is a security problem.';
   }
 
 
+
+  // ---------- Caller anti-ghost policy (方案 B) ----------
+  // A pull_request_target labeled run whose caller jobs all skip creates a
+  // check suite with no "<job> / <Gate>" check → GitHub hangs on "is expected".
+  {
+    function callerPrtTypes(exampleFile) {
+      const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', exampleFile), 'utf8');
+      const onBlock = ex.split(/^jobs:/m)[0];
+      return (onBlock.match(/pull_request_target:[\s\S]*?types:\s*\[([^\]]+)\]/) || [])[1] || '';
+    }
+    function callerJobIf(exampleFile, jobId) {
+      const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', exampleFile), 'utf8');
+      const jobs = ex.split(/^jobs:\s*$/m)[1] || '';
+      const re = new RegExp('^  ' + jobId + ':\\n([\\s\\S]*?)(?=^  [A-Za-z]|$)', 'm');
+      const m = jobs.match(re);
+      assert.ok(m, exampleFile + ': job ' + jobId + ' not found');
+      const ifM = m[1].match(/if:\s*>-\n([\s\S]*?)(?=\n    [a-zA-Z]|\n  [a-zA-Z])/);
+      return ifM ? ifM[1] : m[1];
+    }
+    await t('codex caller: no labeled/unlabeled (B — no ghost expected suite)', () => {
+      const types = callerPrtTypes('codex-gate.yml');
+      assert.ok(types.length > 0, 'codex pull_request_target types present');
+      assert.ok(!/labeled|unlabeled/.test(types), 'codex must not listen labeled/unlabeled: ' + types);
+      assert.ok(/opened/.test(types) && /synchronize/.test(types), 'codex still listens push-class');
+      const iff = callerJobIf('codex-gate.yml', 'codex');
+      assert.ok(!/skip-codex-gate/.test(iff), 'codex if: must not special-case skip-codex-gate labeled');
+      assert.ok(!/event\.label\.name/.test(iff), 'codex if: must not filter by label name');
+    });
+    await t('qa caller: labeled/unlabeled keep evaluating (no skip-all ghost)', () => {
+      const types = callerPrtTypes('qa-gate.yml');
+      assert.ok(/labeled/.test(types) && /unlabeled/.test(types), 'qa still needs labeled for qa-passed');
+      const iff = callerJobIf('qa-gate.yml', 'qa');
+      assert.ok(/pull_request_target/.test(iff), 'qa if: includes pull_request_target');
+      assert.ok(!/event\.label\.name/.test(iff), 'qa if: must not skip non-qa-passed labels: ' + iff.trim());
+    });
+    await t('reusable codex header documents no-labeled caller policy', () => {
+      const yml = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/codex-gate.yml'), 'utf8');
+      const head = yml.split(/^name:/m)[0];
+      assert.ok(/labeled\/unlabeled/.test(head) && /is expected/.test(head),
+        'reusable header must warn callers off labeled/unlabeled ghost');
+    });
+  }
+
   if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
   console.log('all passed');
 })();
