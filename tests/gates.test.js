@@ -918,25 +918,38 @@ const UNL_KW = 'This is a security problem.';
 
 
   await t('understand cancel-heal: PR-associated base-SHA peers supersede cancelled trigger', async () => {
-    for (const status of ['in_progress', 'queued', 'completed']) {
-      for (const number of [9, 10]) {
-        const trigger = { id: 100, workflow_id: 7, status: 'completed', conclusion: 'cancelled', created_at: '2026-10-20T01:00:00Z' };
-        const reruns = [];
-        const github = {
-          paginate: async () => [{ id: 101, head_sha: 'base', pull_requests: [{ number }], status, conclusion: status === 'completed' ? 'success' : null, created_at: '2026-10-20T02:00:00Z' }],
-          rest: {
-            actions: {
-              getWorkflowRun: async () => ({ data: trigger }),
-              listWorkflowRuns: {},
-              reRunWorkflow: async args => reruns.push(args.run_id),
+    const at = hour => `2026-10-20T0${hour}:00:00Z`;
+    const cases = [
+      { trigger: { created_at: at(1) }, peer: { created_at: at(2) }, newer: true },
+      // An older run's new attempt supersedes the trigger.
+      { trigger: { created_at: at(2) }, peer: { created_at: at(1), run_started_at: at(3) }, newer: true },
+      // The trigger's new attempt supersedes a peer created later.
+      { trigger: { created_at: at(1), run_started_at: at(3) }, peer: { created_at: at(2) }, newer: false },
+      // Both attempts must be compared, regardless of creation order.
+      { trigger: { created_at: at(2), run_started_at: at(3) }, peer: { created_at: at(1), run_started_at: at(4) }, newer: true },
+      { trigger: { created_at: at(1), run_started_at: at(4) }, peer: { created_at: at(2), run_started_at: at(3) }, newer: false },
+    ];
+    for (const times of cases) {
+      for (const status of ['in_progress', 'queued', 'completed']) {
+        for (const number of [9, 10]) {
+          const trigger = { id: 100, workflow_id: 7, status: 'completed', conclusion: 'cancelled', ...times.trigger };
+          const reruns = [];
+          const github = {
+            paginate: async () => [{ id: 101, head_sha: 'base', pull_requests: [{ number }], status, conclusion: status === 'completed' ? 'success' : null, ...times.peer }],
+            rest: {
+              actions: {
+                getWorkflowRun: async () => ({ data: trigger }),
+                listWorkflowRuns: {},
+                reRunWorkflow: async args => reruns.push(args.run_id),
+              },
+              pulls: { get: async () => ({ data: { number: 9, state: 'open', head: { sha: 'head' } } }) },
             },
-            pulls: { get: async () => ({ data: { number: 9, state: 'open', head: { sha: 'head' } } }) },
-          },
-        };
-        const context = { repo: { owner: 'o', repo: 'r' }, runId: 200, eventName: 'workflow_run', payload: { workflow_run: { ...trigger, pull_requests: [{ number: 9 }] } } };
-        await new AsyncFunction('github', 'context', 'core', scripts('understand-gate.yml').at(-1))(
-          github, context, { info() {}, warning(m) { throw new Error(m); } });
-        assert.deepStrictEqual(reruns, number === 9 ? [] : [100]);
+          };
+          const context = { repo: { owner: 'o', repo: 'r' }, runId: 200, eventName: 'workflow_run', payload: { workflow_run: { ...trigger, pull_requests: [{ number: 9 }] } } };
+          await new AsyncFunction('github', 'context', 'core', scripts('understand-gate.yml').at(-1))(
+            github, context, { info() {}, warning(m) { throw new Error(m); } });
+          assert.deepStrictEqual(reruns, number === 9 && times.newer ? [] : [100]);
+        }
       }
     }
   });

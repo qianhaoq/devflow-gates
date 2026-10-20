@@ -564,7 +564,7 @@ jobs:
                       (r.head_sha === headSha || (r.pull_requests || []).some(p => p.number === pr.number)) &&
                       r.id !== context.runId &&
                       (r.status === 'in_progress' || r.status === 'queued' || r.conclusion === 'success') &&
-                      new Date(r.created_at) > new Date(tr.created_at)
+                      new Date(r.run_started_at || r.created_at) > new Date(tr.run_started_at || tr.created_at)
                     );
                     if (newer) {
                       core.info(`Yield heal: newer run ${newer.id} on ${headSha.slice(0, 7)}`);
