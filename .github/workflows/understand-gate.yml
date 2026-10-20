@@ -561,7 +561,8 @@ jobs:
                     });
                     const newer = runs.find((r) =>
                       r.id !== triggeredId &&
-                      r.head_sha === headSha &&
+                      (r.head_sha === headSha || (r.pull_requests || []).some(p => p.number === pr.number)) &&
+                      r.id !== context.runId &&
                       (r.status === 'in_progress' || r.status === 'queued' || r.conclusion === 'success') &&
                       new Date(r.created_at) > new Date(tr.created_at)
                     );

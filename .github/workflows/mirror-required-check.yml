@@ -96,6 +96,7 @@ jobs:
                 repo,
                 ref: sha,
                 check_name: checkName,
+                filter: 'all',
                 per_page: 100,
               });
             }
@@ -235,6 +236,15 @@ jobs:
                 labelError = `Success refused: ${error.message}. Run the real gate evaluator again.`;
                 core.info(labelError);
               }
+            }
+            // Label API reads may overlap a real evaluation. Yield if its check
+            // changed while reading labels, including when we would post failure.
+            runs = await listNamed();
+            latest = (runs || []).slice().sort(byNewestCreated)[0];
+            if ((runs || []).some(r => r.status && r.status !== 'completed')
+              || !latest || latest.id !== observedId || latest.conclusion !== observedConclusion) {
+              core.info('Post-label pre-create revalidate: source changed — not mirroring');
+              return;
             }
             await github.rest.checks.create({
               owner,

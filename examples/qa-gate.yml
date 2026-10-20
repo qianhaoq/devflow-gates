@@ -1,4 +1,6 @@
 # Example caller: copy to .github/workflows/qa-gate.yml.
+# Required check: "qa / QA Gate".
+# pull_request_target uses trusted base YAML; never check out or execute PR code.
 # Also install qa-gate-cancel-heal.yml: self-listening workflow_run is invalid.
 # Irrelevant labels mirror only a same-named real gate verdict; success requires
 # current relevant-label state to match the source verdict's event history.

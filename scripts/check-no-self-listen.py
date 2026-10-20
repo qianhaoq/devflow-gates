@@ -15,8 +15,9 @@ def self_listens(text):
     return bool(workflow.get('name') and workflow['name'] in names)
 
 
-def main():
-    files = [p for folder in ('examples', '.github/workflows') for p in Path(folder).glob('*.yml')]
+def main(root=None):
+    root = Path(root) if root is not None else Path(__file__).resolve().parents[1]
+    files = [p for folder in ('examples', '.github/workflows') for pattern in ('*.yml', '*.yaml') for p in (root / folder).glob(pattern)]
     bad = [str(p) for p in files if self_listens(p.read_text())]
     if bad:
         print('workflow cannot listen to itself: ' + ', '.join(bad), file=sys.stderr)

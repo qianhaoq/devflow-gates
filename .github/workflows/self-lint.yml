@@ -50,9 +50,6 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Install workflow parser
-        run: python3 -c 'import yaml' 2>/dev/null || pip install --quiet 'pyyaml==6.0.2'
-
       # Dry-run of the inline github-script logic (severity classifier,
       # block_unlabeled, explicit-P2, QA draft/synchronize ordering) with
       # mocked GitHub API — no network, no tokens.

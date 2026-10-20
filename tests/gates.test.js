@@ -917,6 +917,30 @@ const UNL_KW = 'This is a security problem.';
   }
 
 
+  await t('understand cancel-heal: PR-associated base-SHA peers supersede cancelled trigger', async () => {
+    for (const status of ['in_progress', 'queued', 'completed']) {
+      for (const number of [9, 10]) {
+        const trigger = { id: 100, workflow_id: 7, status: 'completed', conclusion: 'cancelled', created_at: '2026-10-20T01:00:00Z' };
+        const reruns = [];
+        const github = {
+          paginate: async () => [{ id: 101, head_sha: 'base', pull_requests: [{ number }], status, conclusion: status === 'completed' ? 'success' : null, created_at: '2026-10-20T02:00:00Z' }],
+          rest: {
+            actions: {
+              getWorkflowRun: async () => ({ data: trigger }),
+              listWorkflowRuns: {},
+              reRunWorkflow: async args => reruns.push(args.run_id),
+            },
+            pulls: { get: async () => ({ data: { number: 9, state: 'open', head: { sha: 'head' } } }) },
+          },
+        };
+        const context = { repo: { owner: 'o', repo: 'r' }, runId: 200, eventName: 'workflow_run', payload: { workflow_run: { ...trigger, pull_requests: [{ number: 9 }] } } };
+        await new AsyncFunction('github', 'context', 'core', scripts('understand-gate.yml').at(-1))(
+          github, context, { info() {}, warning(m) { throw new Error(m); } });
+        assert.deepStrictEqual(reruns, number === 9 ? [] : [100]);
+      }
+    }
+  });
+
   // ---------- Diff Quiz / understand-gate pure helpers ----------
   {
     const lib = require('../scripts/understand-gate-lib.js');
@@ -1066,7 +1090,7 @@ const UNL_KW = 'This is a security problem.';
 
   // ---------- mirror-required-check.yml script ----------
   {
-    async function runMirror({ relevantLabels = '', events = [], eventsError = false, labels = [], runAttempt = 1, workflowRuns = [], checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
+    async function runMirror({ relevantLabels = '', events = [], eventsError = false, afterEvents, labels = [], runAttempt = 1, workflowRuns = [], checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
       const src = scripts('mirror-required-check.yml')[0];
       const created = [];
       const infos = [];
@@ -1081,10 +1105,12 @@ const UNL_KW = 'This is a security problem.';
             return workflowRuns;
           }
           if (method === github.rest.issues.listEvents) {
+            if (afterEvents) afterEvents(checks);
             if (eventsError) throw new Error('events unavailable');
             return events;
           }
-          return checks;
+          assert.strictEqual(args.filter, 'all', 'must retain real jobs behind newer label mirrors');
+          return args.filter === 'all' ? checks : checks.slice(-1);
         },
         rest: {
           checks: {
@@ -1156,6 +1182,35 @@ const UNL_KW = 'This is a security problem.';
       const { created } = await runMirror({ relevantLabels: 'qa-passed,no-auto-merge', labels: [{ name: 'qa-passed' }], checks: [success], events: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T00:00:00Z' }] });
       assert.strictEqual(created[0].conclusion, 'success');
     });
+    await t('mirror: missing timestamp or label history refuses success', async () => {
+      for (const options of [
+        { checks: [{ ...success, completed_at: undefined }] },
+        { labels: [{ name: 'qa-passed' }], events: [] },
+        { events: null },
+      ]) {
+        const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success], ...options });
+        assert.strictEqual(created[0].conclusion, 'failure');
+      }
+    });
+    await t('mirror: evaluator appearing during label history read prevents create', async () => {
+      for (const eventsError of [false, true]) {
+        const checks = [{ ...success }];
+        const { created } = await runMirror({
+          relevantLabels: 'qa-passed', checks, eventsError,
+          afterEvents: () => checks.push({ id: 99, status: 'in_progress', created_at: '2026-10-20T05:00:00Z' }),
+        });
+        assert.deepStrictEqual(created, []);
+      }
+    });
+    await t('mirror: newer label ack retains earlier real verdict', async () => {
+      const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [
+        success,
+        { ...success, id: 78, created_at: '2026-10-20T04:00:00Z', output: { title: 'Label ack: mirrored success' } },
+      ] });
+      assert.strictEqual(created.length, 1);
+      assert.strictEqual(created[0].conclusion, 'success');
+      assert.match(created[0].output.summary, /77/);
+    });
     await t('mirror: previous mirror cannot freshen old success', async () => {
       const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success, { ...success, id: 78, created_at: '2026-10-20T04:00:00Z', completed_at: '2026-10-20T04:00:00Z', output: { title: 'Label ack: mirrored success' } }], events: [{ event: 'unlabeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T03:00:00Z' }] });
       assert.strictEqual(created[0].conclusion, 'failure');
@@ -1182,7 +1237,7 @@ const UNL_KW = 'This is a security problem.';
       assert.ok(infos.some((m) => /still in_progress/.test(m)));
     });
     await t('mirror: pre-create revalidate aborts if latest changed', async () => {
-      for (const changeOnRead of [2, 3]) {
+      for (const changeOnRead of [2, 3, 4]) {
         let n = 0;
         const src = scripts('mirror-required-check.yml')[0];
         const created = [];
