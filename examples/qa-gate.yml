@@ -15,13 +15,13 @@
 # Triggers (PR-only): every QA input change — push, label, draft/ready —
 # is itself a pull_request_target event, so there is NO schedule (each
 # scheduled run boots a runner; the old */15 refresh re-ran legitimately
-# red gates forever). labeled/unlabeled ALWAYS evaluate (any label name):
-# a caller-level skip on an irrelevant label would create a check suite
-# with no "qa / QA Gate" run → GitHub hangs on "is expected" (same ghost
-# as the old codex labeled filter). Re-evaluating is cheap (~15 s) and
-# idempotent. synchronize is NEVER filtered. workflow_run(completed) —
-# SELF-LISTENING, cancel-heal only (job `qa-cancel-heal`, DEFAULT ON): a
-# cancelled run cannot run its own post steps, so this workflow listens
+# red gates forever). labeled/unlabeled for the QA label (`qa-passed`) →
+# real evaluate (job `qa`). Any OTHER label → job `qa-label-ack` mirrors
+# the latest "qa / QA Gate" conclusion via Checks API (avoids "is
+# expected" ghost without burning a full QA evaluate + write ceiling on
+# triage labels). synchronize is NEVER filtered. workflow_run(completed)
+# — SELF-LISTENING, cancel-heal only (job `qa-cancel-heal`, DEFAULT ON):
+# a cancelled run cannot run its own post steps, so this workflow listens
 # for its own completions (fires from the default branch only; GitHub
 # caps workflow_run chains at 3 levels, so self-listening cannot loop).
 # Without it, a manually cancelled synchronize run leaves the required
@@ -80,12 +80,13 @@ concurrency:
 
 jobs:
   qa:
-    # Always evaluate on pull_request_target (any action, any label).
-    # Filtering other labels used to skip all jobs → ghost "is expected"
-    # for the required "qa / QA Gate" check (see header / docs/PITFALLS.md).
+    # Real evaluate: non-label PRT events, or labeled/unlabeled for the
+    # QA label only. Irrelevant labels go to qa-label-ack (anti-ghost).
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'pull_request_target'
+      (github.event_name == 'pull_request_target' &&
+        ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+         github.event.label.name == 'qa-passed'))
     # GitHub checks EVERY job of the called file against this job's
     # ceiling (incl. the skipped refresh job, which needs actions: write);
     # the evaluator itself narrows to actions: read.
@@ -97,9 +98,24 @@ jobs:
     uses: qianhaoq/devflow-gates/.github/workflows/qa-gate.yml@main
     with:
       # runs_on: self-hosted   # optional; default ubuntu-latest (also set on qa-refresh if enabled)
-      qa_label: 'qa-passed'
+      qa_label: 'qa-passed'   # keep in sync with the `if:` above and qa-label-ack
       # allowed_labelers: 'alice, bob'   # optional: only these users' label counts
       # keep_qa_on_clean_main_update: true   # optional: a clean "update branch" merge of main keeps the label
+
+
+  # Anti-ghost ack (方案 B): irrelevant labels must NOT skip every job.
+  qa-label-ack:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+      github.event.label.name != 'qa-passed'
+    permissions:
+      contents: read
+      checks: write
+    uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@main
+    with:
+      check_name: 'qa / QA Gate'
+      # runs_on: self-hosted   # keep in sync with qa job above
 
   # OPTIONAL schedule path: add `schedule: [{cron: '17 */6 * * *'}]` under
   # `on:` only if you need it. It never blindly re-runs a red gate (see

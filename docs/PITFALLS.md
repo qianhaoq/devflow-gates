@@ -4,9 +4,9 @@
 
 | 坑 | 状态 | 根治动作 | Owner |
 | --- | --- | --- | --- |
-| Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**（cancel-heal）；方案 B **进行中**（本 PR：caller 去掉 labeled/unlabeled） | B：codex caller 与 understand-gate 一致，不监听 labeled/unlabeled，避免无同名 check 的 suite；`skip-codex-gate` 仍由 evaluate + Auto Merge 即时认，加删后 `/recheck` 刷新检查 | 专业研发 |
+| Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**（cancel-heal）；方案 B **进行中**（本 PR：相关 label 真评估 + 无关 label mirror 同名 check） | B：`skip-codex-gate`/`qa-passed` 走真评估；其它 label 走 `mirror-required-check.yml` 按最新结论重挂同名必需检查（不发明 success） | 专业研发 |
 | 临时撤必需检查才能合 | **已约束** | 只允许清幽灵且合后立刻加回；**禁止 `--admin`**；优先 `heal-required-checks.sh` | 专业研发 |
-| 打无关标签（如 `qa-passed`）触发 codex-gate labeled → 幽灵 | **进行中**（随 B） | codex 不再监听 labeled；qa caller 对任意 label 仍评估并上报 `qa / QA Gate`（不再 skip 出幽灵） | 专业研发 |
+| 打无关标签（如 `qa-passed`）触发 codex-gate labeled → 幽灵 | **进行中**（随 B） | codex/qa caller 增加 `*-label-ack`；无关 label 不再 skip-all | 专业研发 |
 | 转仓后 workflow 权限被改成 write / 可批 PR（kilocean） | **待修**/检查单 | **转仓必查**：permissions、branch protection、required checks、App 安装 | 专业研发 |
 | runner 预置 Python 漏 `build` 目录 → pip 缺 `operations` | **已修**/需固化 | runner 镜像/预置含完整 stdlib；CI 用官方 setup-python 或自检 `import operations` | 专业研发 |
 | deploy sparse-checkout 污染共享 workdir（jobs） | **已修**（`.deploy-sparse`） | Deploy 稀疏检出用独立路径，结束后恢复默认 `GITHUB_WORKSPACE` | 专业研发 |

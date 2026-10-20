@@ -43,6 +43,11 @@ in [README.md](README.md).
     the skipped check is named after the caller job). Never skip a
     head-attached event INSIDE a reusable file: that attaches a skipped
     (= passing) required check.
+  - labeled/unlabeled anti-ghost (方案 B, 2026-10): never let a label run
+    skip EVERY caller job (that leaves the required "<job> / <Gate>" as
+    "is expected"). Gate-relevant labels run the real evaluator;
+    irrelevant labels call `mirror-required-check.yml` to re-post the
+    latest same-named conclusion (never invent success).
   - No blind periodic re-runs. Refresh jobs re-run a failed gate run only
     when its input changed (Codex: the shared `verdict()` would now pass;
     QA: label applied after the run), else at most the newest cancelled

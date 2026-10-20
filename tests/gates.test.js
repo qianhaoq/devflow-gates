@@ -971,42 +971,112 @@ const UNL_KW = 'This is a security problem.';
   // ---------- Caller anti-ghost policy (方案 B) ----------
   // A pull_request_target labeled run whose caller jobs all skip creates a
   // check suite with no "<job> / <Gate>" check → GitHub hangs on "is expected".
+  // Fix: gate-relevant labels evaluate; irrelevant labels mirror via Checks API.
   {
     function callerPrtTypes(exampleFile) {
       const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', exampleFile), 'utf8');
       const onBlock = ex.split(/^jobs:/m)[0];
       return (onBlock.match(/pull_request_target:[\s\S]*?types:\s*\[([^\]]+)\]/) || [])[1] || '';
     }
-    function callerJobIf(exampleFile, jobId) {
+    function callerJobs(exampleFile) {
       const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', exampleFile), 'utf8');
-      const jobs = ex.split(/^jobs:\s*$/m)[1] || '';
-      const re = new RegExp('^  ' + jobId + ':\\n([\\s\\S]*?)(?=^  [A-Za-z]|$)', 'm');
+      return ex.split(/^jobs:\s*$/m)[1] || '';
+    }
+    function callerJobIf(exampleFile, jobId) {
+      const jobs = callerJobs(exampleFile);
+      const re = new RegExp('^  ' + jobId + ':\\n([\\s\\S]*?)(?=^  [A-Za-z]|(?![\\s\\S]))', 'm');
       const m = jobs.match(re);
       assert.ok(m, exampleFile + ': job ' + jobId + ' not found');
       const ifM = m[1].match(/if:\s*>-\n([\s\S]*?)(?=\n    [a-zA-Z]|\n  [a-zA-Z])/);
       return ifM ? ifM[1] : m[1];
     }
-    await t('codex caller: no labeled/unlabeled (B — no ghost expected suite)', () => {
+    await t('codex caller: skip-codex-gate evaluates; other labels ack-mirror', () => {
       const types = callerPrtTypes('codex-gate.yml');
-      assert.ok(types.length > 0, 'codex pull_request_target types present');
-      assert.ok(!/labeled|unlabeled/.test(types), 'codex must not listen labeled/unlabeled: ' + types);
-      assert.ok(/opened/.test(types) && /synchronize/.test(types), 'codex still listens push-class');
+      assert.ok(/labeled/.test(types) && /unlabeled/.test(types), 'codex must listen labeled for skip-codex-gate');
       const iff = callerJobIf('codex-gate.yml', 'codex');
-      assert.ok(!/skip-codex-gate/.test(iff), 'codex if: must not special-case skip-codex-gate labeled');
-      assert.ok(!/event\.label\.name/.test(iff), 'codex if: must not filter by label name');
+      assert.ok(/skip-codex-gate/.test(iff), 'codex if: evaluates skip-codex-gate labeled');
+      const ackIf = callerJobIf('codex-gate.yml', 'codex-label-ack');
+      assert.ok(/!= 'skip-codex-gate'/.test(ackIf) || /!= "skip-codex-gate"/.test(ackIf),
+        'ack if: only non-skip labels');
+      const jobs = callerJobs('codex-gate.yml');
+      assert.ok(jobs.includes("check_name: 'codex / Codex Review Gate'"), 'ack mirrors exact required name');
+      assert.ok(jobs.includes('mirror-required-check.yml'), 'ack uses reusable mirror');
     });
-    await t('qa caller: labeled/unlabeled keep evaluating (no skip-all ghost)', () => {
+    await t('qa caller: qa-passed evaluates; other labels ack-mirror', () => {
       const types = callerPrtTypes('qa-gate.yml');
-      assert.ok(/labeled/.test(types) && /unlabeled/.test(types), 'qa still needs labeled for qa-passed');
+      assert.ok(/labeled/.test(types) && /unlabeled/.test(types), 'qa needs labeled');
       const iff = callerJobIf('qa-gate.yml', 'qa');
-      assert.ok(/pull_request_target/.test(iff), 'qa if: includes pull_request_target');
-      assert.ok(!/event\.label\.name/.test(iff), 'qa if: must not skip non-qa-passed labels: ' + iff.trim());
+      assert.ok(/qa-passed/.test(iff), 'qa if: evaluates qa-passed labeled');
+      const ackIf = callerJobIf('qa-gate.yml', 'qa-label-ack');
+      assert.ok(/!= 'qa-passed'/.test(ackIf), 'ack if: only non-qa-passed labels');
+      const jobs = callerJobs('qa-gate.yml');
+      assert.ok(jobs.includes("check_name: 'qa / QA Gate'"), 'ack mirrors qa required name');
     });
-    await t('reusable codex header documents no-labeled caller policy', () => {
+    await t('reusable codex header documents anti-ghost mirror policy', () => {
       const yml = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/codex-gate.yml'), 'utf8');
       const head = yml.split(/^name:/m)[0];
-      assert.ok(/labeled\/unlabeled/.test(head) && /is expected/.test(head),
-        'reusable header must warn callers off labeled/unlabeled ghost');
+      assert.ok(/is expected/.test(head) && /mirror-required-check/.test(head),
+        'reusable header must document mirror anti-ghost');
+    });
+  }
+
+  // ---------- mirror-required-check.yml script ----------
+  {
+    async function runMirror({ checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
+      const src = scripts('mirror-required-check.yml')[0];
+      const created = [];
+      const infos = [];
+      const github = {
+        paginate: async () => checks,
+        rest: {
+          checks: {
+            listForRef: {},
+            create: async (args) => { created.push(args); return { data: args }; },
+          },
+        },
+      };
+      const context = {
+        repo: { owner: 'o', repo: 'r' },
+        eventName: 'pull_request_target',
+        payload: { action, label: { name: label }, pull_request: sha ? { head: { sha } } : null },
+      };
+      const core = {
+        info: (m) => infos.push(m),
+        setFailed: (m) => { throw new Error('setFailed: ' + m); },
+      };
+      await new AsyncFunction('github', 'context', 'core', 'process', src)(
+        github, context, core, { env: { CHECK_NAME: checkName } });
+      return { created, infos };
+    }
+    await t('mirror: copies latest completed conclusion (no invent)', async () => {
+      const { created } = await runMirror({
+        checks: [
+          { id: 1, status: 'completed', conclusion: 'failure', completed_at: '2026-10-20T01:00:00Z' },
+          { id: 2, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T02:00:00Z' },
+        ],
+      });
+      assert.strictEqual(created.length, 1);
+      assert.strictEqual(created[0].name, 'codex / Codex Review Gate');
+      assert.strictEqual(created[0].conclusion, 'success');
+      assert.strictEqual(created[0].head_sha, 'abc1234000000000000000000000000000000000');
+      assert.strictEqual(created[0].status, 'completed');
+    });
+    await t('mirror: in-flight same-named check → no create (no race)', async () => {
+      const { created, infos } = await runMirror({
+        checks: [{ id: 9, status: 'in_progress', conclusion: null, started_at: '2026-10-20T03:00:00Z' }],
+      });
+      assert.deepStrictEqual(created, []);
+      assert.ok(infos.some((m) => /still in_progress/.test(m)));
+    });
+    await t('mirror: no prior completed check → no invent success', async () => {
+      const { created, infos } = await runMirror({ checks: [] });
+      assert.deepStrictEqual(created, []);
+      assert.ok(infos.some((m) => /not inventing/.test(m)));
+    });
+    await t('mirror: missing PR head → nothing', async () => {
+      const { created, infos } = await runMirror({ sha: null, checks: [{ id: 1, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T01:00:00Z' }] });
+      assert.deepStrictEqual(created, []);
+      assert.ok(infos.some((m) => /No pull_request/.test(m)));
     });
   }
 
