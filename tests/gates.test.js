@@ -1048,25 +1048,47 @@ const UNL_KW = 'This is a security problem.';
         github, context, core, { env: { CHECK_NAME: checkName } });
       return { created, infos };
     }
-    await t('mirror: copies latest completed conclusion (no invent)', async () => {
+    await t('mirror: copies latest by created_at (not completed_at)', async () => {
+      // Older green finishes AFTER newer red — created_at must win (red).
       const { created } = await runMirror({
         checks: [
-          { id: 1, status: 'completed', conclusion: 'failure', completed_at: '2026-10-20T01:00:00Z' },
-          { id: 2, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T02:00:00Z' },
+          { id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T03:00:00Z' },
+          { id: 2, status: 'completed', conclusion: 'failure', created_at: '2026-10-20T02:00:00Z', completed_at: '2026-10-20T02:30:00Z' },
         ],
       });
       assert.strictEqual(created.length, 1);
       assert.strictEqual(created[0].name, 'codex / Codex Review Gate');
-      assert.strictEqual(created[0].conclusion, 'success');
+      assert.strictEqual(created[0].conclusion, 'failure');
       assert.strictEqual(created[0].head_sha, 'abc1234000000000000000000000000000000000');
       assert.strictEqual(created[0].status, 'completed');
     });
     await t('mirror: in-flight same-named check → no create (no race)', async () => {
       const { created, infos } = await runMirror({
-        checks: [{ id: 9, status: 'in_progress', conclusion: null, started_at: '2026-10-20T03:00:00Z' }],
+        checks: [{ id: 9, status: 'in_progress', conclusion: null, created_at: '2026-10-20T03:00:00Z' }],
       });
       assert.deepStrictEqual(created, []);
       assert.ok(infos.some((m) => /still in_progress/.test(m)));
+    });
+    await t('mirror: pre-create revalidate aborts if latest changed', async () => {
+      let n = 0;
+      const src = scripts('mirror-required-check.yml')[0];
+      const created = [];
+      const infos = [];
+      const first = [{ id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z' }];
+      const second = [{ id: 2, status: 'in_progress', conclusion: null, created_at: '2026-10-20T02:00:00Z' }];
+      const github = {
+        paginate: async () => (++n === 1 ? first : second),
+        rest: { checks: { listForRef: {}, create: async (args) => { created.push(args); return { data: args }; } } },
+      };
+      const context = {
+        repo: { owner: 'o', repo: 'r' }, eventName: 'pull_request_target',
+        payload: { action: 'labeled', label: { name: 'wip' }, pull_request: { head: { sha: 'abc1234000000000000000000000000000000000' } } },
+      };
+      const core = { info: (m) => infos.push(m), setFailed: (m) => { throw new Error(m); } };
+      await new AsyncFunction('github', 'context', 'core', 'process', src)(
+        github, context, core, { env: { CHECK_NAME: 'codex / Codex Review Gate' } });
+      assert.deepStrictEqual(created, []);
+      assert.ok(infos.some((m) => /Pre-create revalidate/.test(m)));
     });
     await t('mirror: no prior completed check → no invent success', async () => {
       const { created, infos } = await runMirror({ checks: [] });
@@ -1074,9 +1096,20 @@ const UNL_KW = 'This is a security problem.';
       assert.ok(infos.some((m) => /not inventing/.test(m)));
     });
     await t('mirror: missing PR head → nothing', async () => {
-      const { created, infos } = await runMirror({ sha: null, checks: [{ id: 1, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T01:00:00Z' }] });
+      const { created, infos } = await runMirror({ sha: null, checks: [{ id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z' }] });
       assert.deepStrictEqual(created, []);
       assert.ok(infos.some((m) => /No pull_request/.test(m)));
+    });
+    await t('codex/qa callers: PRT evaluate+ack share concurrency group', () => {
+      for (const f of ['codex-gate.yml', 'qa-gate.yml']) {
+        const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', f), 'utf8');
+        const onBlock = ex.split(/^jobs:/m)[0];
+        assert.ok(/&& 'prt'/.test(onBlock) || /&& "prt"/.test(onBlock), f + ' must share prt concurrency for all PRT');
+        // push-class still the only cancel-in-progress case
+        assert.ok(/cancel-in-progress: \$\{\{ github\.event_name == 'pull_request_target'/.test(onBlock)
+          || onBlock.includes("cancel-in-progress: ${{ github.event_name == 'pull_request_target'"),
+          f + ' cancel-in-progress still gated');
+      }
     });
   }
 

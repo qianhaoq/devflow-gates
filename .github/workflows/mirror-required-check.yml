@@ -64,22 +64,33 @@ jobs:
             const label = context.payload.label?.name || '';
             const action = context.payload.action || context.eventName;
 
-            const runs = await github.paginate(github.rest.checks.listForRef, {
-              owner,
-              repo,
-              ref: sha,
-              check_name: checkName,
-              per_page: 100,
-            });
-            const attemptAt = (r) => Date.parse(r.completed_at || r.started_at || r.created_at || 0) || 0;
-            const sorted = (runs || []).slice().sort(
-              (a, b) => (attemptAt(b) - attemptAt(a)) || ((b.id || 0) - (a.id || 0))
-            );
-            const latest = sorted[0];
+            // Rank by created_at (+ id), same as auto-merge / heal-required-checks:
+            // an older run can finish after a newer one; completed_at would
+            // wrongly prefer the older conclusion.
+            function byNewestCreated(a, b) {
+              const ta = a.created_at || '';
+              const tb = b.created_at || '';
+              if (ta !== tb) return ta < tb ? 1 : -1;
+              return (b.id || 0) - (a.id || 0);
+            }
+            async function listNamed() {
+              return github.paginate(github.rest.checks.listForRef, {
+                owner,
+                repo,
+                ref: sha,
+                check_name: checkName,
+                per_page: 100,
+              });
+            }
+
+            let runs = await listNamed();
+            let sorted = (runs || []).slice().sort(byNewestCreated);
+            let latest = sorted[0];
 
             if (latest && latest.status && latest.status !== 'completed') {
               // An in-flight same-named check already covers the required
-              // name for this head — posting a mirror would race it.
+              // name for this head — posting a mirror would race it / become
+              // a newer created_at that outranks the evaluator.
               core.info(`Latest "${checkName}" is still ${latest.status} (id ${latest.id}) — not mirroring`);
               return;
             }
@@ -91,12 +102,25 @@ jobs:
             }
 
             const conclusion = latest.conclusion;
+            const sourceId = latest.id;
             const title = `Label ack: mirrored ${conclusion}`;
             const summary = [
               `Irrelevant label \`${label || '(none)'}\` (${action}) on head \`${sha.slice(0, 7)}\`.`,
-              `Re-posted previous \`${checkName}\` conclusion (**${conclusion}**) so this check suite does not leave the required check as "is expected".`,
+              `Re-posted previous \`${checkName}\` conclusion (**${conclusion}**, source check ${sourceId}) so this check suite does not leave the required check as "is expected".`,
               'Gate-relevant labels still run the real evaluator.',
             ].join('\n\n');
+
+            // Revalidate immediately before create: an evaluator may have
+            // started (or finished) since the first list. Never let a stale
+            // mirror become the newest same-named check ahead of a live gate.
+            runs = await listNamed();
+            sorted = (runs || []).slice().sort(byNewestCreated);
+            latest = sorted[0];
+            if (!latest || latest.id !== sourceId || latest.conclusion !== conclusion
+              || (latest.status && latest.status !== 'completed')) {
+              core.info(`Pre-create revalidate: latest "${checkName}" changed (now id ${latest?.id}, status ${latest?.status}, conclusion ${latest?.conclusion}) — not mirroring`);
+              return;
+            }
 
             await github.rest.checks.create({
               owner,
@@ -107,4 +131,4 @@ jobs:
               conclusion,
               output: { title, summary },
             });
-            core.info(`Mirrored "${checkName}" = ${conclusion} on ${sha.slice(0, 7)}`);
+            core.info(`Mirrored "${checkName}" = ${conclusion} on ${sha.slice(0, 7)} (source ${sourceId})`);
