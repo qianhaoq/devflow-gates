@@ -57,6 +57,8 @@ in [README.md](README.md).
     older head's evaluation. Label / review / dispatch runs get their own
     group: a label or review event must never cancel a push evaluation, and
     a cancelled required check must never be the final word.
+    Plan B label ack and same-SHA labeled evaluate share `label-{sha}` with
+    cancel-in-progress to close the mirror list→create TOCTOU.
 - Cancelled required checks are healed, never bypassed (A1/A2, 2026-10):
   branch protection gates on the LATEST check run per required name on the
   head SHA, so a stuck cancelled/expected check blocks merge even when the

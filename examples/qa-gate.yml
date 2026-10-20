@@ -38,7 +38,10 @@
 #     replace an older still-pending one. Never cancelled — a heal must not
 #     be cancelled by a newer push (the re-run preserves the ORIGINAL event
 #     and never joins the push group).
-#   - every other run (labeled / unlabeled / ready / draft / dispatch /
+#   - labeled/unlabeled share label-{sha} + cancel-in-progress (Plan B):
+#     serialize evaluate + ack to close mirror TOCTOU. A later triage label
+#     may cancel unfinished qa-passed evaluate; reapply it or /recheck.
+#   - every other run (ready / draft / dispatch /
 #     skipped) gets its own group: never cancelled, never cancels.
 # The gate itself does not rely on this: the sign-off is bound to the head
 # SHA via server-side run records and a stale label is stripped on ANY
@@ -71,14 +74,16 @@ permissions:
 # cancelling push group: a re-run of an OLD head's synchronize run would
 # otherwise cancel the newest head's evaluation.
 concurrency:
-  # Unique run-{id} for non-push PRT (incl. label-ack): a shared pending
-  # queue would let triage labels drop a pending qa-passed evaluate.
+  # Plan B: serialize label evaluate + ack by PR + SHA to close mirror TOCTOU.
+  # A later triage label can cancel an unfinished relevant-label evaluate;
+  # accepted tradeoff: reapply the relevant label or use /recheck to evaluate.
   group: >-
     qa-gate-pr-${{ github.event.pull_request.number || github.event.inputs.pr_number || 'none' }}-${{
     (github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) && 'push' ||
+    (github.event_name == 'pull_request_target' && contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format('label-{0}', github.event.pull_request.head.sha) ||
     (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled') && format('heal-{0}', github.event.workflow_run.id) ||
     format('run-{0}', github.run_id) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' && ((github.run_attempt == '1' && contains(fromJSON('["opened","synchronize","reopened"]'), github.event.action)) || contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) }}
 
 jobs:
   qa:
@@ -115,6 +120,8 @@ jobs:
       contents: read
       checks: write
       actions: write
+      pull-requests: write
+      issues: write
     uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@main
     with:
       check_name: 'qa / QA Gate'

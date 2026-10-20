@@ -1022,19 +1022,33 @@ const UNL_KW = 'This is a security problem.';
 
   // ---------- mirror-required-check.yml script ----------
   {
-    async function runMirror({ checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
+    async function runMirror({ runAttempt = 1, workflowRuns = [], checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
       const src = scripts('mirror-required-check.yml')[0];
       const created = [];
       const infos = [];
       const reruns = [];
+      const comments = [];
       const github = {
-        paginate: async () => checks,
+        paginate: async (method, args) => {
+          if (method === github.rest.actions.listWorkflowRuns) {
+            assert.strictEqual(args.workflow_id, 99);
+            assert.strictEqual(args.head_sha, sha);
+            return workflowRuns;
+          }
+          return checks;
+        },
         rest: {
           checks: {
             listForRef: {},
             create: async (args) => { created.push(args); return { data: args }; },
           },
+          issues: { createComment: async (args) => { comments.push(args); } },
           actions: {
+            getWorkflowRun: async (args) => {
+              assert.strictEqual(args.run_id, 4242);
+              return { data: { workflow_id: 99, run_attempt: runAttempt } };
+            },
+            listWorkflowRuns: {},
             reRunWorkflow: async (args) => { reruns.push(args); return {}; },
           },
         },
@@ -1042,7 +1056,7 @@ const UNL_KW = 'This is a security problem.';
       const context = {
         repo: { owner: 'o', repo: 'r' },
         eventName: 'pull_request_target',
-        payload: { action, label: { name: label }, pull_request: sha ? { head: { sha } } : null },
+        payload: { action, label: { name: label }, pull_request: sha ? { number: 9, head: { sha } } : null },
       };
       const core = {
         info: (m) => infos.push(m),
@@ -1050,7 +1064,7 @@ const UNL_KW = 'This is a security problem.';
       };
       await new AsyncFunction('github', 'context', 'core', 'process', src)(
         github, context, core, { env: { CHECK_NAME: checkName } });
-      return { created, infos, reruns };
+      return { created, infos, reruns, comments };
     }
     await t('mirror: copies latest by created_at (not completed_at)', async () => {
       // Older green finishes AFTER newer red — created_at must win (red).
@@ -1123,14 +1137,48 @@ const UNL_KW = 'This is a security problem.';
       assert.deepStrictEqual(reruns, []);
       assert.ok(infos.some((m) => /without a workflow run URL/.test(m)));
     });
-    await t('codex/qa callers: non-push PRT keep unique run-id concurrency (no drop queue)', () => {
+    await t('mirror: cancelled heal at attempt cap comments without rerun or create', async () => {
+      for (const runAttempt of [3, 4]) {
+        const result = await runMirror({ runAttempt, checks: [{
+          id: 7, status: 'completed', conclusion: 'cancelled',
+          details_url: 'https://github.com/o/r/actions/runs/4242',
+        }] });
+        assert.deepStrictEqual(result.reruns, []);
+        assert.deepStrictEqual(result.created, []);
+        assert.strictEqual(result.comments.length, 1);
+        assert.strictEqual(result.comments[0].issue_number, 9);
+        assert.match(result.comments[0].body, /attempt cap.*Actions UI or push/);
+        assert.ok(result.infos.some(m => /attempt cap/.test(m)));
+      }
+    });
+    await t('mirror: same-SHA workflow in flight prevents cancelled heal', async () => {
+      for (const status of ['queued', 'in_progress', 'waiting', 'pending', 'requested', 'completed']) {
+        for (const sameSha of [true, false]) {
+          const result = await runMirror({
+            checks: [{ id: 7, status: 'completed', conclusion: 'cancelled', details_url: 'https://github.com/o/r/actions/runs/4242' }],
+            workflowRuns: [{ status, head_sha: sameSha ? 'abc1234000000000000000000000000000000000' : 'other' }],
+          });
+          assert.deepStrictEqual(result.created, []);
+          const blocked = sameSha && status !== 'completed';
+          assert.strictEqual(result.reruns.length, blocked ? 0 : 1);
+          if (blocked) assert.ok(result.infos.some(m => /in-flight/.test(m)));
+        }
+      }
+    });
+    await t('codex/qa callers: labeled evaluate + ack serialize by SHA and cancel older labels', () => {
       for (const f of ['codex-gate.yml', 'qa-gate.yml']) {
         const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', f), 'utf8');
-        const onBlock = ex.split(/^jobs:/m)[0];
-        assert.ok(!/&& 'prt'/.test(onBlock), f + ' must NOT share a dropping prt pending queue');
-        assert.ok(/format\('run-\{0\}'/.test(onBlock) || onBlock.includes("format('run-{0}'"),
-          f + ' unique run-id group for non-push');
+        const concurrency = ex.split(/^concurrency:/m)[1].split(/^jobs:/m)[0];
+        assert.ok(!/&& 'prt'/.test(concurrency), f + ' must NOT share a prt pending queue');
+        assert.ok(concurrency.includes(`contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format('label-{0}', github.event.pull_request.head.sha)`));
+        const cancel = concurrency.split('cancel-in-progress:')[1];
+        assert.ok(cancel.includes(`|| contains(fromJSON('["labeled","unlabeled"]'), github.event.action)`));
+        assert.ok(concurrency.includes("&& 'push'"));
+        assert.ok(concurrency.includes("format('run-{0}', github.run_id)"));
       }
+      const mirror = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/mirror-required-check.yml'), 'utf8');
+      assert.ok(mirror.includes('group: mirror-required-${{ github.repository }}-${{ inputs.check_name }}-pr-'));
+      assert.ok(mirror.includes('      cancel-in-progress: true'));
     });
   }
 

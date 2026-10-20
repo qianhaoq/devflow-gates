@@ -34,16 +34,23 @@ permissions:
   contents: read
   checks: write
   actions: write
+  pull-requests: write
+  issues: write
 
 jobs:
   mirror:
     name: Mirror Required Check
     runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    concurrency:
+      group: mirror-required-${{ github.repository }}-${{ inputs.check_name }}-pr-${{ github.event.pull_request.number || github.event.issue.number || 'none' }}-${{ github.event.pull_request.head.sha || github.sha }}
+      cancel-in-progress: true
     timeout-minutes: 2
     permissions:
       contents: read
       checks: write
       actions: write
+      pull-requests: write
+      issues: write
     steps:
       - name: Mirror latest required-check conclusion
         uses: actions/github-script@v7
@@ -117,7 +124,30 @@ jobs:
                 core.info(`Latest "${checkName}" is cancelled without a workflow run URL — not mirroring`);
                 return;
               }
-              await github.rest.actions.reRunWorkflow({ owner, repo, run_id: Number(m[1]) });
+              const run_id = Number(m[1]);
+              const { data: run } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id });
+              if ((run.run_attempt || 1) >= 3) {
+                const message = `Cancelled heal for "${checkName}" reached the attempt cap (run ${run_id}, run_attempt=${run.run_attempt || 1}). Please rerun manually in the Actions UI or push a new commit.`;
+                core.info(message);
+                const number = context.payload.pull_request?.number;
+                if (number) {
+                  try {
+                    await github.rest.issues.createComment({ owner, repo, issue_number: number, body: message });
+                  } catch (error) {
+                    core.info(`Could not comment on PR #${number}: ${error.message}`);
+                  }
+                }
+                return;
+              }
+              const workflowRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                owner, repo, workflow_id: run.workflow_id, head_sha: sha, per_page: 100,
+              });
+              const activeStatuses = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
+              if (workflowRuns.some(r => r.head_sha === sha && activeStatuses.has(r.status))) {
+                core.info(`Workflow ${run.workflow_id} already has an in-flight run on ${sha.slice(0, 7)} — not re-running cancelled run ${run_id}`);
+                return;
+              }
+              await github.rest.actions.reRunWorkflow({ owner, repo, run_id });
               core.info(`Latest "${checkName}" was cancelled — heal re-run of workflow ${m[1]} instead of mirroring`);
               return;
             }
@@ -135,6 +165,7 @@ jobs:
               'Gate-relevant labels still run the real evaluator.',
             ].join('\n\n');
 
+            // Defensive supplement to caller label concurrency (the primary TOCTOU fix).
             // Revalidate immediately before create: an evaluator may have
             // started (or finished) since the first list. Never let a stale
             // mirror become the newest same-named check ahead of a live gate.

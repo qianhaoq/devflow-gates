@@ -4,7 +4,7 @@
 
 | 坑 | 状态 | 根治动作 | Owner |
 | --- | --- | --- | --- |
-| Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**；方案 B **进行中**（PR #15，已 3 轮 P1 自修后停循环） | B：相关 label 真评估 + 无关 label `mirror-required-check`（created_at、不镜像 cancelled、创建前再校验）。剩余开放 P1：list→create 非原子 TOCTOU（观察/人工跟进） | 专业研发 |
+| Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**；方案 B **本 PR 合入后完成** | B：相关 label 真评估 + 无关 label `mirror-required-check`；PR+SHA `label-{sha}` concurrency 串行化并 cancel-in-progress 修复 list→create TOCTOU，保留创建前校验；cancelled heal 加 attempt>=3 上限、PR 提示及同 SHA in-flight guard | 专业研发 |
 | 临时撤必需检查才能合 | **已约束** | 只允许清幽灵且合后立刻加回；**禁止 `--admin`**；优先 `heal-required-checks.sh` | 专业研发 |
 | 打无关标签（如 `qa-passed`）触发 codex-gate labeled → 幽灵 | **进行中**（随 B） | codex/qa caller 增加 `*-label-ack`；无关 label 不再 skip-all | 专业研发 |
 | 转仓后 workflow 权限被改成 write / 可批 PR（kilocean） | **待修**/检查单 | **转仓必查**：permissions、branch protection、required checks、App 安装 | 专业研发 |
