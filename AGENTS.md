@@ -57,17 +57,24 @@ in [README.md](README.md).
     older head's evaluation. Label / review / dispatch runs get their own
     group: a label or review event must never cancel a push evaluation, and
     a cancelled required check must never be the final word.
-    Plan B label ack and same-SHA labeled evaluate share `label-{sha}` with
-    cancel-in-progress to close the mirror list→create TOCTOU.
+    Label evaluate and ack use separate `label-eval-{sha}` / `label-ack-{sha}`
+    groups: unrelated labels must never cancel real evaluation. Before mirroring
+    success, read current relevant labels and their latest issue events; stale
+    or unverifiable state must produce failure with an explanation. Mirrors
+    copy only same-named real job conclusions, never invent success or use
+    a prior mirror as a fresh verdict. `no-auto-merge` is relevant too.
 - Cancelled required checks are healed, never bypassed (A1/A2, 2026-10):
   branch protection gates on the LATEST check run per required name on the
   head SHA, so a stuck cancelled/expected check blocks merge even when the
   change is substantively green (jobs-qianhao-ai #4).
-  - A1: the gate callers self-listen via `workflow_run(completed)` (fires
-    from the default branch only; GitHub caps workflow_run chains at 3
-    levels, so self-listening cannot loop) and run a `*-cancel-heal` job
-    (QA's is DEFAULT ON) that routes to the reusable refresh job, which
-    re-runs the TRIGGERING cancelled run — a cancelled run cannot run its
+  - A1: separately named companion workflows listen via `workflow_run(completed)`
+    (default branch only) and run a `*-cancel-heal` job. A workflow that
+    includes its own name in `on.workflow_run.workflows` is invalid; enforce
+    this with `scripts/check-no-self-listen.py`. Companions
+    (QA's is DEFAULT ON) route to the reusable refresh job, which
+    re-runs the TRIGGERING cancelled run. Locate the SOURCE workflow using
+    `workflow_run.workflow_id` or fetch `workflow_run.id`; never use the
+    companion current run/workflow identity. A cancelled run cannot run its
     own post steps. Same caps: one re-run per PR, attempt 3, never while a
     run is in flight. Heal/refresh concurrency groups are never
     cancelled and never join the push cancel-in-progress group.

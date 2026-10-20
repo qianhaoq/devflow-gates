@@ -33,7 +33,7 @@
 #   - issue_comment / workflow_run conclusions do not attach to the PR head
 #     check — the Refresh job re-runs a head-attached evaluate run instead.
 #
-# Cancel-heal (A1): caller self-listens workflow_run(completed) and routes
+# Cancel-heal (A1): a separate companion listens workflow_run(completed) and routes
 # cancelled completions to the refresh job (same caps as QA/Codex).
 
 name: Reusable Diff Quiz Gate
@@ -504,7 +504,7 @@ jobs:
               ? Number(context.payload.workflow_run?.id) || 0 : 0;
 
             const { data: thisRun } = await github.rest.actions.getWorkflowRun({
-              owner, repo, run_id: context.runId,
+              owner, repo, run_id: triggeredId || context.runId,
             });
             const workflowId = thisRun.workflow_id;
             core.info(`Refreshing Diff Quiz for workflow "${thisRun.name}" (id ${workflowId})`);

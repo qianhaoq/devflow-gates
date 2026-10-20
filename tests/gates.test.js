@@ -679,7 +679,7 @@ const UNL_KW = 'This is a security problem.';
         actions: {
           // Branches by run_id: context.runId (=1) and any id not in runById
           // keep the default caller-workflow answer.
-          getWorkflowRun: async (a) => ({ data: (runById && runById[a.run_id]) || { workflow_id: 7, name: 'Gate' } }),
+          getWorkflowRun: async (a) => ({ data: (runById && runById[a.run_id]) || { workflow_id: eventName === 'workflow_run' && a.run_id === 1 ? 999 : 7, name: 'Gate' } }),
           listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
           reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
           reRunWorkflow: async (a) => { reran.push(`all:${a.run_id}`); },
@@ -698,6 +698,7 @@ const UNL_KW = 'This is a security problem.';
         if (fn === github.rest.issues.listEvents) return labelEvents;
         if (fn === github.rest.pulls.list) return prList;
         if (fn === github.rest.actions.listWorkflowRuns) {
+          assert.strictEqual(args.workflow_id, 7, 'heal must query source workflow, not companion');
           // The cancel-heal fallback sweeps workflow-wide: no event/head_sha.
           if (!args.event && !args.head_sha) return allRuns || [];
           return runsByEvent[args.event] || [];
@@ -1020,9 +1021,52 @@ const UNL_KW = 'This is a security problem.';
     });
   }
 
+  for (const file of ['codex-gate.yml', 'qa-gate.yml', 'understand-gate.yml']) {
+    await t(`${file}: companion heal uses triggering workflow and respects attempt cap`, async () => {
+      for (const attempt of [1, 3]) {
+        const reruns = [];
+        const source = { id: 21, workflow_id: 7, status: 'completed', conclusion: 'cancelled', event: 'pull_request_target', run_attempt: attempt, created_at: '2026-10-16T01:00:00Z', pull_requests: [{ number: 9 }] };
+        const pr = { number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'feature' }, labels: [] };
+        const github = { rest: {
+          actions: {
+            getWorkflowRun: async ({ run_id }) => {
+              assert.strictEqual(run_id, 21, 'must fetch source, not companion current run');
+              return { data: source };
+            },
+            listWorkflowRuns: {},
+            reRunWorkflow: async ({ run_id }) => reruns.push(run_id),
+          },
+          pulls: { get: async () => ({ data: pr }), list: {} },
+          issues: { listComments: {}, listEvents: {} },
+        }, paginate: async (method, args) => {
+          if (method === github.rest.actions.listWorkflowRuns) {
+            assert.strictEqual(args.workflow_id, 7);
+            return [source];
+          }
+          return [];
+        } };
+        const context = { runId: 999, repo: { owner: 'o', repo: 'r' }, eventName: 'workflow_run', payload: { workflow_run: source } };
+        const core = { info() {}, warning() {}, setFailed(m) { throw new Error(m); } };
+        await new AsyncFunction('github', 'context', 'core', 'process', scripts(file)[1])(github, context, core, { env: { GATE_MODE: 'refresh', REFRESH_POLL_MS: '0', QA_LABEL: 'qa-passed' } });
+        assert.deepStrictEqual(reruns, attempt === 1 ? [21] : []);
+      }
+    });
+  }
+
+  await t('all refresh paths resolve source workflow from triggering run in companions', () => {
+    for (const file of ['codex-gate.yml', 'qa-gate.yml', 'understand-gate.yml']) {
+      const refreshScripts = scripts(file).filter(src => src.includes('const triggeredId ='));
+      assert.ok(refreshScripts.length);
+      for (const src of refreshScripts) {
+        assert.match(src, /run_id: triggeredId \|\| context.runId/);
+        assert.match(src, /const workflowId = thisRun.workflow_id/);
+      }
+    }
+  });
+
   // ---------- mirror-required-check.yml script ----------
   {
-    async function runMirror({ runAttempt = 1, workflowRuns = [], checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
+    async function runMirror({ relevantLabels = '', events = [], eventsError = false, labels = [], runAttempt = 1, workflowRuns = [], checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
       const src = scripts('mirror-required-check.yml')[0];
       const created = [];
       const infos = [];
@@ -1036,6 +1080,10 @@ const UNL_KW = 'This is a security problem.';
             assert.strictEqual(args.per_page, 100);
             return workflowRuns;
           }
+          if (method === github.rest.issues.listEvents) {
+            if (eventsError) throw new Error('events unavailable');
+            return events;
+          }
           return checks;
         },
         rest: {
@@ -1043,7 +1091,7 @@ const UNL_KW = 'This is a security problem.';
             listForRef: {},
             create: async (args) => { created.push(args); return { data: args }; },
           },
-          issues: { createComment: async (args) => { comments.push(args); } },
+          issues: { listEvents: {}, get: async () => ({ data: { labels } }), createComment: async (args) => { comments.push(args); } },
           actions: {
             getWorkflowRun: async (args) => {
               assert.strictEqual(args.run_id, 4242);
@@ -1064,9 +1112,54 @@ const UNL_KW = 'This is a security problem.';
         setFailed: (m) => { throw new Error('setFailed: ' + m); },
       };
       await new AsyncFunction('github', 'context', 'core', 'process', src)(
-        github, context, core, { env: { CHECK_NAME: checkName } });
+        github, context, core, { env: { CHECK_NAME: checkName, RELEVANT_LABELS: relevantLabels } });
       return { created, infos, reruns, comments };
     }
+    await t('mirror: relevant label removal and unreadable history refuse old success', async () => {
+      for (const relevantLabels of ['qa-passed', 'skip-codex-gate']) {
+        for (const eventsError of [false, true]) {
+          const { created } = await runMirror({ relevantLabels, eventsError,
+            label: 'triage', action: 'labeled',
+            events: [{ event: 'unlabeled', label: { name: relevantLabels }, created_at: '2026-10-20T03:00:00Z' }],
+            checks: [{ id: 1, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T02:00:00Z', details_url: 'https://github.com/o/r/actions/runs/123/job/456' }],
+          });
+          assert.strictEqual(created[0].conclusion, 'failure');
+          assert.match(created[0].output.summary, /Success refused/);
+        }
+      }
+    });
+    await t('mirror: label history older than real verdict permits success', async () => {
+      const { created } = await runMirror({ relevantLabels: 'qa-passed', labels: [{ name: 'qa-passed' }],
+        events: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T01:00:00Z' }],
+        checks: [{ id: 1, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T02:00:00Z', details_url: 'https://github.com/o/r/actions/runs/123/job/456' }],
+      });
+      assert.strictEqual(created[0].conclusion, 'success');
+    });
+    await t('self-listen guard rejects own name, accepts companion and scans repo', () => {
+      const code = "import runpy; f=runpy.run_path('scripts/check-no-self-listen.py')['self_listens']; assert f('name: Gate\\non: {workflow_run: {workflows: [Gate]}}'); assert not f('name: Heal\\non: {workflow_run: {workflows: [Gate]}}')";
+      require('child_process').execFileSync('python3', ['-c', code.replace(/\\n/g, '\\n')]);
+      require('child_process').execFileSync('python3', ['scripts/check-no-self-listen.py']);
+    });
+    const success = { id: 77, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T02:00:00Z', details_url: 'https://github.com/o/r/actions/runs/123/job/456' };
+    for (const relevant of ['qa-passed', 'skip-codex-gate']) {
+      await t(`mirror: ${relevant} removal after source success then irrelevant label refuses green`, async () => {
+        const { created } = await runMirror({ relevantLabels: relevant, label: 'triage', checks: [success], events: [{ event: 'unlabeled', label: { name: relevant }, created_at: '2026-10-20T03:00:00Z' }] });
+        assert.strictEqual(created[0].conclusion, 'failure');
+        assert.match(created[0].output.summary, /Run the real gate/);
+      });
+    }
+    await t('mirror: events API failure refuses success', async () => {
+      const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success], eventsError: true });
+      assert.strictEqual(created[0].conclusion, 'failure');
+    });
+    await t('mirror: older relevant event matching current state copies real success', async () => {
+      const { created } = await runMirror({ relevantLabels: 'qa-passed,no-auto-merge', labels: [{ name: 'qa-passed' }], checks: [success], events: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T00:00:00Z' }] });
+      assert.strictEqual(created[0].conclusion, 'success');
+    });
+    await t('mirror: previous mirror cannot freshen old success', async () => {
+      const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success, { ...success, id: 78, created_at: '2026-10-20T04:00:00Z', completed_at: '2026-10-20T04:00:00Z', output: { title: 'Label ack: mirrored success' } }], events: [{ event: 'unlabeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T03:00:00Z' }] });
+      assert.strictEqual(created[0].conclusion, 'failure');
+    });
     await t('mirror: copies latest by created_at (not completed_at)', async () => {
       // Older green finishes AFTER newer red — created_at must win (red).
       const { created } = await runMirror({
@@ -1182,12 +1275,13 @@ const UNL_KW = 'This is a security problem.';
         assert.ok(!/pull-requests:\s*write/.test(ack));
       }
     });
-    await t('codex/qa callers: labeled evaluate + ack serialize by SHA and cancel older labels', () => {
+    await t('codex/qa callers: labeled evaluate + ack have separate SHA groups', () => {
       for (const f of ['codex-gate.yml', 'qa-gate.yml']) {
         const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', f), 'utf8');
         const concurrency = ex.split(/^concurrency:/m)[1].split(/^jobs:/m)[0];
         assert.ok(!/&& 'prt'/.test(concurrency), f + ' must NOT share a prt pending queue');
-        assert.ok(concurrency.includes(`contains(fromJSON('["labeled","unlabeled"]'), github.event.action)) && format('label-{0}', github.event.pull_request.head.sha)`));
+        assert.ok(concurrency.includes("'label-eval-{0}' || 'label-ack-{0}'"));
+        assert.ok(concurrency.includes('no-auto-merge'));
         const cancel = concurrency.split('cancel-in-progress:')[1];
         assert.ok(cancel.includes(`|| contains(fromJSON('["labeled","unlabeled"]'), github.event.action)`));
         assert.ok(concurrency.includes("&& 'push'"));

@@ -11,9 +11,9 @@
 # Call from the product caller ONLY for irrelevant labels; keep the real
 # gate job for gate-relevant labels (skip-codex-gate / qa-passed / …).
 #
-# Caller labeled/unlabeled paths MUST share label-{head.sha} concurrency with
-# cancel-in-progress: true across evaluate and ack: this is the primary TOCTOU
-# lock. Mirror revalidation is defense only and cannot provide atomicity.
+# Caller evaluate and ack use separate concurrency groups. Validate label history
+# immediately before mirroring success; uncertainty produces failure.
+# Only same-named real job verdicts are eligible sources, never earlier mirrors.
 #
 # Check name produced by THIS job's Actions wrapper is
 # "<caller job id> / Mirror Required Check" (harmless side check). The
@@ -28,6 +28,11 @@ on:
         description: 'Exact required check name to mirror (e.g. "codex / Codex Review Gate")'
         required: true
         type: string
+      relevant_labels:
+        description: 'Gate-relevant labels, comma or newline separated (required to mirror success)'
+        type: string
+        required: false
+        default: ''
       runs_on:
         description: 'Runner label or JSON array string'
         required: false
@@ -58,6 +63,7 @@ jobs:
         uses: actions/github-script@v7
         env:
           CHECK_NAME: ${{ inputs.check_name }}
+          RELEVANT_LABELS: ${{ inputs.relevant_labels }}
         with:
           script: |
             const owner = context.repo.owner;
@@ -112,6 +118,14 @@ jobs:
               return;
             }
 
+            const observedId = latest.id;
+            const observedConclusion = latest.conclusion;
+            // Mirrors must never become sources for another mirror.
+            if (/^Label ack:/.test(latest.output?.title || '')) {
+              latest = sorted.find(r => !/^Label ack:/.test(r.output?.title || ''));
+              if (!latest || latest.status !== 'completed' || !latest.conclusion) return;
+            }
+            const source = latest;
             const conclusion = latest.conclusion;
             const sourceId = latest.id;
 
@@ -170,14 +184,14 @@ jobs:
               'Gate-relevant labels still run the real evaluator.',
             ].join('\n\n');
 
-            // Defensive supplement to caller label concurrency (the primary TOCTOU fix).
+            // Revalidate the observed latest check immediately before posting.
             // Revalidate immediately before create: an evaluator may have
             // started (or finished) since the first list. Never let a stale
             // mirror become the newest same-named check ahead of a live gate.
             runs = await listNamed();
             sorted = (runs || []).slice().sort(byNewestCreated);
             latest = sorted[0];
-            if (!latest || latest.id !== sourceId || latest.conclusion !== conclusion
+            if (!latest || latest.id !== observedId || latest.conclusion !== observedConclusion
               || (latest.status && latest.status !== 'completed')) {
               core.info(`Pre-create revalidate: latest "${checkName}" changed (now id ${latest?.id}, status ${latest?.status}, conclusion ${latest?.conclusion}) — not mirroring`);
               return;
@@ -187,22 +201,51 @@ jobs:
             runs = await listNamed();
             latest = (runs || []).slice().sort(byNewestCreated)[0];
             if ((runs || []).some(r => r.status && r.status !== 'completed')
-              || !latest || latest.id !== sourceId || latest.conclusion !== conclusion) {
+              || !latest || latest.id !== observedId || latest.conclusion !== observedConclusion) {
               core.info(`Final pre-create revalidate: "${checkName}" changed or is in flight — not mirroring`);
               return;
             }
 
-            // Atomicity is guaranteed by caller label-{head.sha} concurrency
-            // with cancel-in-progress across labeled evaluate and ack paths.
-            // This pre-create revalidation is defense only: Checks list/create
-            // is not atomic and cannot replace the caller concurrency lock.
+            let mirroredConclusion = conclusion;
+            let labelError = '';
+            if (conclusion === 'success') {
+              try {
+                const relevant = new Set((process.env.RELEVANT_LABELS || '').split(/[,\n]/).map(s => s.trim()).filter(Boolean));
+                if (!relevant.size) throw new Error('relevant_labels missing');
+                const number = context.payload.pull_request?.number;
+                const { data: pr } = await github.rest.issues.get({ owner, repo, issue_number: number });
+                if (!Array.isArray(pr.labels)) throw new Error('current labels missing');
+                const events = await github.paginate(github.rest.issues.listEvents, { owner, repo, issue_number: number, per_page: 100 });
+                if (!Array.isArray(events)) throw new Error('label events missing');
+                if (!/\/actions\/runs\/\d+/.test(source.details_url || source.html_url || '')) throw new Error('real job provenance missing');
+                const cutoff = Date.parse(source.started_at || source.completed_at || '');
+                if (!Number.isFinite(cutoff)) throw new Error('source verdict timestamp missing');
+                for (const name of relevant) {
+                  const history = events.filter(e => e.label?.name === name && ['labeled', 'unlabeled'].includes(e.event));
+                  if (history.some(e => !Number.isFinite(Date.parse(e.created_at)))) throw new Error(`invalid history for ${name}`);
+                  history.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || (b.id || 0) - (a.id || 0));
+                  const last = history[0];
+                  const present = pr.labels.some(l => (typeof l === 'string' ? l : l.name) === name);
+                  if ((!last && present) || (last && (Date.parse(last.created_at) >= cutoff || (last.event === 'labeled') !== present))) {
+                    throw new Error(`label state cannot be confirmed at source verdict: ${name}`);
+                  }
+                }
+              } catch (error) {
+                mirroredConclusion = 'failure';
+                labelError = `Success refused: ${error.message}. Run the real gate evaluator again.`;
+                core.info(labelError);
+              }
+            }
             await github.rest.checks.create({
               owner,
               repo,
               name: checkName,
               head_sha: sha,
               status: 'completed',
-              conclusion,
-              output: { title, summary },
+              conclusion: mirroredConclusion,
+              output: {
+                title: labelError ? 'Label ack: success refused' : title,
+                summary: labelError ? `${summary}\n\n${labelError}` : summary,
+              },
             });
-            core.info(`Mirrored "${checkName}" = ${conclusion} on ${sha.slice(0, 7)} (source ${sourceId})`);
+            core.info(`Mirrored "${checkName}" = ${mirroredConclusion} on ${sha.slice(0, 7)} (source ${sourceId})`);

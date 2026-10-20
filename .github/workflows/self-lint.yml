@@ -50,6 +50,9 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
+      - name: Install workflow parser
+        run: python3 -c 'import yaml' 2>/dev/null || pip install --quiet 'pyyaml==6.0.2'
+
       # Dry-run of the inline github-script logic (severity classifier,
       # block_unlabeled, explicit-P2, QA draft/synchronize ordering) with
       # mocked GitHub API — no network, no tokens.
@@ -62,3 +65,8 @@ jobs:
         run: |
           python3 -c 'import yaml' 2>/dev/null || pip install --quiet 'pyyaml==6.0.2'
           python3 tests/acceptance_test.py
+
+      - name: Reject workflow self-listeners
+        run: |
+          python3 scripts/check-no-self-listen.py
+          python3 tests/no_self_listen_test.py
