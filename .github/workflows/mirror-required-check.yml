@@ -11,6 +11,10 @@
 # Call from the product caller ONLY for irrelevant labels; keep the real
 # gate job for gate-relevant labels (skip-codex-gate / qa-passed / …).
 #
+# Caller labeled/unlabeled paths MUST share label-{head.sha} concurrency with
+# cancel-in-progress: true across evaluate and ack: this is the primary TOCTOU
+# lock. Mirror revalidation is defense only and cannot provide atomicity.
+#
 # Check name produced by THIS job's Actions wrapper is
 # "<caller job id> / Mirror Required Check" (harmless side check). The
 # required name is created explicitly via checks.create below.
@@ -34,7 +38,6 @@ permissions:
   contents: read
   checks: write
   actions: write
-  pull-requests: write
   issues: write
 
 jobs:
@@ -49,7 +52,6 @@ jobs:
       contents: read
       checks: write
       actions: write
-      pull-requests: write
       issues: write
     steps:
       - name: Mirror latest required-check conclusion
@@ -140,11 +142,14 @@ jobs:
                 return;
               }
               const workflowRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
-                owner, repo, workflow_id: run.workflow_id, head_sha: sha, per_page: 100,
+                owner, repo, workflow_id: run.workflow_id, per_page: 100,
               });
               const activeStatuses = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
-              if (workflowRuns.some(r => r.head_sha === sha && activeStatuses.has(r.status))) {
-                core.info(`Workflow ${run.workflow_id} already has an in-flight run on ${sha.slice(0, 7)} — not re-running cancelled run ${run_id}`);
+              const prNumber = context.payload.pull_request?.number;
+              // PRT workflow head_sha is the base SHA; match the PR association.
+              if (workflowRuns.some(r => r.id !== run_id && activeStatuses.has(r.status)
+                && (r.pull_requests || []).some(p => p.number === prNumber))) {
+                core.info(`Workflow ${run.workflow_id} already has an in-flight run for PR #${prNumber} — not re-running cancelled run ${run_id}`);
                 return;
               }
               await github.rest.actions.reRunWorkflow({ owner, repo, run_id });
@@ -178,6 +183,19 @@ jobs:
               return;
             }
 
+            // One final Checks read after the preceding revalidation passed.
+            runs = await listNamed();
+            latest = (runs || []).slice().sort(byNewestCreated)[0];
+            if ((runs || []).some(r => r.status && r.status !== 'completed')
+              || !latest || latest.id !== sourceId || latest.conclusion !== conclusion) {
+              core.info(`Final pre-create revalidate: "${checkName}" changed or is in flight — not mirroring`);
+              return;
+            }
+
+            // Atomicity is guaranteed by caller label-{head.sha} concurrency
+            // with cancel-in-progress across labeled evaluate and ack paths.
+            // This pre-create revalidation is defense only: Checks list/create
+            // is not atomic and cannot replace the caller concurrency lock.
             await github.rest.checks.create({
               owner,
               repo,

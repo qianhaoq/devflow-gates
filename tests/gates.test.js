@@ -1032,7 +1032,8 @@ const UNL_KW = 'This is a security problem.';
         paginate: async (method, args) => {
           if (method === github.rest.actions.listWorkflowRuns) {
             assert.strictEqual(args.workflow_id, 99);
-            assert.strictEqual(args.head_sha, sha);
+            assert.ok(!Object.hasOwn(args, 'head_sha'));
+            assert.strictEqual(args.per_page, 100);
             return workflowRuns;
           }
           return checks;
@@ -1088,25 +1089,27 @@ const UNL_KW = 'This is a security problem.';
       assert.ok(infos.some((m) => /still in_progress/.test(m)));
     });
     await t('mirror: pre-create revalidate aborts if latest changed', async () => {
-      let n = 0;
-      const src = scripts('mirror-required-check.yml')[0];
-      const created = [];
-      const infos = [];
-      const first = [{ id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z' }];
-      const second = [{ id: 2, status: 'in_progress', conclusion: null, created_at: '2026-10-20T02:00:00Z' }];
-      const github = {
-        paginate: async () => (++n === 1 ? first : second),
-        rest: { checks: { listForRef: {}, create: async (args) => { created.push(args); return { data: args }; } } },
-      };
-      const context = {
-        repo: { owner: 'o', repo: 'r' }, eventName: 'pull_request_target',
-        payload: { action: 'labeled', label: { name: 'wip' }, pull_request: { head: { sha: 'abc1234000000000000000000000000000000000' } } },
-      };
-      const core = { info: (m) => infos.push(m), setFailed: (m) => { throw new Error(m); } };
-      await new AsyncFunction('github', 'context', 'core', 'process', src)(
-        github, context, core, { env: { CHECK_NAME: 'codex / Codex Review Gate' } });
-      assert.deepStrictEqual(created, []);
-      assert.ok(infos.some((m) => /Pre-create revalidate/.test(m)));
+      for (const changeOnRead of [2, 3]) {
+        let n = 0;
+        const src = scripts('mirror-required-check.yml')[0];
+        const created = [];
+        const infos = [];
+        const first = [{ id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z' }];
+        const second = [{ id: 2, status: 'in_progress', conclusion: null, created_at: '2026-10-20T02:00:00Z' }];
+        const github = {
+          paginate: async () => (++n < changeOnRead ? first : second),
+          rest: { checks: { listForRef: {}, create: async (args) => { created.push(args); return { data: args }; } } },
+        };
+        const context = {
+          repo: { owner: 'o', repo: 'r' }, eventName: 'pull_request_target',
+          payload: { action: 'labeled', label: { name: 'wip' }, pull_request: { head: { sha: 'abc1234000000000000000000000000000000000' } } },
+        };
+        const core = { info: (m) => infos.push(m), setFailed: (m) => { throw new Error(m); } };
+        await new AsyncFunction('github', 'context', 'core', 'process', src)(
+          github, context, core, { env: { CHECK_NAME: 'codex / Codex Review Gate' } });
+        assert.deepStrictEqual(created, []);
+        assert.ok(infos.some((m) => /pre-create revalidate/i.test(m)));
+      }
     });
     await t('mirror: no prior completed check → no invent success', async () => {
       const { created, infos } = await runMirror({ checks: [] });
@@ -1151,18 +1154,32 @@ const UNL_KW = 'This is a security problem.';
         assert.ok(result.infos.some(m => /attempt cap/.test(m)));
       }
     });
-    await t('mirror: same-SHA workflow in flight prevents cancelled heal', async () => {
+    await t('mirror: PR-associated in-flight PRT peer prevents cancelled heal', async () => {
       for (const status of ['queued', 'in_progress', 'waiting', 'pending', 'requested', 'completed']) {
-        for (const sameSha of [true, false]) {
-          const result = await runMirror({
-            checks: [{ id: 7, status: 'completed', conclusion: 'cancelled', details_url: 'https://github.com/o/r/actions/runs/4242' }],
-            workflowRuns: [{ status, head_sha: sameSha ? 'abc1234000000000000000000000000000000000' : 'other' }],
-          });
-          assert.deepStrictEqual(result.created, []);
-          const blocked = sameSha && status !== 'completed';
-          assert.strictEqual(result.reruns.length, blocked ? 0 : 1);
-          if (blocked) assert.ok(result.infos.some(m => /in-flight/.test(m)));
+        for (const association of [9, 10, null]) {
+          for (const id of [4242, 4243]) {
+            const result = await runMirror({
+              checks: [{ id: 7, status: 'completed', conclusion: 'cancelled', details_url: 'https://github.com/o/r/actions/runs/4242' }],
+              workflowRuns: [{ id, status, head_sha: 'base-sha',
+                ...(association === null ? {} : { pull_requests: [{ number: association }] }) }],
+            });
+            assert.deepStrictEqual(result.created, []);
+            const blocked = id !== 4242 && association === 9 && status !== 'completed';
+            assert.strictEqual(result.reruns.length, blocked ? 0 : 1);
+            if (blocked) assert.ok(result.infos.some(m => /in-flight/.test(m)));
+          }
         }
+      }
+    });
+    await t('mirror and label-ack grant issues write without pull-requests write', () => {
+      const mirror = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/mirror-required-check.yml'), 'utf8');
+      assert.ok(!/pull-requests:\s*write/.test(mirror));
+      assert.strictEqual((mirror.match(/issues:\s*write/g) || []).length, 2);
+      for (const gate of ['codex', 'qa']) {
+        const caller = fs.readFileSync(path.join(__dirname, '..', 'examples', gate + '-gate.yml'), 'utf8');
+        const ack = caller.split('  ' + gate + '-label-ack:')[1].split(/^  [a-zA-Z]/m)[0];
+        assert.match(ack, /issues:\s*write/);
+        assert.ok(!/pull-requests:\s*write/.test(ack));
       }
     });
     await t('codex/qa callers: labeled evaluate + ack serialize by SHA and cancel older labels', () => {

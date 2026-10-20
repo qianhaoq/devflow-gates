@@ -53,8 +53,9 @@
 #     replace an older still-pending one. Never cancelled — a heal must not
 #     be cancelled by a newer push (the re-run preserves the ORIGINAL event
 #     and never joins the push group).
-#   - labeled/unlabeled share label-{sha} + cancel-in-progress (Plan B):
-#     serialize evaluate + ack to close mirror TOCTOU. A later triage label
+#   - labeled/unlabeled MUST share label-{head.sha} + cancel-in-progress
+#     (Plan B) across evaluate + ack: this is the primary TOCTOU lock.
+#     Mirror revalidation is defense only. A later triage label
 #     may cancel unfinished skip-codex-gate evaluate; reapply it or /recheck.
 #   - every other run (Codex reviews, dispatch, skipped events)
 #     gets its own group: never cancelled, never cancels. Gate runs are
@@ -151,7 +152,6 @@ jobs:
       contents: read
       checks: write
       actions: write
-      pull-requests: write
       issues: write
     uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@main
     with:
