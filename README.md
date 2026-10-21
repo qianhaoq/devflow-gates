@@ -27,8 +27,8 @@ uses: qianhaoq/devflow-gates/.github/workflows/<工作流文件>.yml@main
 | `examples/codex-gate.yml` | `codex` | `codex / Codex Review Gate` |
 | `examples/codex-gate.yml` | `codex-refresh` | `codex-refresh / Codex Gate Refresh`（仅 Codex 评论 / `/recheck` 评论触发，**不**挂在 PR 检查上） |
 | `examples/codex-gate-cancel-heal.yml` | `codex-cancel-heal` | `codex-cancel-heal / Codex Gate Refresh`（独立 companion 监听 `workflow_run`，仅 cancelled 完成时触发，**不**挂在 PR 检查上） |
-| `examples/codex-gate.yml` | `codex-label-ack` | 侧车 `codex-label-ack / Mirror Required Check`；并通过 Checks API 重挂 **`codex / Codex Review Gate`**（仅无关 label） |
-| `examples/qa-gate.yml` | `qa-label-ack` | 侧车 `qa-label-ack / Mirror Required Check`；并通过 Checks API 重挂 **`qa / QA Gate`**（仅无关 label） |
+| `examples/codex-gate.yml` | `codex-label-ack`（`name: codex`） | 仅无关 label：job 本身即 **`codex / Codex Review Gate`**，结论 = 最新真实评估结论（不再 checks.create） |
+| `examples/qa-gate.yml` | `qa-label-ack`（`name: qa`） | 仅无关 label：job 本身即 **`qa / QA Gate`**，结论 = 最新真实评估结论（不再 checks.create） |
 | `examples/qa-gate.yml` | `qa` | `qa / QA Gate` |
 | `examples/qa-gate.yml` | `qa-refresh` | `qa-refresh / QA Gate Refresh`（可选，示例默认注释掉；仅 schedule 运行，**不**挂在 PR 检查上） |
 | `examples/qa-gate-cancel-heal.yml` | `qa-cancel-heal` | `qa-cancel-heal / QA Gate Refresh`（独立 companion 监听 `workflow_run`，仅 cancelled 完成时触发，**默认启用**，**不**挂在 PR 检查上） |
@@ -134,8 +134,9 @@ Job：
 converted_to_draft, labeled, unlabeled]（**方案 B**：`skip-codex-gate` 的
 labeled/unlabeled → 真评估；**其它标签** → `codex-label-ack` 调用
 [`mirror-required-check.yml`](.github/workflows/mirror-required-check.yml)
-按 head 上最新同名结论重挂 `codex / Codex Review Gate`，避免全 job skipped
-导致的 `is expected` 幽灵，且不发明 success；见
+以 job 名 `codex / Codex Review Gate` 运行（caller `name: codex` + 输入
+`job_name`），用 job 结论表达 head 上最新真实同名结论（进行中则有界轮询，
+超时失败），避免全 job skipped 导致的 `is expected` 幽灵，不发明 success、不用 checks.create；见
 [docs/PITFALLS.md](docs/PITFALLS.md)）、
 `pull_request_review` [submitted]（只评估 Codex 的 review）、
 `pull_request_review_comment` [created, edited]（只评估 Codex 评论的**编辑**
@@ -294,8 +295,8 @@ pull_request_review(_comment) / PR 分支上的 workflow_dispatch；被调用方
 需要写权限；可复用工作流自己无法提权）。触发事件：`pull_request_target`
 [opened, synchronize, reopened, ready_for_review, converted_to_draft,
 labeled, unlabeled] + `workflow_dispatch(pr_number)`；`qa-passed` 的
-labeled/unlabeled → 真评估；**其它标签** → `qa-label-ack` mirror 同名
-`qa / QA Gate`（反幽灵，不空跑 QA），synchronize 从不过滤。
+labeled/unlabeled → 真评估；**其它标签** → `qa-label-ack`（`name: qa`）以 job
+`qa / QA Gate` 本身表达最新真实结论（反幽灵，不空跑 QA），synchronize 从不过滤。
 **没有 schedule**：QA 的每个输入变化（push、打/撤标签、草稿/就绪）本身就是
 pull_request_target 事件。`converted_to_draft` 让退回草稿的
 PR 立刻把检查置为失败。

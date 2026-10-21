@@ -65,18 +65,24 @@ jobs:
 
   # Anti-ghost ack (方案 B): irrelevant labels must NOT skip every job.
   qa-label-ack:
+    # Job name = required prefix: the called job "QA Gate" is then the
+    # required check "qa / QA Gate" itself (conclusion = mirrored verdict).
+    name: qa
     if: >-
       github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
       github.event.label.name != 'qa-passed' && github.event.label.name != 'no-auto-merge'
     permissions:
       contents: read
-      checks: write
+      checks: read
       actions: write
       issues: write
+      pull-requests: read
     uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@main
     with:
       check_name: 'qa / QA Gate'
+      job_name: 'QA Gate'
+      wait_minutes: 30   # > real gate timeout (10) + runner queue time
       relevant_labels: 'qa-passed,no-auto-merge'
       # runs_on: self-hosted   # keep in sync with qa job above
 

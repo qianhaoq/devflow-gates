@@ -1022,7 +1022,7 @@ const UNL_KW = 'This is a security problem.';
   // ---------- Caller anti-ghost policy (方案 B) ----------
   // A pull_request_target labeled run whose caller jobs all skip creates a
   // check suite with no "<job> / <Gate>" check → GitHub hangs on "is expected".
-  // Fix: gate-relevant labels evaluate; irrelevant labels mirror via Checks API.
+  // Fix: gate-relevant labels evaluate; irrelevant labels run a label-ack job named as the required check.
   {
     function callerPrtTypes(exampleFile) {
       const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', exampleFile), 'utf8');
@@ -1114,306 +1114,211 @@ const UNL_KW = 'This is a security problem.';
     }
   });
 
-  // ---------- mirror-required-check.yml script ----------
+  // ---------- mirror-required-check.yml script (label ack = required job) ----------
   {
-    async function runMirror({ relevantLabels = '', events = [], eventsError = false, afterEvents, labels = [], runAttempt = 1, workflowRuns = [], checks = [], sha = 'abc1234000000000000000000000000000000000', label = 'qa-passed', action = 'labeled', checkName = 'codex / Codex Review Gate' } = {}) {
+    const SHA = 'abc1234000000000000000000000000000000000';
+    const ACK_STEP = 'Label ack mirror latest real gate verdict';
+    const job = (id, conclusion, extra = {}) => ({ id, status: 'completed', conclusion,
+      started_at: '2026-10-20T02:00:00Z', completed_at: '2026-10-20T02:05:00Z',
+      details_url: `https://github.com/o/r/actions/runs/${4000 + id}/job/${id}`, ...extra });
+    // checks: array, or function(readNo) => array (simulates progress over polls).
+    async function runMirror({ relevantLabels = 'qa-passed,no-auto-merge', events = [], eventsError = false, labels = [],
+      runAttempt = 1, workflowRuns = [], checks = [], ackJobs = [], unknownJobs = [], noStepJobs = [], jobError = false,
+      sha = SHA, label = 'triage', action = 'labeled', checkName = 'qa / QA Gate', jobName = 'QA Gate',
+      waitMinutes = '0', selfRun = 9999 } = {}) {
       const src = scripts('mirror-required-check.yml')[0];
-      const created = [];
-      const infos = [];
-      const reruns = [];
-      const comments = [];
+      const infos = []; const reruns = []; const comments = []; const created = [];
+      let reads = 0; let failed = null; const classified = [];
       const github = {
         paginate: async (method, args) => {
-          if (method === github.rest.actions.listWorkflowRuns) {
-            assert.strictEqual(args.workflow_id, 99);
-            assert.ok(!Object.hasOwn(args, 'head_sha'));
-            assert.strictEqual(args.per_page, 100);
-            return workflowRuns;
-          }
-          if (method === github.rest.issues.listEvents) {
-            if (afterEvents) afterEvents(checks);
-            if (eventsError) throw new Error('events unavailable');
-            return events;
-          }
-          assert.strictEqual(args.filter, 'all', 'must retain real jobs behind newer label mirrors');
-          return args.filter === 'all' ? checks : checks.slice(-1);
+          if (method === github.rest.actions.listWorkflowRuns) return workflowRuns;
+          if (method === github.rest.issues.listEvents) { if (eventsError) throw new Error('events unavailable'); return events; }
+          assert.strictEqual(args.filter, 'all');
+          assert.strictEqual(args.check_name, checkName);
+          reads++;
+          return typeof checks === 'function' ? checks(reads) : checks;
         },
         rest: {
-          checks: {
-            listForRef: {},
-            create: async (args) => { created.push(args); return { data: args }; },
-          },
-          issues: { listEvents: {}, get: async () => ({ data: { labels } }), createComment: async (args) => { comments.push(args); } },
+          checks: { listForRef: {}, create: async (a) => { created.push(a); } },
+          issues: { listEvents: {}, get: async () => ({ data: { labels } }), createComment: async (a) => { comments.push(a); } },
           actions: {
-            getWorkflowRun: async (args) => {
-              assert.strictEqual(args.run_id, 4242);
-              return { data: { workflow_id: 99, run_attempt: runAttempt } };
+            getJobForWorkflowRun: async ({ job_id }) => {
+              if (jobError) throw new Error('jobs api down');
+              classified.push(job_id);
+              if (unknownJobs.includes(job_id)) return { data: { status: 'queued', steps: [] } };
+              if (noStepJobs.includes(job_id)) return { data: { status: 'completed', steps: [] } };
+              return { data: { steps: [{ name: 'Set up job' }, { name: ackJobs.includes(job_id) ? ACK_STEP : 'Evaluate' }] } };
             },
+            getWorkflowRun: async ({ run_id }) => ({ data: { id: run_id, workflow_id: 99, run_attempt: runAttempt } }),
             listWorkflowRuns: {},
-            reRunWorkflow: async (args) => { reruns.push(args); return {}; },
+            reRunWorkflow: async (a) => { reruns.push(a); },
           },
         },
       };
-      const context = {
-        repo: { owner: 'o', repo: 'r' },
-        eventName: 'pull_request_target',
-        payload: { action, label: { name: label }, pull_request: sha ? { number: 9, head: { sha } } : null },
-      };
-      const core = {
-        info: (m) => infos.push(m),
-        setFailed: (m) => { throw new Error('setFailed: ' + m); },
-      };
-      await new AsyncFunction('github', 'context', 'core', 'process', src)(
-        github, context, core, { env: { CHECK_NAME: checkName, RELEVANT_LABELS: relevantLabels } });
-      return { created, infos, reruns, comments };
+      const context = { repo: { owner: 'o', repo: 'r' }, runId: selfRun, eventName: 'pull_request_target',
+        payload: { action, label: { name: label }, pull_request: sha ? { number: 9, head: { sha } } : null } };
+      const core = { info: (m) => infos.push(m), setFailed: (m) => { failed = m; } };
+      await new AsyncFunction('github', 'context', 'core', 'process', src)(github, context, core,
+        { env: { CHECK_NAME: checkName, JOB_NAME: jobName, RELEVANT_LABELS: relevantLabels, WAIT_MINUTES: waitMinutes, POLL_SECONDS: '0' } });
+      return { failed, infos, reruns, comments, created, reads, classified };
     }
-    await t('mirror: relevant label removal and unreadable history refuse old success', async () => {
-      for (const relevantLabels of ['qa-passed', 'skip-codex-gate']) {
-        for (const eventsError of [false, true]) {
-          const { created } = await runMirror({ relevantLabels, eventsError,
-            label: 'triage', action: 'labeled',
-            events: [{ event: 'unlabeled', label: { name: relevantLabels }, created_at: '2026-10-20T03:00:00Z' }],
-            checks: [{ id: 1, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T02:00:00Z', details_url: 'https://github.com/o/r/actions/runs/123/job/456' }],
-          });
-          assert.strictEqual(created[0].conclusion, 'failure');
-          assert.match(created[0].output.summary, /Success refused/);
+    const okEvents = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T01:00:00Z' }];
+    const okLabels = [{ name: 'qa-passed' }];
+
+    await t('mirror: never calls checks.create; job conclusion carries result', async () => {
+      const src = scripts('mirror-required-check.yml')[0];
+      assert.ok(!/checks\.create/.test(src));
+      const yml = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/mirror-required-check.yml'), 'utf8');
+      assert.ok(!/checks:\s*write/.test(yml), 'no checks: write needed');
+      assert.ok(yml.includes('name: ${{ inputs.job_name }}'), 'job name comes from input');
+      assert.ok(yml.includes(`- name: ${ACK_STEP}`), 'ack step name is the ack marker');
+      assert.ok(!/cancel-in-progress/.test(yml), 'no job-level cancel (would cancel the required check)');
+    });
+    await t('mirror: latest real success with confirmed labels ⇒ pass', async () => {
+      const r = await runMirror({ labels: okLabels, events: okEvents, checks: [job(1, 'success')] });
+      assert.strictEqual(r.failed, null);
+      assert.deepStrictEqual(r.created, []);
+    });
+    await t('mirror: latest real failure ⇒ fail', async () => {
+      const r = await runMirror({ checks: [job(1, 'success'), job(2, 'failure')] });
+      assert.match(r.failed, /is failure \(source check 2\)/);
+    });
+    await t('mirror: newest by id wins over later completion', async () => {
+      const r = await runMirror({ labels: okLabels, events: okEvents, checks: [
+        job(2, 'failure', { completed_at: '2026-10-20T02:01:00Z' }), job(1, 'success', { completed_at: '2026-10-20T03:00:00Z' })] });
+      assert.match(r.failed, /source check 2/);
+    });
+    await t('mirror: earlier acks (step marker, own run, legacy API mirror) are never sources', async () => {
+      const r = await runMirror({ labels: okLabels, events: okEvents, ackJobs: [5], checks: [
+        job(1, 'success'),
+        job(5, 'failure'),                                                     // earlier ack job
+        job(6, 'failure', { details_url: 'https://github.com/o/r/actions/runs/9999/job/6' }), // this run
+        job(7, 'failure', { details_url: 'https://github.com/o/r/runs/7', output: { title: 'Label ack: mirrored failure' } }),
+      ] });
+      assert.strictEqual(r.failed, null);
+    });
+    await t('mirror: only acks / nothing ⇒ fail after bounded wait (no invented green)', async () => {
+      for (const checks of [[], [job(5, 'success')]]) {
+        const r = await runMirror({ ackJobs: [5], checks });
+        assert.match(r.failed, /Timed out after 0 min.*no real/);
+      }
+    });
+    await t('mirror: in-flight real ⇒ waits, then mirrors its verdict', async () => {
+      const r = await runMirror({ waitMinutes: '1', labels: okLabels, events: okEvents,
+        checks: (n) => n < 3 ? [job(1, 'failure'), { ...job(2, null), status: 'in_progress', conclusion: null }] : [job(1, 'failure'), job(2, 'success')] });
+      assert.strictEqual(r.failed, null);
+      assert.ok(r.infos.some((m) => /still in_progress/.test(m)));
+    });
+    await t('mirror: in-flight real beyond wait ⇒ fail, not old verdict', async () => {
+      const r = await runMirror({ checks: [job(1, 'success'), { ...job(2, null), status: 'in_progress', conclusion: null }] });
+      assert.match(r.failed, /Timed out.*still in_progress/);
+    });
+    await t('mirror: queued job without steps is treated as in-flight', async () => {
+      const r = await runMirror({ unknownJobs: [2], checks: [job(1, 'success'), { ...job(2, null), status: 'queued', conclusion: null }] });
+      assert.match(r.failed, /Timed out/);
+    });
+    await t('mirror: completed no-step (cancelled before start) job is transparent', async () => {
+      for (const older of ['success', 'failure']) {
+        const r = await runMirror({ labels: okLabels, events: okEvents, noStepJobs: [2],
+          checks: [job(1, older), job(2, 'cancelled', { started_at: null })] });
+        assert.deepStrictEqual(r.reruns, []);
+        if (older === 'success') assert.strictEqual(r.failed, null); else assert.match(r.failed, /source check 1/);
+      }
+    });
+    await t('mirror: deferred heal retried after peer finishes; budget only on issued rerun', async () => {
+      let n = 0;
+      const peers = [{ id: 4500, status: 'in_progress', pull_requests: [{ number: 9 }] }];
+      const r = await runMirror({ waitMinutes: '1', workflowRuns: peers, labels: okLabels, events: okEvents,
+        checks: (k) => { n = k; if (k === 3) peers[0].status = 'completed'; return k < 6 ? [job(1, 'cancelled')] : [job(1, 'cancelled'), job(3, 'success')]; } });
+      assert.deepStrictEqual(r.reruns, [{ owner: 'o', repo: 'r', run_id: 4001 }]);
+      assert.strictEqual(r.failed, null);
+    });
+    await t('mirror: second cancellation after an issued heal ⇒ fail, no second rerun', async () => {
+      const r = await runMirror({ waitMinutes: '1',
+        checks: (k) => k < 3 ? [job(1, 'cancelled')] : [job(1, 'cancelled'), job(3, 'cancelled')] });
+      assert.strictEqual(r.reruns.length, 1);
+      assert.match(r.failed, /cancelled again/);
+    });
+    await t('mirror: classification stops at newest real check', async () => {
+      const r = await runMirror({ labels: okLabels, events: okEvents, ackJobs: [9],
+        checks: [job(1, 'failure'), job(2, 'failure'), job(3, 'success'), job(9, 'failure')] });
+      assert.strictEqual(r.failed, null);
+      assert.ok(!r.classified.includes(1) && !r.classified.includes(2), String(r.classified));
+    });
+    await t('mirror: jobs API failure ⇒ fail', async () => {
+      const r = await runMirror({ jobError: true, checks: [job(1, 'success')] });
+      assert.match(r.failed, /Cannot read\/classify/);
+    });
+    await t('mirror: skipped / neutral real verdict is not a pass', async () => {
+      for (const c of ['skipped', 'neutral', 'timed_out']) {
+        const r = await runMirror({ checks: [job(1, c)] });
+        assert.match(r.failed, new RegExp(`is ${c}`));
+      }
+    });
+    for (const relevant of ['qa-passed', 'skip-codex-gate']) {
+      await t(`mirror: ${relevant} removed after source success ⇒ success refused`, async () => {
+        const r = await runMirror({ relevantLabels: relevant, checks: [job(1, 'success')],
+          events: [{ event: 'unlabeled', label: { name: relevant }, created_at: '2026-10-20T03:00:00Z' }] });
+        assert.match(r.failed, /Success refused/);
+      });
+    }
+    await t('mirror: unreadable / missing label history refuses success', async () => {
+      for (const o of [{ eventsError: true }, { labels: okLabels, events: [] }, { events: null }, { relevantLabels: '' },
+        { labels: okLabels, events: okEvents, checks: [job(1, 'success', { started_at: null, completed_at: null })] }]) {
+        const r = await runMirror({ checks: [job(1, 'success')], ...o });
+        assert.match(r.failed, /Success refused/);
+      }
+    });
+    await t('mirror: source changing during validation re-polls instead of concluding', async () => {
+      const r = await runMirror({ waitMinutes: '1', labels: okLabels, events: okEvents,
+        checks: (n) => n < 2 ? [job(1, 'success')] : [job(1, 'success'), job(2, 'failure')] });
+      assert.match(r.failed, /source check 2/);
+    });
+    await t('mirror: cancelled ⇒ heal re-run once then mirror re-run verdict', async () => {
+      const r = await runMirror({ waitMinutes: '1', labels: okLabels, events: okEvents,
+        checks: (n) => n < 3 ? [job(1, 'cancelled')] : [job(1, 'cancelled'), job(3, 'success')] });
+      assert.deepStrictEqual(r.reruns, [{ owner: 'o', repo: 'r', run_id: 4001 }]);
+      assert.strictEqual(r.failed, null);
+    });
+    await t('mirror: cancelled at attempt cap ⇒ comment + fail, no rerun', async () => {
+      for (const runAttempt of [3, 4]) {
+        const r = await runMirror({ runAttempt, checks: [job(1, 'cancelled')] });
+        assert.deepStrictEqual(r.reruns, []);
+        assert.strictEqual(r.comments.length, 1);
+        assert.strictEqual(r.comments[0].issue_number, 9);
+        assert.match(r.failed, /attempt cap.*Actions UI or push/);
+      }
+    });
+    await t('mirror: PR-associated in-flight peer prevents heal (own run ignored)', async () => {
+      for (const status of ['queued', 'in_progress', 'completed']) {
+        for (const [id, assoc] of [[4001, 9], [4002, 9], [4002, 10], [9999, 9]]) {
+          const r = await runMirror({ checks: [job(1, 'cancelled')], workflowRuns: [{ id, status, pull_requests: [{ number: assoc }] }] });
+          const blocked = id === 4002 && assoc === 9 && status !== 'completed';
+          assert.strictEqual(r.reruns.length, blocked ? 0 : 1, `${status} ${id} ${assoc}`);
+          assert.match(r.failed, /Timed out/);
         }
       }
     });
-    await t('mirror: label history older than real verdict permits success', async () => {
-      const { created } = await runMirror({ relevantLabels: 'qa-passed', labels: [{ name: 'qa-passed' }],
-        events: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T01:00:00Z' }],
-        checks: [{ id: 1, status: 'completed', conclusion: 'success', completed_at: '2026-10-20T02:00:00Z', details_url: 'https://github.com/o/r/actions/runs/123/job/456' }],
-      });
-      assert.strictEqual(created[0].conclusion, 'success');
+    await t('mirror: missing PR head or bad name pairing ⇒ fail', async () => {
+      assert.match((await runMirror({ sha: null })).failed, /No pull_request/);
+      assert.match((await runMirror({ jobName: 'Codex Review Gate' })).failed, /must end with/);
     });
     await t('self-listen guard rejects own name, accepts companion and scans repo', () => {
       const code = "import runpy; f=runpy.run_path('scripts/check-no-self-listen.py')['self_listens']; assert f('name: Gate\\non: {workflow_run: {workflows: [Gate]}}'); assert not f('name: Heal\\non: {workflow_run: {workflows: [Gate]}}')";
       require('child_process').execFileSync('python3', ['-c', code.replace(/\\n/g, '\\n')]);
       require('child_process').execFileSync('python3', ['scripts/check-no-self-listen.py']);
     });
-    const success = { id: 77, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T02:00:00Z', details_url: 'https://github.com/o/r/actions/runs/123/job/456' };
-    for (const relevant of ['qa-passed', 'skip-codex-gate']) {
-      await t(`mirror: ${relevant} removal after source success then irrelevant label refuses green`, async () => {
-        const { created } = await runMirror({ relevantLabels: relevant, label: 'triage', checks: [success], events: [{ event: 'unlabeled', label: { name: relevant }, created_at: '2026-10-20T03:00:00Z' }] });
-        assert.strictEqual(created[0].conclusion, 'failure');
-        assert.match(created[0].output.summary, /Run the real gate/);
-      });
-    }
-    await t('mirror: events API failure refuses success', async () => {
-      const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success], eventsError: true });
-      assert.strictEqual(created[0].conclusion, 'failure');
-    });
-    await t('mirror: older relevant event matching current state copies real success', async () => {
-      const { created } = await runMirror({ relevantLabels: 'qa-passed,no-auto-merge', labels: [{ name: 'qa-passed' }], checks: [success], events: [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T00:00:00Z' }] });
-      assert.strictEqual(created[0].conclusion, 'success');
-    });
-    await t('mirror: missing timestamp or label history refuses success', async () => {
-      for (const options of [
-        { checks: [{ ...success, completed_at: undefined }] },
-        { labels: [{ name: 'qa-passed' }], events: [] },
-        { events: null },
-      ]) {
-        const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success], ...options });
-        assert.strictEqual(created[0].conclusion, 'failure');
-      }
-    });
-    await t('mirror: evaluator appearing during label history read prevents create', async () => {
-      for (const eventsError of [false, true]) {
-        const checks = [{ ...success }];
-        const { created } = await runMirror({
-          relevantLabels: 'qa-passed', checks, eventsError,
-          afterEvents: () => checks.push({ id: 99, status: 'in_progress', created_at: '2026-10-20T05:00:00Z' }),
-        });
-        assert.deepStrictEqual(created, []);
-      }
-    });
-    await t('mirror: newer label ack retains earlier real verdict', async () => {
-      const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [
-        success,
-        { ...success, id: 78, created_at: '2026-10-20T04:00:00Z', output: { title: 'Label ack: mirrored success' } },
-      ] });
-      assert.strictEqual(created.length, 1);
-      assert.strictEqual(created[0].conclusion, 'success');
-      assert.match(created[0].output.summary, /77/);
-    });
-    await t('mirror: previous mirror cannot freshen old success', async () => {
-      const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success, { ...success, id: 78, created_at: '2026-10-20T04:00:00Z', completed_at: '2026-10-20T04:00:00Z', output: { title: 'Label ack: mirrored success' } }], events: [{ event: 'unlabeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T03:00:00Z' }] });
-      assert.strictEqual(created[0].conclusion, 'failure');
-    });
-    await t('mirror: copies latest by id (not completed_at)', async () => {
-      // Older green finishes AFTER newer red — newer attempt must win (red).
-      const { created } = await runMirror({
-        checks: [
-          { id: 2, status: 'completed', conclusion: 'failure', started_at: '2026-10-20T02:00:00Z', completed_at: '2026-10-20T02:30:00Z' },
-          { id: 1, status: 'completed', conclusion: 'success', started_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T03:00:00Z' },
-        ],
-      });
-      assert.strictEqual(created.length, 1);
-      assert.strictEqual(created[0].name, 'codex / Codex Review Gate');
-      assert.strictEqual(created[0].conclusion, 'failure');
-      assert.strictEqual(created[0].head_sha, 'abc1234000000000000000000000000000000000');
-      assert.strictEqual(created[0].status, 'completed');
-    });
-    {
-      // Shape of pinhaoyun #28 head ff133a9: Checks API has no created_at;
-      // ids/started_at of rerun attempts; label-ack mirrors (and GitHub's
-      // re-run copies of them, URL /runs/<id>) interleaved.
-      const job = (id, at, conclusion, extra = {}) => ({ id, status: 'completed', conclusion, started_at: at, completed_at: at,
-        details_url: `https://github.com/o/r/actions/runs/39539778477/job/${id}`, external_id: `x${id}`, ...extra });
-      const ack = (id, at) => ({ id, status: 'completed', conclusion: 'failure', started_at: at, completed_at: at,
-        details_url: `https://github.com/o/r/runs/${id}`, output: { title: 'Label ack: mirrored failure' } });
-      const events = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-21T03:00:00Z' }];
-      await t('mirror: older failure + newer success ⇒ success', async () => {
-        const { created } = await runMirror({ relevantLabels: 'qa-passed', labels: [{ name: 'qa-passed' }], events, label: 'triage', checks: [
-          job(10, '2026-10-21T03:39:41Z', 'failure'),
-          job(20, '2026-10-21T03:56:17Z', 'success'),
-        ] });
-        assert.strictEqual(created.length, 1);
-        assert.strictEqual(created[0].conclusion, 'success');
-        assert.match(created[0].output.summary, /source check 20/);
-      });
-      await t('mirror: rerun attempts with interleaved acks pick newest real attempt', async () => {
-        const { created } = await runMirror({ relevantLabels: 'qa-passed', labels: [{ name: 'qa-passed' }], events, label: 'triage', checks: [
-          ack(119029406049, '2026-10-21T03:56:22Z'),
-          job(119029377082, '2026-10-21T03:56:17Z', 'success'),
-          ack(119028815663, '2026-10-21T03:54:16Z'),
-          job(119028212125, '2026-10-21T03:54:11Z', 'success'),
-          { ...ack(119025675579, '2026-10-21T03:43:14Z'), output: undefined },
-          job(119024627996, '2026-10-21T03:39:41Z', 'failure'),
-        ] });
-        assert.strictEqual(created.length, 1);
-        assert.strictEqual(created[0].conclusion, 'success');
-        assert.match(created[0].output.summary, /source check 119029377082/);
-      });
-      await t('mirror: newest real attempt in progress ⇒ stay pending, not old failure', async () => {
-        const { created, infos } = await runMirror({ checks: [
-          ack(30, '2026-10-21T03:43:14Z'),
-          job(10, '2026-10-21T03:39:41Z', 'failure'),
-          { id: 40, status: 'in_progress', conclusion: null, started_at: '2026-10-21T03:50:00Z', details_url: 'https://github.com/o/r/actions/runs/1/job/40' },
-        ] });
-        assert.deepStrictEqual(created, []);
-        assert.ok(infos.some((m) => /still in_progress/.test(m)));
-      });
-      await t('mirror: newer cancelled-before-start (started_at null) beats older success', async () => {
-        const { created, reruns } = await runMirror({ checks: [
-          job(10, '2026-10-21T03:39:41Z', 'success'),
-          { id: 11, status: 'completed', conclusion: 'cancelled', started_at: null, completed_at: '2026-10-21T03:40:00Z', details_url: 'https://github.com/o/r/actions/runs/4242/job/11' },
-        ] });
-        assert.deepStrictEqual(created, []);
-        assert.deepStrictEqual(reruns, [{ owner: 'o', repo: 'r', run_id: 4242 }]);
-      });
-      await t('mirror: same started_at, older success finishing last does not mask newer failure', async () => {
-        const { created } = await runMirror({ checks: [
-          job(10, '2026-10-21T03:39:41Z', 'success', { completed_at: '2026-10-21T03:45:00Z' }),
-          job(11, '2026-10-21T03:39:41Z', 'failure', { completed_at: '2026-10-21T03:40:00Z' }),
-        ] });
-        assert.strictEqual(created[0].conclusion, 'failure');
-        assert.match(created[0].output.summary, /source check 11/);
-      });
-      await t('mirror: only mirrors present ⇒ no create', async () => {
-        const { created } = await runMirror({ checks: [ack(30, '2026-10-21T03:43:14Z')] });
-        assert.deepStrictEqual(created, []);
-      });
-    }
-    await t('mirror: in-flight same-named check → no create (no race)', async () => {
-      const { created, infos } = await runMirror({
-        checks: [{ id: 9, status: 'in_progress', conclusion: null, created_at: '2026-10-20T03:00:00Z' }],
-      });
-      assert.deepStrictEqual(created, []);
-      assert.ok(infos.some((m) => /still in_progress/.test(m)));
-    });
-    await t('mirror: pre-create revalidate aborts if latest changed', async () => {
-      for (const changeOnRead of [2, 3, 4]) {
-        let n = 0;
-        const src = scripts('mirror-required-check.yml')[0];
-        const created = [];
-        const infos = [];
-        const first = [{ id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z' }];
-        const second = [{ id: 2, status: 'in_progress', conclusion: null, created_at: '2026-10-20T02:00:00Z' }];
-        const github = {
-          paginate: async () => (++n < changeOnRead ? first : second),
-          rest: { checks: { listForRef: {}, create: async (args) => { created.push(args); return { data: args }; } } },
-        };
-        const context = {
-          repo: { owner: 'o', repo: 'r' }, eventName: 'pull_request_target',
-          payload: { action: 'labeled', label: { name: 'wip' }, pull_request: { head: { sha: 'abc1234000000000000000000000000000000000' } } },
-        };
-        const core = { info: (m) => infos.push(m), setFailed: (m) => { throw new Error(m); } };
-        await new AsyncFunction('github', 'context', 'core', 'process', src)(
-          github, context, core, { env: { CHECK_NAME: 'codex / Codex Review Gate' } });
-        assert.deepStrictEqual(created, []);
-        assert.ok(infos.some((m) => /pre-create revalidate/i.test(m)));
-      }
-    });
-    await t('mirror: no prior completed check → no invent success', async () => {
-      const { created, infos } = await runMirror({ checks: [] });
-      assert.deepStrictEqual(created, []);
-      assert.ok(infos.some((m) => /not inventing/.test(m)));
-    });
-    await t('mirror: missing PR head → nothing', async () => {
-      const { created, infos } = await runMirror({ sha: null, checks: [{ id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z' }] });
-      assert.deepStrictEqual(created, []);
-      assert.ok(infos.some((m) => /No pull_request/.test(m)));
-    });
-    await t('mirror: cancelled → heal re-run source, never synthetic cancelled', async () => {
-      const { created, infos, reruns } = await runMirror({
-        checks: [{
-          id: 7, status: 'completed', conclusion: 'cancelled', created_at: '2026-10-20T01:00:00Z',
-          details_url: 'https://github.com/o/r/actions/runs/4242',
-        }],
-      });
-      assert.deepStrictEqual(created, []);
-      assert.deepStrictEqual(reruns, [{ owner: 'o', repo: 'r', run_id: 4242 }]);
-      assert.ok(infos.some((m) => /heal re-run/.test(m)));
-    });
-    await t('mirror: cancelled without run URL → no create', async () => {
-      const { created, reruns, infos } = await runMirror({
-        checks: [{ id: 7, status: 'completed', conclusion: 'cancelled', created_at: '2026-10-20T01:00:00Z' }],
-      });
-      assert.deepStrictEqual(created, []);
-      assert.deepStrictEqual(reruns, []);
-      assert.ok(infos.some((m) => /without a workflow run URL/.test(m)));
-    });
-    await t('mirror: cancelled heal at attempt cap comments without rerun or create', async () => {
-      for (const runAttempt of [3, 4]) {
-        const result = await runMirror({ runAttempt, checks: [{
-          id: 7, status: 'completed', conclusion: 'cancelled',
-          details_url: 'https://github.com/o/r/actions/runs/4242',
-        }] });
-        assert.deepStrictEqual(result.reruns, []);
-        assert.deepStrictEqual(result.created, []);
-        assert.strictEqual(result.comments.length, 1);
-        assert.strictEqual(result.comments[0].issue_number, 9);
-        assert.match(result.comments[0].body, /attempt cap.*Actions UI or push/);
-        assert.ok(result.infos.some(m => /attempt cap/.test(m)));
-      }
-    });
-    await t('mirror: PR-associated in-flight PRT peer prevents cancelled heal', async () => {
-      for (const status of ['queued', 'in_progress', 'waiting', 'pending', 'requested', 'completed']) {
-        for (const association of [9, 10, null]) {
-          for (const id of [4242, 4243]) {
-            const result = await runMirror({
-              checks: [{ id: 7, status: 'completed', conclusion: 'cancelled', details_url: 'https://github.com/o/r/actions/runs/4242' }],
-              workflowRuns: [{ id, status, head_sha: 'base-sha',
-                ...(association === null ? {} : { pull_requests: [{ number: association }] }) }],
-            });
-            assert.deepStrictEqual(result.created, []);
-            const blocked = id !== 4242 && association === 9 && status !== 'completed';
-            assert.strictEqual(result.reruns.length, blocked ? 0 : 1);
-            if (blocked) assert.ok(result.infos.some(m => /in-flight/.test(m)));
-          }
-        }
-      }
-    });
-    await t('mirror and label-ack grant issues write without pull-requests write', () => {
+    await t('label-ack callers: named as required prefix, job_name matches, no checks: write', () => {
       const mirror = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/mirror-required-check.yml'), 'utf8');
       assert.ok(!/pull-requests:\s*write/.test(mirror));
-      assert.strictEqual((mirror.match(/issues:\s*write/g) || []).length, 2);
-      for (const gate of ['codex', 'qa']) {
+      for (const [gate, prefix, jobName] of [['codex', 'codex', 'Codex Review Gate'], ['qa', 'qa', 'QA Gate']]) {
         const caller = fs.readFileSync(path.join(__dirname, '..', 'examples', gate + '-gate.yml'), 'utf8');
         const ack = caller.split('  ' + gate + '-label-ack:')[1].split(/^  [a-zA-Z]/m)[0];
+        assert.match(ack, new RegExp(`\\n    name: ${prefix}\\n`));
+        assert.ok(ack.includes(`job_name: '${jobName}'`));
+        assert.ok(ack.includes(`check_name: '${prefix} / ${jobName}'`));
         assert.match(ack, /issues:\s*write/);
+        assert.ok(!/checks:\s*write/.test(ack));
         assert.ok(!/pull-requests:\s*write/.test(ack));
       }
     });
@@ -1421,19 +1326,13 @@ const UNL_KW = 'This is a security problem.';
       for (const f of ['codex-gate.yml', 'qa-gate.yml']) {
         const ex = fs.readFileSync(path.join(__dirname, '..', 'examples', f), 'utf8');
         const concurrency = ex.split(/^concurrency:/m)[1].split(/^jobs:/m)[0];
-        assert.ok(!/&& 'prt'/.test(concurrency), f + ' must NOT share a prt pending queue');
         assert.ok(concurrency.includes("format('label-{0}', github.event.pull_request.head.sha)"));
-        assert.ok(!/label-(eval|ack)-/.test(concurrency));
-        assert.ok(concurrency.includes('no-auto-merge'));
         const cancel = concurrency.split('cancel-in-progress:')[1];
         const labels = f === 'codex-gate.yml' ? 'skip-codex-gate' : 'qa-passed';
         assert.ok(cancel.includes(`|| (contains(fromJSON('["labeled","unlabeled"]'), github.event.action) && contains(fromJSON('["${labels}","no-auto-merge"]'), github.event.label.name))`));
         assert.ok(concurrency.includes("&& 'push'"));
         assert.ok(concurrency.includes("format('run-{0}', github.run_id)"));
       }
-      const mirror = fs.readFileSync(path.join(__dirname, '..', '.github/workflows/mirror-required-check.yml'), 'utf8');
-      assert.ok(mirror.includes('group: mirror-required-${{ github.repository }}-${{ inputs.check_name }}-pr-'));
-      assert.ok(mirror.includes('      cancel-in-progress: true'));
     });
   }
 

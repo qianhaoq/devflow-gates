@@ -83,19 +83,25 @@ jobs:
   # latest same-named conclusion via Checks API instead — no false green
   # (refuses to invent a conclusion when none exists).
   codex-label-ack:
+    # Job name = required prefix: the called job "Codex Review Gate" is then the
+    # required check "codex / Codex Review Gate" itself (conclusion = mirrored verdict).
+    name: codex
     if: >-
       github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
       github.event.label.name != 'skip-codex-gate' && github.event.label.name != 'no-auto-merge'
     permissions:
       contents: read
-      checks: write
+      checks: read
       actions: write
       issues: write
+      pull-requests: read
     uses: qianhaoq/devflow-gates/.github/workflows/mirror-required-check.yml@main
     with:
       # Keep in sync with the required-check name this caller produces.
       check_name: 'codex / Codex Review Gate'
+      job_name: 'Codex Review Gate'
+      wait_minutes: 30   # > real gate max runtime
       relevant_labels: 'skip-codex-gate,no-auto-merge'
       # runs_on: self-hosted   # keep in sync with codex job above
 

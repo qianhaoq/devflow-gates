@@ -88,8 +88,9 @@
 # "codex / Codex Review Gate" → GitHub hangs on "is expected"
 # (docs/PITFALLS.md). Pattern (方案 B): gate-relevant labels
 # (`skip-codex-gate`) run the real evaluator; irrelevant labels call
-# mirror-required-check.yml to re-post the latest same-named conclusion
-# via the Checks API (no false green — refuses to invent a conclusion).
+# mirror-required-check.yml from a caller job named `codex`, so that job
+# IS "codex / Codex Review Gate" and its conclusion mirrors the latest real
+# verdict (no checks.create; no false green — never invents a conclusion).
 # A skip INSIDE this file would attach a skipped (= passing) required
 # check, so this file never skips a head-attached event.
 

@@ -46,8 +46,11 @@ in [README.md](README.md).
   - labeled/unlabeled anti-ghost (方案 B, 2026-10): never let a label run
     skip EVERY caller job (that leaves the required "<job> / <Gate>" as
     "is expected"). Gate-relevant labels run the real evaluator;
-    irrelevant labels call `mirror-required-check.yml` to re-post the
-    latest same-named conclusion (never invent success).
+    irrelevant labels run a caller job `name: <prefix>` calling
+    `mirror-required-check.yml` with `job_name`, so the ack job IS the
+    required check; its conclusion = latest real same-named verdict
+    (bounded poll while in flight, then fail). Never checks.create
+    (API checks land in arbitrary suites and are duplicated on re-runs).
   - No blind periodic re-runs. Refresh jobs re-run a failed gate run only
     when its input changed (Codex: the shared `verdict()` would now pass;
     QA: label applied after the run), else at most the newest cancelled
