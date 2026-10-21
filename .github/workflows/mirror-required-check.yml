@@ -48,6 +48,7 @@ permissions:
   checks: write
   actions: write
   issues: write
+  pull-requests: read  # private repos: issues.get/listEvents on PRs
 
 jobs:
   mirror:
@@ -62,6 +63,7 @@ jobs:
       checks: write
       actions: write
       issues: write
+      pull-requests: read
     steps:
       - name: Mirror latest required-check conclusion
         uses: actions/github-script@v7
