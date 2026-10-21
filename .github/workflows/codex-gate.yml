@@ -19,7 +19,8 @@
 #   - No Codex Review Summary comment yet:
 #       * head commit younger than wait_minutes → fail (still waiting)
 #       * otherwise → fail (timeout; comment @codex review)
-#   - Summary still Running / in progress / queued → fail
+#   - Summary still Running / in progress / queued → stay in_progress
+#     (poll ~14 min), then fail if still Running
 #   - Summary Failed / cancelled / error (and not Completed) → fail
 #   - Summary does not positively show Completed or 👍 no-findings → fail
 #   - Summary completed but does not mention the current head SHA (stale
@@ -132,7 +133,7 @@ jobs:
   codex-review-gate:
     name: Codex Review Gate
     runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
-    timeout-minutes: 5
+    timeout-minutes: 20
     # Head-attached events only. issue_comment / schedule go to the refresh
     # job below (their conclusion would land on the default branch, so
     # evaluating there is wasted runner time). pull_request_review_thread
@@ -422,7 +423,7 @@ jobs:
               }
 
               if (summaryLooksRunning(latestSummary.body)) {
-                return { ok: false, msg: 'Codex Review Summary is still Running / in progress — fail until Completed' };
+                return { ok: false, running: true, msg: 'Codex Review Summary is still Running / in progress — fail until Completed' };
               }
 
               if (summaryLooksFailed(latestSummary.body)) {
@@ -477,7 +478,17 @@ jobs:
                 core.info('No PR number resolved for this event — nothing to gate');
                 return;
               }
-              const v = await verdict(prNumber);
+              let v = await verdict(prNumber);
+              // Codex still Running: keep this check in_progress (pending)
+              // and poll, instead of posting a failure that a later green
+              // rerun may not be able to replace in the required context.
+              const pollMs = Math.max(0, Number(process.env.RUNNING_POLL_MS ?? 30000));
+              const maxPolls = Math.max(0, Number(process.env.RUNNING_MAX_POLLS ?? 28));
+              for (let i = 0; v.running && i < maxPolls; i++) {
+                core.info(`PR #${prNumber}: Codex review still Running — waiting (poll ${i + 1}/${maxPolls})`);
+                await new Promise((r) => setTimeout(r, pollMs));
+                v = await verdict(prNumber);
+              }
               if (v.none) {
                 core.info(v.msg);
                 return;
@@ -761,7 +772,7 @@ jobs:
   codex-gate-refresh:
     name: Codex Gate Refresh
     runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
-    timeout-minutes: 5
+    timeout-minutes: 20
     if: >-
       github.event_name == 'schedule' ||
       (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'cancelled') ||
@@ -1053,7 +1064,7 @@ jobs:
               }
 
               if (summaryLooksRunning(latestSummary.body)) {
-                return { ok: false, msg: 'Codex Review Summary is still Running / in progress — fail until Completed' };
+                return { ok: false, running: true, msg: 'Codex Review Summary is still Running / in progress — fail until Completed' };
               }
 
               if (summaryLooksFailed(latestSummary.body)) {
@@ -1108,7 +1119,17 @@ jobs:
                 core.info('No PR number resolved for this event — nothing to gate');
                 return;
               }
-              const v = await verdict(prNumber);
+              let v = await verdict(prNumber);
+              // Codex still Running: keep this check in_progress (pending)
+              // and poll, instead of posting a failure that a later green
+              // rerun may not be able to replace in the required context.
+              const pollMs = Math.max(0, Number(process.env.RUNNING_POLL_MS ?? 30000));
+              const maxPolls = Math.max(0, Number(process.env.RUNNING_MAX_POLLS ?? 28));
+              for (let i = 0; v.running && i < maxPolls; i++) {
+                core.info(`PR #${prNumber}: Codex review still Running — waiting (poll ${i + 1}/${maxPolls})`);
+                await new Promise((r) => setTimeout(r, pollMs));
+                v = await verdict(prNumber);
+              }
               if (v.none) {
                 core.info(v.msg);
                 return;

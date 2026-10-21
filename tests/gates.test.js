@@ -671,7 +671,7 @@ const UNL_KW = 'This is a security problem.';
   const RH = 'feedfacefeedfacefeedfacefeedfacefeedface';
   const SUMMARY_DONE = { user: { login: 'chatgpt-codex-connector[bot]' }, updated_at: '2026-10-16T03:00:00Z', body: `<!-- codex-pull-request-review-summary -->\n**Completed** — reviewed ${RH}` };
   const SUMMARY_RUNNING = { ...SUMMARY_DONE, body: '<!-- codex-pull-request-review-summary -->\n**Running**' };
-  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [], runById, allRuns } = {}) {
+  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [], runById, allRuns, env = {} } = {}) {
     const reran = [];
     const prList = prs || [{ number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: labels.map((name) => ({ name })) }];
     const github = {
@@ -694,7 +694,7 @@ const UNL_KW = 'This is a security problem.';
       },
       graphql: async () => ({ repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } }),
       paginate: async (fn, args = {}) => {
-        if (fn === github.rest.issues.listComments) return summary ? [summary] : [];
+        if (fn === github.rest.issues.listComments) { const sm = typeof summary === 'function' ? summary() : summary; return sm ? [sm] : []; }
         if (fn === github.rest.issues.listEvents) return labelEvents;
         if (fn === github.rest.pulls.list) return prList;
         if (fn === github.rest.actions.listWorkflowRuns) {
@@ -709,7 +709,7 @@ const UNL_KW = 'This is a security problem.';
     const core = { info(m) { if (process.env.DEBUG_T) console.log('  info:', m); }, warning() {}, setFailed(m) { if (mode !== 'refresh') { failed.push(m); return; } throw new Error(m); }, summary: { addRaw() { return this; }, write: async () => {} } };
     const context = { runId: 1, eventName, repo: { owner: 'o', repo: 'r' }, payload };
     const src = scripts(file)[mode === 'refresh' ? 1 : 0];
-    await new AsyncFunction('github', 'context', 'core', 'process', 'exec', src)(github, context, core, { env: { GATE_MODE: mode, QA_LABEL: 'qa-passed', REFRESH_POLL_MS: '0' } }, {});
+    await new AsyncFunction('github', 'context', 'core', 'process', 'exec', src)(github, context, core, { env: { GATE_MODE: mode, QA_LABEL: 'qa-passed', REFRESH_POLL_MS: '0', RUNNING_POLL_MS: '0', RUNNING_MAX_POLLS: '0', ...env } }, {});
     return reran;
   }
   const run = (id, event, conclusion, created_at, extra = {}) => ({ id, event, head_sha: RH, head_branch: 'crawl/auto', status: 'completed', conclusion, created_at, run_started_at: created_at, run_attempt: 1, ...extra });
@@ -731,6 +731,19 @@ const UNL_KW = 'This is a security problem.';
     const fail2 = [];
     await runRefresh('codex-gate.yml', {}, { eventName: 'workflow_dispatch', payload: { inputs: { pr_number: 'x' } }, mode: 'evaluate', failed: fail2 });
     assert.match(fail2[0] || '', /pr_number is invalid/);
+  });
+  await t('codex-gate evaluate: Running summary stays in_progress and passes once Completed', async () => {
+    const p = { eventName: 'pull_request_target', payload: { pull_request: { number: 9 } }, mode: 'evaluate' };
+    let n = 0;
+    const failed = [];
+    await runRefresh('codex-gate.yml', {}, { ...p, failed, env: { RUNNING_MAX_POLLS: '5' }, summary: () => (++n < 3 ? SUMMARY_RUNNING : SUMMARY_DONE) });
+    assert.deepStrictEqual(failed, []);
+    assert.strictEqual(n, 3);
+    const still = [];
+    let m = 0;
+    await runRefresh('codex-gate.yml', {}, { ...p, failed: still, env: { RUNNING_MAX_POLLS: '2' }, summary: () => { m++; return SUMMARY_RUNNING; } });
+    assert.strictEqual(m, 3, 'bounded polling');
+    assert.match(still[0] || '', /still Running/);
   });
   await t('codex-gate refresh: failed head run re-run only when the gate would now pass', async () => {
     const runs = { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] };
@@ -1228,12 +1241,12 @@ const UNL_KW = 'This is a security problem.';
       const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success, { ...success, id: 78, created_at: '2026-10-20T04:00:00Z', completed_at: '2026-10-20T04:00:00Z', output: { title: 'Label ack: mirrored success' } }], events: [{ event: 'unlabeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T03:00:00Z' }] });
       assert.strictEqual(created[0].conclusion, 'failure');
     });
-    await t('mirror: copies latest by created_at (not completed_at)', async () => {
-      // Older green finishes AFTER newer red — created_at must win (red).
+    await t('mirror: copies latest by id (not completed_at)', async () => {
+      // Older green finishes AFTER newer red — newer attempt must win (red).
       const { created } = await runMirror({
         checks: [
-          { id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T03:00:00Z' },
-          { id: 2, status: 'completed', conclusion: 'failure', created_at: '2026-10-20T02:00:00Z', completed_at: '2026-10-20T02:30:00Z' },
+          { id: 2, status: 'completed', conclusion: 'failure', started_at: '2026-10-20T02:00:00Z', completed_at: '2026-10-20T02:30:00Z' },
+          { id: 1, status: 'completed', conclusion: 'success', started_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T03:00:00Z' },
         ],
       });
       assert.strictEqual(created.length, 1);
@@ -1242,6 +1255,67 @@ const UNL_KW = 'This is a security problem.';
       assert.strictEqual(created[0].head_sha, 'abc1234000000000000000000000000000000000');
       assert.strictEqual(created[0].status, 'completed');
     });
+    {
+      // Shape of pinhaoyun #28 head ff133a9: Checks API has no created_at;
+      // ids/started_at of rerun attempts; label-ack mirrors (and GitHub's
+      // re-run copies of them, URL /runs/<id>) interleaved.
+      const job = (id, at, conclusion, extra = {}) => ({ id, status: 'completed', conclusion, started_at: at, completed_at: at,
+        details_url: `https://github.com/o/r/actions/runs/39539778477/job/${id}`, external_id: `x${id}`, ...extra });
+      const ack = (id, at) => ({ id, status: 'completed', conclusion: 'failure', started_at: at, completed_at: at,
+        details_url: `https://github.com/o/r/runs/${id}`, output: { title: 'Label ack: mirrored failure' } });
+      const events = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-21T03:00:00Z' }];
+      await t('mirror: older failure + newer success ⇒ success', async () => {
+        const { created } = await runMirror({ relevantLabels: 'qa-passed', labels: [{ name: 'qa-passed' }], events, label: 'triage', checks: [
+          job(10, '2026-10-21T03:39:41Z', 'failure'),
+          job(20, '2026-10-21T03:56:17Z', 'success'),
+        ] });
+        assert.strictEqual(created.length, 1);
+        assert.strictEqual(created[0].conclusion, 'success');
+        assert.match(created[0].output.summary, /source check 20/);
+      });
+      await t('mirror: rerun attempts with interleaved acks pick newest real attempt', async () => {
+        const { created } = await runMirror({ relevantLabels: 'qa-passed', labels: [{ name: 'qa-passed' }], events, label: 'triage', checks: [
+          ack(119029406049, '2026-10-21T03:56:22Z'),
+          job(119029377082, '2026-10-21T03:56:17Z', 'success'),
+          ack(119028815663, '2026-10-21T03:54:16Z'),
+          job(119028212125, '2026-10-21T03:54:11Z', 'success'),
+          { ...ack(119025675579, '2026-10-21T03:43:14Z'), output: undefined },
+          job(119024627996, '2026-10-21T03:39:41Z', 'failure'),
+        ] });
+        assert.strictEqual(created.length, 1);
+        assert.strictEqual(created[0].conclusion, 'success');
+        assert.match(created[0].output.summary, /source check 119029377082/);
+      });
+      await t('mirror: newest real attempt in progress ⇒ stay pending, not old failure', async () => {
+        const { created, infos } = await runMirror({ checks: [
+          ack(30, '2026-10-21T03:43:14Z'),
+          job(10, '2026-10-21T03:39:41Z', 'failure'),
+          { id: 40, status: 'in_progress', conclusion: null, started_at: '2026-10-21T03:50:00Z', details_url: 'https://github.com/o/r/actions/runs/1/job/40' },
+        ] });
+        assert.deepStrictEqual(created, []);
+        assert.ok(infos.some((m) => /still in_progress/.test(m)));
+      });
+      await t('mirror: newer cancelled-before-start (started_at null) beats older success', async () => {
+        const { created, reruns } = await runMirror({ checks: [
+          job(10, '2026-10-21T03:39:41Z', 'success'),
+          { id: 11, status: 'completed', conclusion: 'cancelled', started_at: null, completed_at: '2026-10-21T03:40:00Z', details_url: 'https://github.com/o/r/actions/runs/4242/job/11' },
+        ] });
+        assert.deepStrictEqual(created, []);
+        assert.deepStrictEqual(reruns, [{ owner: 'o', repo: 'r', run_id: 4242 }]);
+      });
+      await t('mirror: same started_at, older success finishing last does not mask newer failure', async () => {
+        const { created } = await runMirror({ checks: [
+          job(10, '2026-10-21T03:39:41Z', 'success', { completed_at: '2026-10-21T03:45:00Z' }),
+          job(11, '2026-10-21T03:39:41Z', 'failure', { completed_at: '2026-10-21T03:40:00Z' }),
+        ] });
+        assert.strictEqual(created[0].conclusion, 'failure');
+        assert.match(created[0].output.summary, /source check 11/);
+      });
+      await t('mirror: only mirrors present ⇒ no create', async () => {
+        const { created } = await runMirror({ checks: [ack(30, '2026-10-21T03:43:14Z')] });
+        assert.deepStrictEqual(created, []);
+      });
+    }
     await t('mirror: in-flight same-named check → no create (no race)', async () => {
       const { created, infos } = await runMirror({
         checks: [{ id: 9, status: 'in_progress', conclusion: null, created_at: '2026-10-20T03:00:00Z' }],

@@ -3,7 +3,7 @@
 # When a gate caller listens for labeled/unlabeled but skips the real
 # evaluator for unrelated labels, GitHub still opens a check suite with no
 # run named like the required check ("codex / Codex Review Gate") → hangs
-# on "is expected". This reusable job re-posts the LATEST conclusion for
+# on "is expected". This reusable job re-posts the LATEST REAL (non-mirror) conclusion for
 # that exact check name on the PR head via the Checks API (no false green:
 # it never invents success when nothing prior exists; it never runs while
 # a same-named check is still in flight).
@@ -87,14 +87,25 @@ jobs:
             const label = context.payload.label?.name || '';
             const action = context.payload.action || context.eventName;
 
-            // Rank by created_at (+ id), same as auto-merge / heal-required-checks:
-            // an older run can finish after a newer one; completed_at would
-            // wrongly prefer the older conclusion.
-            function byNewestCreated(a, b) {
-              const ta = a.created_at || '';
-              const tb = b.created_at || '';
-              if (ta !== tb) return ta < tb ? 1 : -1;
-              return (b.id || 0) - (a.id || 0);
+            // Check runs carry NO created_at in the Checks API (the old
+            // created_at sort silently degraded). Check run ids are allocated
+            // monotonically at creation, and every rerun attempt gets a new
+            // id, so highest id = newest real attempt. Timestamps are only a
+            // tiebreak: started_at is null for checks cancelled before start,
+            // and an older attempt can finish after a newer one.
+            function ts(v) { const n = Date.parse(v || ''); return Number.isFinite(n) ? n : 0; }
+            function byNewest(a, b) {
+              return ((b.id || 0) - (a.id || 0))
+                || (ts(b.started_at) - ts(a.started_at))
+                || (ts(b.completed_at) - ts(a.completed_at));
+            }
+            // Mirror outputs (ours, or GitHub's re-run copies of them) are
+            // never sources: "Label ack" title, or an API-created check whose
+            // URL is /runs/<id> instead of an Actions job /actions/runs/<id>.
+            function isMirror(r) {
+              if (/^Label ack/.test(r?.output?.title || '')) return true;
+              const url = String(r?.details_url || r?.html_url || '');
+              return !!url && !/\/actions\/runs\/\d+/.test(url);
             }
             async function listNamed() {
               return github.paginate(github.rest.checks.listForRef, {
@@ -106,35 +117,38 @@ jobs:
                 per_page: 100,
               });
             }
+            // { latest: newest real run (any status), source: it if completed }
+            function pick(list) {
+              const real = (list || []).filter(r => !isMirror(r)).sort(byNewest);
+              const latest = real[0];
+              const inflight = real.some(r => r.status && r.status !== 'completed');
+              const source = latest && (!latest.status || latest.status === 'completed') && latest.conclusion ? latest : null;
+              return { latest, inflight, source };
+            }
+            function unchanged(p) {
+              return !p.inflight && p.source && p.source.id === observedId && p.source.conclusion === observedConclusion;
+            }
 
-            let runs = await listNamed();
-            let sorted = (runs || []).slice().sort(byNewestCreated);
-            let latest = sorted[0];
-
-            if (latest && latest.status && latest.status !== 'completed') {
-              // An in-flight same-named check already covers the required
-              // name for this head — posting a mirror would race it / become
-              // a newer created_at that outranks the evaluator.
-              core.info(`Latest "${checkName}" is still ${latest.status} (id ${latest.id}) — not mirroring`);
+            let picked = pick(await listNamed());
+            if (picked.latest && picked.latest.status && picked.latest.status !== 'completed') {
+              // Newest real attempt is in flight: keep the required check
+              // pending; never re-post an older failure ahead of it.
+              core.info(`Latest "${checkName}" is still ${picked.latest.status} (id ${picked.latest.id}) — not mirroring`);
               return;
             }
-            if (!latest || !latest.conclusion) {
+            if (picked.inflight || !picked.source) {
               // Do not invent success/neutral: a brand-new head with no
               // prior gate result must wait for a real evaluate.
               core.info(`No completed prior "${checkName}" on ${sha.slice(0, 7)} — not inventing a conclusion`);
               return;
             }
 
-            const observedId = latest.id;
-            const observedConclusion = latest.conclusion;
-            // Mirrors must never become sources for another mirror.
-            if (/^Label ack:/.test(latest.output?.title || '')) {
-              latest = sorted.find(r => !/^Label ack:/.test(r.output?.title || ''));
-              if (!latest || latest.status !== 'completed' || !latest.conclusion) return;
-            }
-            const source = latest;
-            const conclusion = latest.conclusion;
-            const sourceId = latest.id;
+            const source = picked.source;
+            let latest = source;
+            const observedId = source.id;
+            const observedConclusion = source.conclusion;
+            const conclusion = source.conclusion;
+            const sourceId = source.id;
 
             // Never create a synthetic cancelled check: Auto Merge /
             // heal-required-checks can only re-run checks that still point
@@ -195,20 +209,12 @@ jobs:
             // Revalidate immediately before create: an evaluator may have
             // started (or finished) since the first list. Never let a stale
             // mirror become the newest same-named check ahead of a live gate.
-            runs = await listNamed();
-            sorted = (runs || []).slice().sort(byNewestCreated);
-            latest = sorted[0];
-            if (!latest || latest.id !== observedId || latest.conclusion !== observedConclusion
-              || (latest.status && latest.status !== 'completed')) {
-              core.info(`Pre-create revalidate: latest "${checkName}" changed (now id ${latest?.id}, status ${latest?.status}, conclusion ${latest?.conclusion}) — not mirroring`);
+            if (!unchanged(pick(await listNamed()))) {
+              core.info(`Pre-create revalidate: latest real "${checkName}" changed or is in flight — not mirroring`);
               return;
             }
-
             // One final Checks read after the preceding revalidation passed.
-            runs = await listNamed();
-            latest = (runs || []).slice().sort(byNewestCreated)[0];
-            if ((runs || []).some(r => r.status && r.status !== 'completed')
-              || !latest || latest.id !== observedId || latest.conclusion !== observedConclusion) {
+            if (!unchanged(pick(await listNamed()))) {
               core.info(`Final pre-create revalidate: "${checkName}" changed or is in flight — not mirroring`);
               return;
             }
@@ -245,10 +251,7 @@ jobs:
             }
             // Label API reads may overlap a real evaluation. Yield if its check
             // changed while reading labels, including when we would post failure.
-            runs = await listNamed();
-            latest = (runs || []).slice().sort(byNewestCreated)[0];
-            if ((runs || []).some(r => r.status && r.status !== 'completed')
-              || !latest || latest.id !== observedId || latest.conclusion !== observedConclusion) {
+            if (!unchanged(pick(await listNamed()))) {
               core.info('Post-label pre-create revalidate: source changed — not mirroring');
               return;
             }
