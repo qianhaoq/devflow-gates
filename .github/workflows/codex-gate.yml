@@ -418,7 +418,7 @@ jobs:
               if (!latestSummary) {
                 const elapsed = await headAgeMs();
                 const waitedMin = Math.max(0, Math.round(elapsed / 60000));
-                return { ok: false, msg: elapsed < WAIT_MS
+                return { ok: false, running: elapsed < WAIT_MS, msg: elapsed < WAIT_MS
                   ? `Codex Review Summary not posted yet (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until chatgpt-codex-connector comments; the check is re-run when Codex posts/edits its summary.`
                   : `Codex never posted a Review Summary within ${WAIT_MINUTES} minutes of head ${sha.slice(0, 7)}. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).` };
               }
@@ -438,7 +438,7 @@ jobs:
               if (!summaryCoversHead(latestSummary.body, sha)) {
                 const elapsed = await headAgeMs();
                 const waitedMin = Math.max(0, Math.round(elapsed / 60000));
-                return { ok: false, msg: elapsed < WAIT_MS
+                return { ok: false, running: elapsed < WAIT_MS, msg: elapsed < WAIT_MS
                   ? `Codex Review Summary does not mention head ${sha.slice(0, 7)} (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until Codex re-reviews this SHA.`
                   : `Codex Review Summary still does not mention head ${sha.slice(0, 7)} after ${WAIT_MINUTES} minutes. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).` };
               }
@@ -480,7 +480,8 @@ jobs:
                 return;
               }
               let v = await verdict(prNumber);
-              // Codex still Running: keep this check in_progress (pending)
+              // Codex still Running, or no summary for this head yet (within
+              // wait_minutes): keep this check in_progress (pending)
               // and poll, instead of posting a failure that a later green
               // rerun may not be able to replace in the required context.
               const pollMs = Math.max(0, Number(process.env.RUNNING_POLL_MS ?? 30000));
@@ -1073,7 +1074,7 @@ jobs:
               if (!latestSummary) {
                 const elapsed = await headAgeMs();
                 const waitedMin = Math.max(0, Math.round(elapsed / 60000));
-                return { ok: false, msg: elapsed < WAIT_MS
+                return { ok: false, running: elapsed < WAIT_MS, msg: elapsed < WAIT_MS
                   ? `Codex Review Summary not posted yet (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until chatgpt-codex-connector comments; the check is re-run when Codex posts/edits its summary.`
                   : `Codex never posted a Review Summary within ${WAIT_MINUTES} minutes of head ${sha.slice(0, 7)}. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).` };
               }
@@ -1093,7 +1094,7 @@ jobs:
               if (!summaryCoversHead(latestSummary.body, sha)) {
                 const elapsed = await headAgeMs();
                 const waitedMin = Math.max(0, Math.round(elapsed / 60000));
-                return { ok: false, msg: elapsed < WAIT_MS
+                return { ok: false, running: elapsed < WAIT_MS, msg: elapsed < WAIT_MS
                   ? `Codex Review Summary does not mention head ${sha.slice(0, 7)} (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until Codex re-reviews this SHA.`
                   : `Codex Review Summary still does not mention head ${sha.slice(0, 7)} after ${WAIT_MINUTES} minutes. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).` };
               }
@@ -1135,7 +1136,8 @@ jobs:
                 return;
               }
               let v = await verdict(prNumber);
-              // Codex still Running: keep this check in_progress (pending)
+              // Codex still Running, or no summary for this head yet (within
+              // wait_minutes): keep this check in_progress (pending)
               // and poll, instead of posting a failure that a later green
               // rerun may not be able to replace in the required context.
               const pollMs = Math.max(0, Number(process.env.RUNNING_POLL_MS ?? 30000));

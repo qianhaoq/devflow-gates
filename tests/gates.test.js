@@ -745,6 +745,14 @@ const UNL_KW = 'This is a security problem.';
     assert.strictEqual(m, 3, 'bounded polling');
     assert.match(still[0] || '', /still Running/);
   });
+  await t('codex-gate evaluate (jobs#14): no summary yet for head ⇒ stays pending/polls, passes once posted', async () => {
+    const p = { eventName: 'pull_request_target', payload: { pull_request: { number: 9 } }, mode: 'evaluate' };
+    let n = 0; const failed = [];
+    const recent = { ...SUMMARY_DONE };
+    await runRefresh('codex-gate.yml', {}, { ...p, failed, env: { RUNNING_MAX_POLLS: '5' }, summary: () => (++n < 3 ? null : recent) });
+    assert.deepStrictEqual(failed, []);
+    assert.strictEqual(n, 3, 'polled instead of failing');
+  });
   await t('codex-gate refresh: failed head run re-run only when the gate would now pass', async () => {
     const runs = { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] };
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs), [5]);
@@ -1226,6 +1234,17 @@ const UNL_KW = 'This is a security problem.';
     await t('mirror: queued job without steps is treated as in-flight', async () => {
       const r = await runMirror({ unknownJobs: [2], checks: [job(1, 'success'), { ...job(2, null), status: 'queued', conclusion: null }] });
       assert.match(r.failed, /Timed out/);
+    });
+    await t('mirror (jobs#14): stale "summary not yet" failure never re-posted once a newer real success exists', async () => {
+      // t1 real PRT gate failed (summary missing) · t2 acks re-posted failure ·
+      // t3 Codex review-event real gate succeeded · t4 new label ack.
+      const r = await runMirror({ labels: okLabels, events: okEvents, ackJobs: [2, 3],
+        checks: [job(1, 'failure'), job(2, 'failure'), job(3, 'failure'), job(4, 'success')] });
+      assert.strictEqual(r.failed, null);
+      // A rerun of the stale failure that succeeds (new id) also wins.
+      const r2 = await runMirror({ labels: okLabels, events: okEvents, ackJobs: [2],
+        checks: [job(1, 'failure'), job(2, 'failure'), job(5, 'success', { details_url: 'https://github.com/o/r/actions/runs/4001/job/5' })] });
+      assert.strictEqual(r2.failed, null);
     });
     await t('mirror: skipped no-step job is transparent', async () => {
       const r = await runMirror({ labels: okLabels, events: okEvents, skippedJobs: [2],
