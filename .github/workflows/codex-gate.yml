@@ -740,6 +740,20 @@ jobs:
                   core.info(`PR #${pr.number}: head check is green but the gate would now fail (${v.msg}) — re-running run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
                   continue;
                 }
+                // Clean Codex verdict for this head: an OLDER failed gate run on
+                // the same head (e.g. pull_request_target failed while Codex was
+                // still Running; a later review-event run went green) can keep a
+                // red required check. Re-run its failed jobs — newest failed run
+                // only, and only at run_attempt 1, so at most once per head run.
+                if (v.ok) {
+                  const staleFail = evaluated.find((r) => r.conclusion === 'failure' || r.conclusion === 'timed_out');
+                  if (staleFail && (staleFail.run_attempt || 1) === 1) {
+                    await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: staleFail.id });
+                    rerun += 1;
+                    core.info(`PR #${pr.number}: Codex verdict is clean — re-running failed jobs of older failed run ${staleFail.id} (${staleFail.event}, head ${sha.slice(0, 7)}), once`);
+                    continue;
+                  }
+                }
               }
               if (latest.conclusion === 'failure' || latest.conclusion === 'timed_out') {
                 if (capped(latest, MAX_ATTEMPTS)) {
@@ -1380,6 +1394,20 @@ jobs:
                   rerun += 1;
                   core.info(`PR #${pr.number}: head check is green but the gate would now fail (${v.msg}) — re-running run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
                   continue;
+                }
+                // Clean Codex verdict for this head: an OLDER failed gate run on
+                // the same head (e.g. pull_request_target failed while Codex was
+                // still Running; a later review-event run went green) can keep a
+                // red required check. Re-run its failed jobs — newest failed run
+                // only, and only at run_attempt 1, so at most once per head run.
+                if (v.ok) {
+                  const staleFail = evaluated.find((r) => r.conclusion === 'failure' || r.conclusion === 'timed_out');
+                  if (staleFail && (staleFail.run_attempt || 1) === 1) {
+                    await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: staleFail.id });
+                    rerun += 1;
+                    core.info(`PR #${pr.number}: Codex verdict is clean — re-running failed jobs of older failed run ${staleFail.id} (${staleFail.event}, head ${sha.slice(0, 7)}), once`);
+                    continue;
+                  }
                 }
               }
               if (latest.conclusion === 'failure' || latest.conclusion === 'timed_out') {
