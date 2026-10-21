@@ -749,7 +749,7 @@ const UNL_KW = 'This is a security problem.';
     const p = { eventName: 'pull_request_target', payload: { pull_request: { number: 9 } }, mode: 'evaluate' };
     let n = 0; const failed = [];
     const recent = { ...SUMMARY_DONE };
-    await runRefresh('codex-gate.yml', {}, { ...p, failed, env: { RUNNING_MAX_POLLS: '5' }, summary: () => (++n < 3 ? null : recent) });
+    await runRefresh('codex-gate.yml', {}, { ...p, failed, env: { RUNNING_MAX_POLLS: '5', WAIT_MINUTES: '9999999' }, summary: () => (++n < 3 ? null : recent) });
     assert.deepStrictEqual(failed, []);
     assert.strictEqual(n, 3, 'polled instead of failing');
   });
