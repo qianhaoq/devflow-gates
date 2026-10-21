@@ -23,8 +23,9 @@
 #   were cancelled before starting (no steps) are NOT transparent: unless a
 #   sibling attempt of the same run proves it was an ack, it is a cancelled
 #   real verdict -> heal or fail (fail-closed; never an older success).
-#   Heal defers only behind an in_progress peer (queued peers may wait on
-#   this ack), bounded; a healed run stuck queued fails this ack closed.
+#   Heal defers only behind an in_progress peer (until the deadline); a
+#   queued peer (may wait on this ack) ends the ack fail-closed without a
+#   competing rerun; a healed run stuck queued fails this ack closed.
 # - Success is mirrored only if current relevant-label state matches the
 #   label event history at the source verdict; uncertainty -> failure.
 # - Sources: same-named Actions jobs that are not acks. Acks are recognised
@@ -228,6 +229,16 @@ jobs:
               // Our own run is in flight too: never count it.
               const peer = workflowRuns.find((r) => r.id !== run_id && r.id !== Number(context.runId) && r.status === 'in_progress'
                 && (r.pull_requests || []).some((p) => p.number === number));
+              // A queued/pending peer of this PR may be waiting on OUR concurrency
+              // group (or runner capacity): never wait on it (mutual wait) and
+              // never launch a competing rerun — end this ack fail-closed; the
+              // peer's newer check carries the verdict once it runs.
+              const queuedPeer = workflowRuns.find((r) => r.id !== run_id && r.id !== Number(context.runId)
+                && ['queued', 'waiting', 'pending', 'requested'].includes(r.status)
+                && (r.pull_requests || []).some((p) => p.number === number));
+              if (!peer && queuedPeer) {
+                return { capped: `Cancelled "${checkName}" (run ${run_id}) not healed: run ${queuedPeer.id} for PR #${number} is ${queuedPeer.status} (may be waiting on this ack); failing closed — its newer check will carry the verdict.` };
+              }
               // An in_progress peer is not blocked by us: keep deferring until
               // the ack's own wait deadline (bounded by wait_minutes).
               if (peer) {

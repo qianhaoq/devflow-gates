@@ -1291,13 +1291,13 @@ const UNL_KW = 'This is a security problem.';
       assert.deepStrictEqual(r.reruns, []);
       assert.strictEqual(r.failed, null);
     });
-    await t('mirror (P1-a): queued peer (blocked on our concurrency group) does not defer heal', async () => {
+    await t('mirror (P1-a): queued peer (maybe blocked on our concurrency group) ⇒ no wait, no competing rerun, fail closed', async () => {
       for (const status of ['queued', 'pending', 'waiting', 'requested']) {
-        const r = await runMirror({ waitMinutes: '1', labels: okLabels, events: okEvents,
-          workflowRuns: [{ id: 4500, status, pull_requests: [{ number: 9 }] }],
-          checks: (k) => k < 3 ? [job(1, 'cancelled')] : [job(1, 'cancelled'), job(3, 'success')] });
-        assert.deepStrictEqual(r.reruns, [{ owner: 'o', repo: 'r', run_id: 4001 }], status);
-        assert.strictEqual(r.failed, null, status);
+        const r = await runMirror({ waitMinutes: '60', labels: okLabels, events: okEvents,
+          workflowRuns: [{ id: 4500, status, pull_requests: [{ number: 9 }] }], checks: [job(1, 'cancelled')] });
+        assert.deepStrictEqual(r.reruns, [], status);
+        assert.match(r.failed, /not healed: run 4500.*failing closed/, status);
+        assert.ok(r.reads < 5, `no mutual wait (${r.reads})`);
       }
     });
     await t('mirror (P1-a): long in-progress peer keeps deferring until it finishes (no early fail)', async () => {
@@ -1385,13 +1385,13 @@ const UNL_KW = 'This is a security problem.';
         assert.match(r.failed, /attempt cap.*Actions UI or push/);
       }
     });
-    await t('mirror: PR-associated in-progress peer defers heal; queued peer does not (own run ignored)', async () => {
+    await t('mirror: PR-associated in-flight peer prevents heal (own run ignored)', async () => {
       for (const status of ['queued', 'in_progress', 'completed']) {
         for (const [id, assoc] of [[4001, 9], [4002, 9], [4002, 10], [9999, 9]]) {
           const r = await runMirror({ checks: [job(1, 'cancelled')], workflowRuns: [{ id, status, pull_requests: [{ number: assoc }] }] });
-          const blocked = id === 4002 && assoc === 9 && status === 'in_progress';
+          const blocked = id === 4002 && assoc === 9 && status !== 'completed';
           assert.strictEqual(r.reruns.length, blocked ? 0 : 1, `${status} ${id} ${assoc}`);
-          assert.match(r.failed, /Timed out/);
+          assert.match(r.failed, blocked && status === 'queued' ? /not healed/ : /Timed out/);
         }
       }
     });
