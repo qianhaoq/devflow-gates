@@ -418,7 +418,7 @@ jobs:
               if (!latestSummary) {
                 const elapsed = await headAgeMs();
                 const waitedMin = Math.max(0, Math.round(elapsed / 60000));
-                return { ok: false, msg: elapsed < WAIT_MS
+                return { ok: false, running: elapsed < WAIT_MS, pending: elapsed < WAIT_MS, msg: elapsed < WAIT_MS
                   ? `Codex Review Summary not posted yet (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until chatgpt-codex-connector comments; the check is re-run when Codex posts/edits its summary.`
                   : `Codex never posted a Review Summary within ${WAIT_MINUTES} minutes of head ${sha.slice(0, 7)}. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).` };
               }
@@ -438,7 +438,7 @@ jobs:
               if (!summaryCoversHead(latestSummary.body, sha)) {
                 const elapsed = await headAgeMs();
                 const waitedMin = Math.max(0, Math.round(elapsed / 60000));
-                return { ok: false, msg: elapsed < WAIT_MS
+                return { ok: false, running: elapsed < WAIT_MS, pending: elapsed < WAIT_MS, msg: elapsed < WAIT_MS
                   ? `Codex Review Summary does not mention head ${sha.slice(0, 7)} (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until Codex re-reviews this SHA.`
                   : `Codex Review Summary still does not mention head ${sha.slice(0, 7)} after ${WAIT_MINUTES} minutes. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).` };
               }
@@ -480,13 +480,20 @@ jobs:
                 return;
               }
               let v = await verdict(prNumber);
-              // Codex still Running: keep this check in_progress (pending)
+              // Codex still Running, or no summary for this head yet (within
+              // wait_minutes): keep this check in_progress (pending)
               // and poll, instead of posting a failure that a later green
               // rerun may not be able to replace in the required context.
               const pollMs = Math.max(0, Number(process.env.RUNNING_POLL_MS ?? 30000));
               const maxPolls = Math.max(0, Number(process.env.RUNNING_MAX_POLLS ?? 28));
-              for (let i = 0; v.running && i < maxPolls; i++) {
-                core.info(`PR #${prNumber}: Codex review still Running — waiting (poll ${i + 1}/${maxPolls})`);
+              // Wall-clock budget stays below the job's 20-minute timeout so the
+              // check ends red (fail closed), never cancelled. Missing-summary
+              // polls do not consume the Running-poll budget.
+              const budgetEnd = Date.now() + Math.max(0, Number(process.env.EVAL_POLL_BUDGET_MS ?? 17 * 60000));
+              let runningPolls = 0;
+              while (v.running && Date.now() < budgetEnd && (v.pending || runningPolls < maxPolls)) {
+                if (!v.pending) runningPolls += 1;
+                core.info(`PR #${prNumber}: ${v.pending ? 'no Codex summary for this head yet' : 'Codex review still Running'} — waiting (running polls ${runningPolls}/${maxPolls})`);
                 await new Promise((r) => setTimeout(r, pollMs));
                 v = await verdict(prNumber);
               }
@@ -739,6 +746,38 @@ jobs:
                   rerun += 1;
                   core.info(`PR #${pr.number}: head check is green but the gate would now fail (${v.msg}) — re-running run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
                   continue;
+                }
+                // Clean Codex verdict for this head: an OLDER failed gate run on
+                // the same head (e.g. pull_request_target failed while Codex was
+                // still Running; a later review-event run went green) can keep a
+                // red required check. Re-run its failed jobs — newest failed run
+                // only, and only at run_attempt 1, so at most once per head run.
+                if (v.ok) {
+                  // headRuns() keys on run.head_sha; a pull_request_target run
+                  // may carry the BASE SHA there. Also sweep workflow runs and
+                  // keep those whose PR association points at THIS head.
+                  const isFail = (r) => r.conclusion === 'failure' || r.conclusion === 'timed_out';
+                  const assoc = (await github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner, repo, workflow_id: workflowId, per_page: 100,
+                  }) || []).filter((r) => r.id !== context.runId
+                    && (r.pull_requests || []).some((p) => p.number === pr.number && p.head?.sha === sha));
+                  // An active PR-associated peer (possibly base-SHA, invisible to
+                  // the inFlight() guard above) owns the check: never rerun now.
+                  if (inFlight(assoc)) {
+                    core.info(`PR #${pr.number}: a PR-associated gate run is still in flight — not re-running older failure`);
+                    continue;
+                  }
+                  const swept = assoc;
+                  const seen = new Set(evaluated.map((r) => r.id));
+                  const pool = [...evaluated, ...swept.filter((r) => !seen.has(r.id) && r.conclusion !== 'skipped')]
+                    .sort((x, y) => (attemptAt(y) - attemptAt(x)) || ((y.id || 0) - (x.id || 0)));
+                  const staleFail = pool.find(isFail);
+                  if (staleFail && (staleFail.run_attempt || 1) === 1) {
+                    await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: staleFail.id });
+                    rerun += 1;
+                    core.info(`PR #${pr.number}: Codex verdict is clean — re-running failed jobs of older failed run ${staleFail.id} (${staleFail.event}, head ${sha.slice(0, 7)}), once`);
+                    continue;
+                  }
                 }
               }
               if (latest.conclusion === 'failure' || latest.conclusion === 'timed_out') {
@@ -1059,7 +1098,7 @@ jobs:
               if (!latestSummary) {
                 const elapsed = await headAgeMs();
                 const waitedMin = Math.max(0, Math.round(elapsed / 60000));
-                return { ok: false, msg: elapsed < WAIT_MS
+                return { ok: false, running: elapsed < WAIT_MS, pending: elapsed < WAIT_MS, msg: elapsed < WAIT_MS
                   ? `Codex Review Summary not posted yet (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until chatgpt-codex-connector comments; the check is re-run when Codex posts/edits its summary.`
                   : `Codex never posted a Review Summary within ${WAIT_MINUTES} minutes of head ${sha.slice(0, 7)}. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).` };
               }
@@ -1079,7 +1118,7 @@ jobs:
               if (!summaryCoversHead(latestSummary.body, sha)) {
                 const elapsed = await headAgeMs();
                 const waitedMin = Math.max(0, Math.round(elapsed / 60000));
-                return { ok: false, msg: elapsed < WAIT_MS
+                return { ok: false, running: elapsed < WAIT_MS, pending: elapsed < WAIT_MS, msg: elapsed < WAIT_MS
                   ? `Codex Review Summary does not mention head ${sha.slice(0, 7)} (${waitedMin}m < ${WAIT_MINUTES}m). Gate fails until Codex re-reviews this SHA.`
                   : `Codex Review Summary still does not mention head ${sha.slice(0, 7)} after ${WAIT_MINUTES} minutes. Comment "@codex review" (skip-codex-gate fails Gate and blocks Auto Merge).` };
               }
@@ -1121,13 +1160,20 @@ jobs:
                 return;
               }
               let v = await verdict(prNumber);
-              // Codex still Running: keep this check in_progress (pending)
+              // Codex still Running, or no summary for this head yet (within
+              // wait_minutes): keep this check in_progress (pending)
               // and poll, instead of posting a failure that a later green
               // rerun may not be able to replace in the required context.
               const pollMs = Math.max(0, Number(process.env.RUNNING_POLL_MS ?? 30000));
               const maxPolls = Math.max(0, Number(process.env.RUNNING_MAX_POLLS ?? 28));
-              for (let i = 0; v.running && i < maxPolls; i++) {
-                core.info(`PR #${prNumber}: Codex review still Running — waiting (poll ${i + 1}/${maxPolls})`);
+              // Wall-clock budget stays below the job's 20-minute timeout so the
+              // check ends red (fail closed), never cancelled. Missing-summary
+              // polls do not consume the Running-poll budget.
+              const budgetEnd = Date.now() + Math.max(0, Number(process.env.EVAL_POLL_BUDGET_MS ?? 17 * 60000));
+              let runningPolls = 0;
+              while (v.running && Date.now() < budgetEnd && (v.pending || runningPolls < maxPolls)) {
+                if (!v.pending) runningPolls += 1;
+                core.info(`PR #${prNumber}: ${v.pending ? 'no Codex summary for this head yet' : 'Codex review still Running'} — waiting (running polls ${runningPolls}/${maxPolls})`);
                 await new Promise((r) => setTimeout(r, pollMs));
                 v = await verdict(prNumber);
               }
@@ -1380,6 +1426,38 @@ jobs:
                   rerun += 1;
                   core.info(`PR #${pr.number}: head check is green but the gate would now fail (${v.msg}) — re-running run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
                   continue;
+                }
+                // Clean Codex verdict for this head: an OLDER failed gate run on
+                // the same head (e.g. pull_request_target failed while Codex was
+                // still Running; a later review-event run went green) can keep a
+                // red required check. Re-run its failed jobs — newest failed run
+                // only, and only at run_attempt 1, so at most once per head run.
+                if (v.ok) {
+                  // headRuns() keys on run.head_sha; a pull_request_target run
+                  // may carry the BASE SHA there. Also sweep workflow runs and
+                  // keep those whose PR association points at THIS head.
+                  const isFail = (r) => r.conclusion === 'failure' || r.conclusion === 'timed_out';
+                  const assoc = (await github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner, repo, workflow_id: workflowId, per_page: 100,
+                  }) || []).filter((r) => r.id !== context.runId
+                    && (r.pull_requests || []).some((p) => p.number === pr.number && p.head?.sha === sha));
+                  // An active PR-associated peer (possibly base-SHA, invisible to
+                  // the inFlight() guard above) owns the check: never rerun now.
+                  if (inFlight(assoc)) {
+                    core.info(`PR #${pr.number}: a PR-associated gate run is still in flight — not re-running older failure`);
+                    continue;
+                  }
+                  const swept = assoc;
+                  const seen = new Set(evaluated.map((r) => r.id));
+                  const pool = [...evaluated, ...swept.filter((r) => !seen.has(r.id) && r.conclusion !== 'skipped')]
+                    .sort((x, y) => (attemptAt(y) - attemptAt(x)) || ((y.id || 0) - (x.id || 0)));
+                  const staleFail = pool.find(isFail);
+                  if (staleFail && (staleFail.run_attempt || 1) === 1) {
+                    await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: staleFail.id });
+                    rerun += 1;
+                    core.info(`PR #${pr.number}: Codex verdict is clean — re-running failed jobs of older failed run ${staleFail.id} (${staleFail.event}, head ${sha.slice(0, 7)}), once`);
+                    continue;
+                  }
                 }
               }
               if (latest.conclusion === 'failure' || latest.conclusion === 'timed_out') {

@@ -745,6 +745,26 @@ const UNL_KW = 'This is a security problem.';
     assert.strictEqual(m, 3, 'bounded polling');
     assert.match(still[0] || '', /still Running/);
   });
+  await t('codex-gate evaluate (jobs#14): no summary yet for head ⇒ stays pending/polls, passes once posted', async () => {
+    const p = { eventName: 'pull_request_target', payload: { pull_request: { number: 9 } }, mode: 'evaluate' };
+    let n = 0; const failed = [];
+    const recent = { ...SUMMARY_DONE };
+    await runRefresh('codex-gate.yml', {}, { ...p, failed, env: { RUNNING_MAX_POLLS: '5', WAIT_MINUTES: '9999999' }, summary: () => (++n < 3 ? null : recent) });
+    assert.deepStrictEqual(failed, []);
+    assert.strictEqual(n, 3, 'polled instead of failing');
+    let m = 0; const f2 = [];
+    await runRefresh('codex-gate.yml', {}, { ...p, failed: f2, env: { RUNNING_MAX_POLLS: '1', WAIT_MINUTES: '9999999' }, summary: () => (++m < 5 ? null : recent) });
+    assert.deepStrictEqual(f2, [], 'polls past RUNNING_MAX_POLLS within wait window');
+    // missing → Running → Completed: missing polls don't eat the Running budget.
+    let q = 0; const f3 = [];
+    const seq = [null, null, null, null, SUMMARY_RUNNING, SUMMARY_RUNNING, recent];
+    await runRefresh('codex-gate.yml', {}, { ...p, failed: f3, env: { RUNNING_MAX_POLLS: '2', WAIT_MINUTES: '9999999' }, summary: () => seq[Math.min(q++, seq.length - 1)] });
+    assert.deepStrictEqual(f3, []);
+    // Wall-clock budget exhausted ⇒ fails closed (never runs into job timeout).
+    const f4 = [];
+    await runRefresh('codex-gate.yml', {}, { ...p, failed: f4, env: { WAIT_MINUTES: '9999999', EVAL_POLL_BUDGET_MS: '0' }, summary: () => null });
+    assert.match(f4[0] || '', /not posted yet/);
+  });
   await t('codex-gate refresh: failed head run re-run only when the gate would now pass', async () => {
     const runs = { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] };
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs), [5]);
@@ -774,6 +794,24 @@ const UNL_KW = 'This is a security problem.';
     const runs = { pull_request_target: [run(5, 'pull_request_target', 'success', '2026-10-16T01:20:00Z', { run_attempt: 3 })] };
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: SUMMARY_RUNNING }), ['all:5']);
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs), []);
+  });
+  await t('codex-gate refresh (P1-c): clean Codex summary re-runs the older failed head run (once; not while Running)', async () => {
+    // weekly #18: PRT failed (Codex Running), review-event run later green, red check stayed.
+    const runs = { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:00:00Z')],
+      pull_request_review: [run(6, 'pull_request_review', 'success', '2026-10-16T01:10:00Z')] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs), [5]);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: SUMMARY_RUNNING }), ['all:6']);
+    const once = { ...runs, pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:00:00Z', { run_attempt: 2 })] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', once), [], 'bounded: once per run');
+  });
+  await t('codex-gate refresh (P1-c): failed PRT run carrying the BASE sha is found via PR head association', async () => {
+    const prt = { ...run(5, 'pull_request_target', 'failure', '2026-10-16T01:00:00Z'), head_sha: 'base000', pull_requests: [{ number: 9, head: { sha: RH } }] };
+    const other = { ...run(4, 'pull_request_target', 'failure', '2026-10-16T00:50:00Z'), head_sha: 'base000', pull_requests: [{ number: 9, head: { sha: 'oldhead' } }] };
+    const runs = { pull_request_review: [run(6, 'pull_request_review', 'success', '2026-10-16T01:10:00Z')] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { allRuns: [prt, other] }), [5]);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { allRuns: [other] }), [], 'other-head failure ignored');
+    const active = { ...run(7, 'pull_request_target', null, '2026-10-16T01:20:00Z', { status: 'in_progress' }), head_sha: 'base000', pull_requests: [{ number: 9, head: { sha: RH } }] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { allRuns: [prt, active] }), [], 'active base-sha peer blocks');
   });
   for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
     await t(`${file} refresh: newest = latest ATTEMPT start (a re-run older run beats a later-created success)`, async () => {
@@ -837,11 +875,11 @@ const UNL_KW = 'This is a security problem.';
           run(14, 'pull_request_target', null, '2026-10-16T02:00:00Z', { status: 'in_progress' })] });
       assert.deepStrictEqual(r, []);
     });
-    await t(`${file} refresh: newest run decides (later success, older failure → nothing)`, async () => {
+    await t(`${file} refresh: later success, older failure → ${file === 'codex-gate.yml' ? 'clean Codex re-runs the failed run once' : 'nothing'}`, async () => {
       const r = await runRefresh(file, {
         workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')],
         pull_request_target: [run(8, 'pull_request_target', 'success', '2026-10-16T02:00:00Z')] });
-      assert.deepStrictEqual(r, []);
+      assert.deepStrictEqual(r, file === 'codex-gate.yml' ? [5] : []);
     });
     await t(`${file} refresh: workflow_run(cancelled) heal re-runs the TRIGGERING run for that PR only`, async () => {
       const wr = { eventName: 'workflow_run', payload: { workflow_run: { id: 21, conclusion: 'cancelled', event: 'pull_request_target', head_sha: RH, head_branch: 'crawl/auto', pull_requests: [{ number: 9 }] } } };
@@ -1123,7 +1161,7 @@ const UNL_KW = 'This is a security problem.';
       details_url: `https://github.com/o/r/actions/runs/${4000 + id}/job/${id}`, ...extra });
     // checks: array, or function(readNo) => array (simulates progress over polls).
     async function runMirror({ relevantLabels = 'qa-passed,no-auto-merge', events = [], eventsError = false, labels = [],
-      runAttempt = 1, workflowRuns = [], checks = [], ackJobs = [], unknownJobs = [], noStepJobs = [], jobError = false,
+      runAttempt = 1, workflowRuns = [], checks = [], ackJobs = [], unknownJobs = [], noStepJobs = [], skippedJobs = [], runStatus = {}, jobError = false,
       sha = SHA, label = 'triage', action = 'labeled', checkName = 'qa / QA Gate', jobName = 'QA Gate',
       waitMinutes = '0', selfRun = 9999 } = {}) {
       const src = scripts('mirror-required-check.yml')[0];
@@ -1146,10 +1184,11 @@ const UNL_KW = 'This is a security problem.';
               if (jobError) throw new Error('jobs api down');
               classified.push(job_id);
               if (unknownJobs.includes(job_id)) return { data: { status: 'queued', steps: [] } };
-              if (noStepJobs.includes(job_id)) return { data: { status: 'completed', steps: [] } };
+              if (noStepJobs.includes(job_id)) return { data: { status: 'completed', conclusion: 'cancelled', steps: [] } };
+              if (skippedJobs.includes(job_id)) return { data: { status: 'completed', conclusion: 'skipped', steps: [] } };
               return { data: { steps: [{ name: 'Set up job' }, { name: ackJobs.includes(job_id) ? ACK_STEP : 'Evaluate' }] } };
             },
-            getWorkflowRun: async ({ run_id }) => ({ data: { id: run_id, workflow_id: 99, run_attempt: runAttempt } }),
+            getWorkflowRun: async ({ run_id }) => ({ data: { id: run_id, workflow_id: 99, run_attempt: runAttempt, status: runStatus[run_id] || 'completed' } }),
             listWorkflowRuns: {},
             reRunWorkflow: async (a) => { reruns.push(a); },
           },
@@ -1217,13 +1256,70 @@ const UNL_KW = 'This is a security problem.';
       const r = await runMirror({ unknownJobs: [2], checks: [job(1, 'success'), { ...job(2, null), status: 'queued', conclusion: null }] });
       assert.match(r.failed, /Timed out/);
     });
-    await t('mirror: completed no-step (cancelled before start) job is transparent', async () => {
-      for (const older of ['success', 'failure']) {
-        const r = await runMirror({ labels: okLabels, events: okEvents, noStepJobs: [2],
-          checks: [job(1, older), job(2, 'cancelled', { started_at: null })] });
-        assert.deepStrictEqual(r.reruns, []);
-        if (older === 'success') assert.strictEqual(r.failed, null); else assert.match(r.failed, /source check 1/);
+    await t('mirror (jobs#14): stale "summary not yet" failure never re-posted once a newer real success exists', async () => {
+      // t1 real PRT gate failed (summary missing) · t2 acks re-posted failure ·
+      // t3 Codex review-event real gate succeeded · t4 new label ack.
+      const r = await runMirror({ labels: okLabels, events: okEvents, ackJobs: [2, 3],
+        checks: [job(1, 'failure'), job(2, 'failure'), job(3, 'failure'), job(4, 'success')] });
+      assert.strictEqual(r.failed, null);
+      // A rerun of the stale failure that succeeds (new id) also wins.
+      const r2 = await runMirror({ labels: okLabels, events: okEvents, ackJobs: [2],
+        checks: [job(1, 'failure'), job(2, 'failure'), job(5, 'success', { details_url: 'https://github.com/o/r/actions/runs/4001/job/5' })] });
+      assert.strictEqual(r2.failed, null);
+    });
+    await t('mirror: skipped no-step job is transparent', async () => {
+      const r = await runMirror({ labels: okLabels, events: okEvents, skippedJobs: [2],
+        checks: [job(1, 'success'), job(2, 'skipped', { started_at: null })] });
+      assert.deepStrictEqual(r.reruns, []);
+      assert.strictEqual(r.failed, null);
+    });
+    await t('mirror (P1-b): cancelled-at-start real evaluation newer than an older success ⇒ heal, never false green', async () => {
+      const r = await runMirror({ labels: okLabels, events: okEvents, noStepJobs: [2],
+        checks: [job(1, 'success'), job(2, 'cancelled', { started_at: null })] });
+      assert.deepStrictEqual(r.reruns, [{ owner: 'o', repo: 'r', run_id: 4002 }], 'heals the cancelled run');
+      assert.ok(r.failed, 'must not mirror the older success');
+      assert.ok(!/mirrored/.test(r.infos.join('\n')));
+      // Heal capped ⇒ fail closed, still never the older success.
+      const c = await runMirror({ runAttempt: 3, labels: okLabels, events: okEvents, noStepJobs: [2],
+        checks: [job(1, 'success'), job(2, 'cancelled', { started_at: null })] });
+      assert.match(c.failed, /attempt cap/);
+    });
+    await t('mirror (P1-b): no-step cancelled check proven an ack by a sibling attempt stays transparent', async () => {
+      const r = await runMirror({ labels: okLabels, events: okEvents, noStepJobs: [2], ackJobs: [3],
+        checks: [job(1, 'success'), job(2, 'cancelled', { started_at: null }),
+          job(3, 'success', { details_url: 'https://github.com/o/r/actions/runs/4002/job/3' })] });
+      assert.deepStrictEqual(r.reruns, []);
+      assert.strictEqual(r.failed, null);
+    });
+    await t('mirror (P1-a): queued peer (maybe blocked on our concurrency group) ⇒ no wait, no competing rerun, fail closed', async () => {
+      for (const status of ['queued', 'pending', 'waiting', 'requested']) {
+        const r = await runMirror({ waitMinutes: '60', labels: okLabels, events: okEvents,
+          workflowRuns: [{ id: 4500, status, pull_requests: [{ number: 9 }] }], checks: [job(1, 'cancelled')] });
+        assert.deepStrictEqual(r.reruns, [], status);
+        assert.match(r.failed, /not healed: run 4500.*failing closed/, status);
+        assert.ok(r.reads < 5, `no mutual wait (${r.reads})`);
       }
+    });
+    await t('mirror (P1-a): long in-progress peer keeps deferring until it finishes (no early fail)', async () => {
+      const peers = [{ id: 4500, status: 'in_progress', pull_requests: [{ number: 9 }] }];
+      const r = await runMirror({ waitMinutes: '1', workflowRuns: peers, labels: okLabels, events: okEvents,
+        checks: (k) => { if (k === 30) peers[0].status = 'completed'; return k < 40 ? [job(1, 'cancelled')] : [job(1, 'cancelled'), job(3, 'success')]; } });
+      assert.strictEqual(r.reruns.length, 1);
+      assert.strictEqual(r.failed, null);
+    });
+    await t('mirror (P1-a): healed run queued without publishing a replacement check ⇒ bounded fail', async () => {
+      const r = await runMirror({ waitMinutes: '60', runStatus: { 4001: 'queued' }, checks: [job(1, 'cancelled')] });
+      assert.strictEqual(r.reruns.length, 1);
+      assert.match(r.failed, /still queued.*failing closed/);
+      assert.ok(r.reads < 20, `bounded polls (${r.reads})`);
+    });
+    await t('mirror (P1-a): healed run stuck queued behind this ack ⇒ bounded fail, no mutual wait', async () => {
+      const r = await runMirror({ waitMinutes: '60', unknownJobs: [3], runStatus: { 4001: 'queued' },
+        checks: (k) => k < 2 ? [job(1, 'cancelled')]
+          : [job(1, 'cancelled'), { ...job(3, null), status: 'queued', conclusion: null, details_url: 'https://github.com/o/r/actions/runs/4001/job/3' }] });
+      assert.strictEqual(r.reruns.length, 1);
+      assert.match(r.failed, /still queued.*failing closed/);
+      assert.ok(r.reads < 20, `bounded polls (${r.reads})`);
     });
     await t('mirror: deferred heal retried after peer finishes; budget only on issued rerun', async () => {
       let n = 0;
@@ -1295,7 +1391,7 @@ const UNL_KW = 'This is a security problem.';
           const r = await runMirror({ checks: [job(1, 'cancelled')], workflowRuns: [{ id, status, pull_requests: [{ number: assoc }] }] });
           const blocked = id === 4002 && assoc === 9 && status !== 'completed';
           assert.strictEqual(r.reruns.length, blocked ? 0 : 1, `${status} ${id} ${assoc}`);
-          assert.match(r.failed, /Timed out/);
+          assert.match(r.failed, blocked && status === 'queued' ? /not healed/ : /Timed out/);
         }
       }
     });
