@@ -1228,12 +1228,12 @@ const UNL_KW = 'This is a security problem.';
       const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success, { ...success, id: 78, created_at: '2026-10-20T04:00:00Z', completed_at: '2026-10-20T04:00:00Z', output: { title: 'Label ack: mirrored success' } }], events: [{ event: 'unlabeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T03:00:00Z' }] });
       assert.strictEqual(created[0].conclusion, 'failure');
     });
-    await t('mirror: copies latest by created_at (not completed_at)', async () => {
-      // Older green finishes AFTER newer red — created_at must win (red).
+    await t('mirror: copies latest by started_at (not completed_at)', async () => {
+      // Older green finishes AFTER newer red — newer attempt must win (red).
       const { created } = await runMirror({
         checks: [
-          { id: 1, status: 'completed', conclusion: 'success', created_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T03:00:00Z' },
-          { id: 2, status: 'completed', conclusion: 'failure', created_at: '2026-10-20T02:00:00Z', completed_at: '2026-10-20T02:30:00Z' },
+          { id: 2, status: 'completed', conclusion: 'failure', started_at: '2026-10-20T02:00:00Z', completed_at: '2026-10-20T02:30:00Z' },
+          { id: 1, status: 'completed', conclusion: 'success', started_at: '2026-10-20T01:00:00Z', completed_at: '2026-10-20T03:00:00Z' },
         ],
       });
       assert.strictEqual(created.length, 1);
@@ -1242,6 +1242,51 @@ const UNL_KW = 'This is a security problem.';
       assert.strictEqual(created[0].head_sha, 'abc1234000000000000000000000000000000000');
       assert.strictEqual(created[0].status, 'completed');
     });
+    {
+      // Shape of pinhaoyun #28 head ff133a9: Checks API has no created_at;
+      // ids/started_at of rerun attempts; label-ack mirrors (and GitHub's
+      // re-run copies of them, URL /runs/<id>) interleaved.
+      const job = (id, at, conclusion, extra = {}) => ({ id, status: 'completed', conclusion, started_at: at, completed_at: at,
+        details_url: `https://github.com/o/r/actions/runs/39539778477/job/${id}`, external_id: `x${id}`, ...extra });
+      const ack = (id, at) => ({ id, status: 'completed', conclusion: 'failure', started_at: at, completed_at: at,
+        details_url: `https://github.com/o/r/runs/${id}`, output: { title: 'Label ack: mirrored failure' } });
+      const events = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-21T03:00:00Z' }];
+      await t('mirror: older failure + newer success ⇒ success', async () => {
+        const { created } = await runMirror({ relevantLabels: 'qa-passed', labels: [{ name: 'qa-passed' }], events, label: 'triage', checks: [
+          job(10, '2026-10-21T03:39:41Z', 'failure'),
+          job(20, '2026-10-21T03:56:17Z', 'success'),
+        ] });
+        assert.strictEqual(created.length, 1);
+        assert.strictEqual(created[0].conclusion, 'success');
+        assert.match(created[0].output.summary, /source check 20/);
+      });
+      await t('mirror: rerun attempts with interleaved acks pick newest real attempt', async () => {
+        const { created } = await runMirror({ relevantLabels: 'qa-passed', labels: [{ name: 'qa-passed' }], events, label: 'triage', checks: [
+          ack(119029406049, '2026-10-21T03:56:22Z'),
+          job(119029377082, '2026-10-21T03:56:17Z', 'success'),
+          ack(119028815663, '2026-10-21T03:54:16Z'),
+          job(119028212125, '2026-10-21T03:54:11Z', 'success'),
+          { ...ack(119025675579, '2026-10-21T03:43:14Z'), output: undefined },
+          job(119024627996, '2026-10-21T03:39:41Z', 'failure'),
+        ] });
+        assert.strictEqual(created.length, 1);
+        assert.strictEqual(created[0].conclusion, 'success');
+        assert.match(created[0].output.summary, /source check 119029377082/);
+      });
+      await t('mirror: newest real attempt in progress ⇒ stay pending, not old failure', async () => {
+        const { created, infos } = await runMirror({ checks: [
+          ack(30, '2026-10-21T03:43:14Z'),
+          job(10, '2026-10-21T03:39:41Z', 'failure'),
+          { id: 40, status: 'in_progress', conclusion: null, started_at: '2026-10-21T03:50:00Z', details_url: 'https://github.com/o/r/actions/runs/1/job/40' },
+        ] });
+        assert.deepStrictEqual(created, []);
+        assert.ok(infos.some((m) => /still in_progress/.test(m)));
+      });
+      await t('mirror: only mirrors present ⇒ no create', async () => {
+        const { created } = await runMirror({ checks: [ack(30, '2026-10-21T03:43:14Z')] });
+        assert.deepStrictEqual(created, []);
+      });
+    }
     await t('mirror: in-flight same-named check → no create (no race)', async () => {
       const { created, infos } = await runMirror({
         checks: [{ id: 9, status: 'in_progress', conclusion: null, created_at: '2026-10-20T03:00:00Z' }],
