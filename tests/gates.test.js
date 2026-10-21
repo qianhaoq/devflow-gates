@@ -1123,12 +1123,12 @@ const UNL_KW = 'This is a security problem.';
       details_url: `https://github.com/o/r/actions/runs/${4000 + id}/job/${id}`, ...extra });
     // checks: array, or function(readNo) => array (simulates progress over polls).
     async function runMirror({ relevantLabels = 'qa-passed,no-auto-merge', events = [], eventsError = false, labels = [],
-      runAttempt = 1, workflowRuns = [], checks = [], ackJobs = [], unknownJobs = [], jobError = false,
+      runAttempt = 1, workflowRuns = [], checks = [], ackJobs = [], unknownJobs = [], noStepJobs = [], jobError = false,
       sha = SHA, label = 'triage', action = 'labeled', checkName = 'qa / QA Gate', jobName = 'QA Gate',
       waitMinutes = '0', selfRun = 9999 } = {}) {
       const src = scripts('mirror-required-check.yml')[0];
       const infos = []; const reruns = []; const comments = []; const created = [];
-      let reads = 0; let failed = null;
+      let reads = 0; let failed = null; const classified = [];
       const github = {
         paginate: async (method, args) => {
           if (method === github.rest.actions.listWorkflowRuns) return workflowRuns;
@@ -1144,7 +1144,9 @@ const UNL_KW = 'This is a security problem.';
           actions: {
             getJobForWorkflowRun: async ({ job_id }) => {
               if (jobError) throw new Error('jobs api down');
-              if (unknownJobs.includes(job_id)) return { data: { steps: [] } };
+              classified.push(job_id);
+              if (unknownJobs.includes(job_id)) return { data: { status: 'queued', steps: [] } };
+              if (noStepJobs.includes(job_id)) return { data: { status: 'completed', steps: [] } };
               return { data: { steps: [{ name: 'Set up job' }, { name: ackJobs.includes(job_id) ? ACK_STEP : 'Evaluate' }] } };
             },
             getWorkflowRun: async ({ run_id }) => ({ data: { id: run_id, workflow_id: 99, run_attempt: runAttempt } }),
@@ -1158,7 +1160,7 @@ const UNL_KW = 'This is a security problem.';
       const core = { info: (m) => infos.push(m), setFailed: (m) => { failed = m; } };
       await new AsyncFunction('github', 'context', 'core', 'process', src)(github, context, core,
         { env: { CHECK_NAME: checkName, JOB_NAME: jobName, RELEVANT_LABELS: relevantLabels, WAIT_MINUTES: waitMinutes, POLL_SECONDS: '0' } });
-      return { failed, infos, reruns, comments, created, reads };
+      return { failed, infos, reruns, comments, created, reads, classified };
     }
     const okEvents = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T01:00:00Z' }];
     const okLabels = [{ name: 'qa-passed' }];
@@ -1212,8 +1214,18 @@ const UNL_KW = 'This is a security problem.';
       assert.match(r.failed, /Timed out.*still in_progress/);
     });
     await t('mirror: queued job without steps is treated as in-flight', async () => {
-      const r = await runMirror({ unknownJobs: [2], checks: [job(1, 'success'), job(2, 'success')] });
+      const r = await runMirror({ unknownJobs: [2], checks: [job(1, 'success'), { ...job(2, null), status: 'queued', conclusion: null }] });
       assert.match(r.failed, /Timed out/);
+    });
+    await t('mirror: completed no-step cancelled job is healed, not polled', async () => {
+      const r = await runMirror({ noStepJobs: [2], checks: [job(1, 'success'), job(2, 'cancelled', { started_at: null })] });
+      assert.deepStrictEqual(r.reruns, [{ owner: 'o', repo: 'r', run_id: 4002 }]);
+    });
+    await t('mirror: classification stops at newest real check', async () => {
+      const r = await runMirror({ labels: okLabels, events: okEvents, ackJobs: [9],
+        checks: [job(1, 'failure'), job(2, 'failure'), job(3, 'success'), job(9, 'failure')] });
+      assert.strictEqual(r.failed, null);
+      assert.ok(!r.classified.includes(1) && !r.classified.includes(2), String(r.classified));
     });
     await t('mirror: jobs API failure ⇒ fail', async () => {
       const r = await runMirror({ jobError: true, checks: [job(1, 'success')] });

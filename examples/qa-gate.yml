@@ -82,7 +82,7 @@ jobs:
     with:
       check_name: 'qa / QA Gate'
       job_name: 'QA Gate'
-      wait_minutes: 10   # > real gate max runtime
+      wait_minutes: 30   # > real gate timeout (10) + runner queue time
       relevant_labels: 'qa-passed,no-auto-merge'
       # runs_on: self-hosted   # keep in sync with qa job above
 

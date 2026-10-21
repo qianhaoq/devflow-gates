@@ -131,7 +131,14 @@ jobs:
               if (kinds.has(r.id)) return kinds.get(r.id);
               const { data: job } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: r.id });
               const steps = job.steps || [];
-              if (!steps.length) return 'unknown';
+              // No steps: queued (not started) -> unknown, re-checked next poll.
+              // Completed without steps (cancelled before start) -> treat as
+              // real so the cancelled-heal path re-runs it (re-running a
+              // cancelled ack is harmless: it excludes its own run).
+              if (!steps.length) {
+                if (job.status === 'completed' || r.status === 'completed') { kinds.set(r.id, 'real'); return 'real'; }
+                return 'unknown';
+              }
               const k = steps.some((s) => s.name === ACK_STEP) ? 'ack' : 'real';
               kinds.set(r.id, k);
               return k;
@@ -140,13 +147,13 @@ jobs:
               const list = await github.paginate(github.rest.checks.listForRef, {
                 owner, repo, ref: sha, check_name: checkName, filter: 'all', per_page: 100,
               });
-              const real = [];
-              for (const r of (list || [])) {
+              // Newest first; stop at the first non-ack (older checks cannot
+              // matter) to keep Jobs API calls bounded on long-lived heads.
+              for (const r of [...(list || [])].sort(byNewest)) {
                 const k = await kindOf(r);
-                if (k !== 'ack') real.push({ ...r, kind: k });
+                if (k !== 'ack') return { ...r, kind: k };
               }
-              real.sort(byNewest);
-              return real[0] || null;
+              return null;
             }
             const same = (a, b) => !!a && !!b && a.id === b.id && a.status === b.status && a.conclusion === b.conclusion;
 
