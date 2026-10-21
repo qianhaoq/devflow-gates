@@ -54,7 +54,11 @@ check suite，但其中只有一个被跳过的 `ci`，没有 `ci / Build & Test
 `ci / Secret Scan` 等 required check 名。branch protection 只看每个 workflow
 最新的 suite，于是 required checks 缺失，PR 被挡住。
 
-- 永远不要对产生 required checks 的调用方做 job 级跳过。
+- 对挂在 PR head 上、其 suite 必须产出 required check 名的事件（如
+  `pull_request` 的 opened/synchronize/reopened/ready_for_review/edited），
+  永远不要对产生 required checks 的调用方做 job 级跳过。与 PR head 无关、
+  不承担 required checks 的事件（例如 `issue_comment`、`schedule` 等）仍可在
+  调用方用 job 级 `if:` 过滤，以免无谓占用 runner。
 - `pull_request` 的 `edited` 不能删（改 base 时 GitHub 只发 `edited`），
   对 edited 事件完整运行 CI；标题/描述编辑多跑一次的成本可接受。
 - 如加 concurrency，edited 事件用 `cancel-in-progress: false`，只取消旧 run，
