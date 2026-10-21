@@ -1,27 +1,33 @@
 # Mirror Required Check — anti-ghost ack for irrelevant labeled/unlabeled.
 #
 # When a gate caller listens for labeled/unlabeled but skips the real
-# evaluator for unrelated labels, GitHub still opens a check suite with no
-# run named like the required check ("codex / Codex Review Gate") → hangs
-# on "is expected". This reusable job re-posts the LATEST REAL (non-mirror) conclusion for
-# that exact check name on the PR head via the Checks API (no false green:
-# it never invents success when nothing prior exists; it never runs while
-# a same-named check is still in flight).
+# evaluator for unrelated labels, GitHub opens a check suite with no run
+# named like the required check ("codex / Codex Review Gate") and the PR
+# hangs on "is expected".
 #
-# Call from the product caller ONLY for irrelevant labels; keep the real
-# gate job for gate-relevant labels (skip-codex-gate / qa-passed / …).
+# This job IS the required check: the caller job sets `name:` to the
+# required prefix (codex / qa / editorial) and passes `job_name` (e.g.
+# "Codex Review Gate"), so the Actions job itself is named
+# "codex / Codex Review Gate". Its CONCLUSION expresses the latest REAL
+# (non-ack) same-named gate verdict: success -> exit 0, anything else ->
+# exit non-zero. No checks.create (API-created checks landed in arbitrary
+# github-actions suites and were duplicated by GitHub on suite re-runs).
 #
-# Caller evaluate and ack share label-{sha} as the main lock, so neither can
-# start concurrently with the other. Only relevant-label evaluate cancels running
-# work; unrelated-label ack never cancels a running evaluator. Ack can replace a
-# pending evaluate: label-event time validation must then reject stale success
-# with failure. Validate label history immediately before mirroring success;
-# uncertainty produces failure.
-# Only same-named real job verdicts are eligible sources, never earlier mirrors.
+# - Newest real attempt in flight / not yet present -> poll up to
+#   wait_minutes, then fail (never invents green). Keep wait_minutes above
+#   the real gate's own maximum runtime: a failed ack is NEWER than a
+#   slower real run and would mask its later result.
+# - Latest real verdict cancelled -> cancel-heal re-run of that workflow
+#   (attempt cap 3, PR comment at cap, same-PR in-flight guard), then keep
+#   polling for the re-run's verdict.
+# - Success is mirrored only if current relevant-label state matches the
+#   label event history at the source verdict; uncertainty -> failure.
+# - Sources: same-named Actions jobs that are not acks. Acks are recognised
+#   by the step name below (and legacy API-created "Label ack" checks).
 #
-# Check name produced by THIS job's Actions wrapper is
-# "<caller job id> / Mirror Required Check" (harmless side check). The
-# required name is created explicitly via checks.create below.
+# Concurrency: the caller's workflow-level label-{sha} group serialises ack
+# and relevant-label evaluate (only relevant labels cancel). No job-level
+# cancel here: a cancelled ack would itself be a cancelled required check.
 
 name: Reusable Mirror Required Check
 
@@ -29,7 +35,11 @@ on:
   workflow_call:
     inputs:
       check_name:
-        description: 'Exact required check name to mirror (e.g. "codex / Codex Review Gate")'
+        description: 'Exact required check name (e.g. "codex / Codex Review Gate"); must equal "<caller job name> / <job_name>"'
+        required: true
+        type: string
+      job_name:
+        description: 'Name of this job: the part of check_name after "<caller job name> / " (e.g. "Codex Review Gate")'
         required: true
         type: string
       relevant_labels:
@@ -37,6 +47,11 @@ on:
         type: string
         required: false
         default: ''
+      wait_minutes:
+        description: 'Max minutes to wait for an in-flight/missing real verdict before failing (1-60; exceed the real gate runtime)'
+        required: false
+        type: number
+        default: 30
       runs_on:
         description: 'Runner label or JSON array string'
         required: false
@@ -45,226 +60,190 @@ on:
 
 permissions:
   contents: read
-  checks: write
+  checks: read
   actions: write
   issues: write
   pull-requests: read  # private repos: issues.get/listEvents on PRs
 
 jobs:
   mirror:
-    name: Mirror Required Check
+    name: ${{ inputs.job_name }}
     runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
-    concurrency:
-      group: mirror-required-${{ github.repository }}-${{ inputs.check_name }}-pr-${{ github.event.pull_request.number || github.event.issue.number || 'none' }}-${{ github.event.pull_request.head.sha || github.sha }}
-      cancel-in-progress: true
-    timeout-minutes: 2
+    timeout-minutes: 70
     permissions:
       contents: read
-      checks: write
+      checks: read
       actions: write
       issues: write
       pull-requests: read
     steps:
-      - name: Mirror latest required-check conclusion
+      - name: Label ack mirror latest real gate verdict
         uses: actions/github-script@v7
         env:
           CHECK_NAME: ${{ inputs.check_name }}
+          JOB_NAME: ${{ inputs.job_name }}
           RELEVANT_LABELS: ${{ inputs.relevant_labels }}
+          WAIT_MINUTES: ${{ inputs.wait_minutes }}
+          POLL_SECONDS: '20'
         with:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
             const checkName = (process.env.CHECK_NAME || '').trim();
-            if (!checkName) {
-              core.setFailed('check_name input is empty');
+            const jobName = (process.env.JOB_NAME || '').trim();
+            if (!checkName || !jobName || !checkName.endsWith(` / ${jobName}`)) {
+              core.setFailed(`check_name "${checkName}" must end with " / ${jobName}" (job_name)`);
               return;
             }
+            const ACK_STEP = 'Label ack mirror latest real gate verdict';
             const sha = context.payload.pull_request?.head?.sha;
-            if (!sha) {
-              core.info('No pull_request.head.sha on this event — nothing to mirror');
+            const number = context.payload.pull_request?.number;
+            if (!sha || !number) {
+              core.setFailed('No pull_request head on this event — cannot mirror (refusing to pass)');
               return;
             }
             const label = context.payload.label?.name || '';
             const action = context.payload.action || context.eventName;
+            const waitMin = Math.min(Math.max(Number(process.env.WAIT_MINUTES ?? 30), 0), 60);
+            const pollMs = Math.max(Number(process.env.POLL_SECONDS ?? 20), 0) * 1000;
+            const deadline = Date.now() + waitMin * 60000;
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-            // Check runs carry NO created_at in the Checks API (the old
-            // created_at sort silently degraded). Check run ids are allocated
-            // monotonically at creation, and every rerun attempt gets a new
-            // id, so highest id = newest real attempt. Timestamps are only a
-            // tiebreak: started_at is null for checks cancelled before start,
-            // and an older attempt can finish after a newer one.
+            // Check run ids are allocated monotonically; every rerun attempt gets a
+            // new id, so highest id = newest attempt. Timestamps only tiebreak.
             function ts(v) { const n = Date.parse(v || ''); return Number.isFinite(n) ? n : 0; }
             function byNewest(a, b) {
               return ((b.id || 0) - (a.id || 0))
                 || (ts(b.started_at) - ts(a.started_at))
                 || (ts(b.completed_at) - ts(a.completed_at));
             }
-            // Mirror outputs (ours, or GitHub's re-run copies of them) are
-            // never sources: "Label ack" title, or an API-created check whose
-            // URL is /runs/<id> instead of an Actions job /actions/runs/<id>.
-            function isMirror(r) {
-              if (/^Label ack/.test(r?.output?.title || '')) return true;
-              const url = String(r?.details_url || r?.html_url || '');
-              return !!url && !/\/actions\/runs\/\d+/.test(url);
+            function runIdOf(r) {
+              const m = String(r?.details_url || r?.html_url || '').match(/\/actions\/runs\/(\d+)/);
+              return m ? Number(m[1]) : null;
             }
-            async function listNamed() {
-              return github.paginate(github.rest.checks.listForRef, {
-                owner,
-                repo,
-                ref: sha,
-                check_name: checkName,
-                filter: 'all',
-                per_page: 100,
+            // 'ack' | 'real' | 'unknown' (queued job, no steps yet). Known kinds cached.
+            const kinds = new Map();
+            async function kindOf(r) {
+              if (/^Label ack/.test(r?.output?.title || '')) return 'ack';   // legacy API mirror
+              const runId = runIdOf(r);
+              if (!runId) return 'ack';                                        // not an Actions job
+              if (runId === Number(context.runId)) return 'ack';               // this run (incl. re-run attempts)
+              if (kinds.has(r.id)) return kinds.get(r.id);
+              const { data: job } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: r.id });
+              const steps = job.steps || [];
+              if (!steps.length) return 'unknown';
+              const k = steps.some((s) => s.name === ACK_STEP) ? 'ack' : 'real';
+              kinds.set(r.id, k);
+              return k;
+            }
+            async function snapshot() {
+              const list = await github.paginate(github.rest.checks.listForRef, {
+                owner, repo, ref: sha, check_name: checkName, filter: 'all', per_page: 100,
               });
-            }
-            // { latest: newest real run (any status), source: it if completed }
-            function pick(list) {
-              const real = (list || []).filter(r => !isMirror(r)).sort(byNewest);
-              const latest = real[0];
-              const inflight = real.some(r => r.status && r.status !== 'completed');
-              const source = latest && (!latest.status || latest.status === 'completed') && latest.conclusion ? latest : null;
-              return { latest, inflight, source };
-            }
-            function unchanged(p) {
-              return !p.inflight && p.source && p.source.id === observedId && p.source.conclusion === observedConclusion;
-            }
-
-            let picked = pick(await listNamed());
-            if (picked.latest && picked.latest.status && picked.latest.status !== 'completed') {
-              // Newest real attempt is in flight: keep the required check
-              // pending; never re-post an older failure ahead of it.
-              core.info(`Latest "${checkName}" is still ${picked.latest.status} (id ${picked.latest.id}) — not mirroring`);
-              return;
-            }
-            if (picked.inflight || !picked.source) {
-              // Do not invent success/neutral: a brand-new head with no
-              // prior gate result must wait for a real evaluate.
-              core.info(`No completed prior "${checkName}" on ${sha.slice(0, 7)} — not inventing a conclusion`);
-              return;
-            }
-
-            const source = picked.source;
-            let latest = source;
-            const observedId = source.id;
-            const observedConclusion = source.conclusion;
-            const conclusion = source.conclusion;
-            const sourceId = source.id;
-
-            // Never create a synthetic cancelled check: Auto Merge /
-            // heal-required-checks can only re-run checks that still point
-            // at a real Actions run URL, and a newer synthetic cancelled
-            // would become the latest (unhealable) required result.
-            if (conclusion === 'cancelled') {
-              const url = latest.details_url || latest.html_url || '';
-              const m = String(url).match(/\/actions\/runs\/(\d+)/);
-              if (!m) {
-                core.info(`Latest "${checkName}" is cancelled without a workflow run URL — not mirroring`);
-                return;
+              const real = [];
+              for (const r of (list || [])) {
+                const k = await kindOf(r);
+                if (k !== 'ack') real.push({ ...r, kind: k });
               }
-              const run_id = Number(m[1]);
+              real.sort(byNewest);
+              return real[0] || null;
+            }
+            const same = (a, b) => !!a && !!b && a.id === b.id && a.status === b.status && a.conclusion === b.conclusion;
+
+            async function labelsConfirm(source) {
+              const relevant = new Set((process.env.RELEVANT_LABELS || '').split(/[,\n]/).map((s) => s.trim()).filter(Boolean));
+              if (!relevant.size) throw new Error('relevant_labels missing');
+              const { data: pr } = await github.rest.issues.get({ owner, repo, issue_number: number });
+              if (!Array.isArray(pr.labels)) throw new Error('current labels missing');
+              const events = await github.paginate(github.rest.issues.listEvents, { owner, repo, issue_number: number, per_page: 100 });
+              if (!Array.isArray(events)) throw new Error('label events missing');
+              const cutoff = Date.parse(source.started_at || source.completed_at || '');
+              if (!Number.isFinite(cutoff)) throw new Error('source verdict timestamp missing');
+              for (const name of relevant) {
+                const history = events.filter((e) => e.label?.name === name && ['labeled', 'unlabeled'].includes(e.event));
+                if (history.some((e) => !Number.isFinite(Date.parse(e.created_at)))) throw new Error(`invalid history for ${name}`);
+                history.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || (b.id || 0) - (a.id || 0));
+                const last = history[0];
+                const present = pr.labels.some((l) => (typeof l === 'string' ? l : l.name) === name);
+                if ((!last && present) || (last && (Date.parse(last.created_at) >= cutoff || (last.event === 'labeled') !== present))) {
+                  throw new Error(`label state cannot be confirmed at source verdict: ${name}`);
+                }
+              }
+            }
+
+            async function heal(latest) {
+              const run_id = runIdOf(latest);
               const { data: run } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id });
               if ((run.run_attempt || 1) >= 3) {
                 const message = `Cancelled heal for "${checkName}" reached the attempt cap (run ${run_id}, run_attempt=${run.run_attempt || 1}). Please rerun manually in the Actions UI or push a new commit.`;
-                core.info(message);
-                const number = context.payload.pull_request?.number;
-                if (number) {
-                  try {
-                    await github.rest.issues.createComment({ owner, repo, issue_number: number, body: message });
-                  } catch (error) {
-                    core.info(`Could not comment on PR #${number}: ${error.message}`);
-                  }
+                try {
+                  await github.rest.issues.createComment({ owner, repo, issue_number: number, body: message });
+                } catch (error) {
+                  core.info(`Could not comment on PR #${number}: ${error.message}`);
                 }
-                return;
+                return message;
               }
               const workflowRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
                 owner, repo, workflow_id: run.workflow_id, per_page: 100,
               });
-              const activeStatuses = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
-              const prNumber = context.payload.pull_request?.number;
+              const active = new Set(['queued', 'in_progress', 'waiting', 'pending', 'requested']);
               // PRT workflow head_sha is the base SHA; match the PR association.
-              if (workflowRuns.some(r => r.id !== run_id && activeStatuses.has(r.status)
-                && (r.pull_requests || []).some(p => p.number === prNumber))) {
-                core.info(`Workflow ${run.workflow_id} already has an in-flight run for PR #${prNumber} — not re-running cancelled run ${run_id}`);
-                return;
+              // Our own run is in flight too: never count it.
+              if (workflowRuns.some((r) => r.id !== run_id && r.id !== Number(context.runId) && active.has(r.status)
+                && (r.pull_requests || []).some((p) => p.number === number))) {
+                core.info(`Workflow ${run.workflow_id} already has an in-flight run for PR #${number} — not re-running ${run_id}`);
+                return null;
               }
               await github.rest.actions.reRunWorkflow({ owner, repo, run_id });
-              core.info(`Latest "${checkName}" was cancelled — heal re-run of workflow ${m[1]} instead of mirroring`);
-              return;
-            }
-            // skipped is treated as pass by branch protection but is not a
-            // real gate verdict — do not re-post it as the required check.
-            if (conclusion === 'skipped') {
-              core.info(`Latest "${checkName}" is skipped — not mirroring a non-verdict`);
-              return;
+              core.info(`Latest "${checkName}" was cancelled — heal re-run of workflow run ${run_id}; waiting for its verdict`);
+              return null;
             }
 
-            const title = `Label ack: mirrored ${conclusion}`;
-            const summary = [
-              `Irrelevant label \`${label || '(none)'}\` (${action}) on head \`${sha.slice(0, 7)}\`.`,
-              `Re-posted previous \`${checkName}\` conclusion (**${conclusion}**, source check ${sourceId}) so this check suite does not leave the required check as "is expected".`,
-              'Gate-relevant labels still run the real evaluator.',
-            ].join('\n\n');
-
-            // Revalidate the observed latest check immediately before posting.
-            // Revalidate immediately before create: an evaluator may have
-            // started (or finished) since the first list. Never let a stale
-            // mirror become the newest same-named check ahead of a live gate.
-            if (!unchanged(pick(await listNamed()))) {
-              core.info(`Pre-create revalidate: latest real "${checkName}" changed or is in flight — not mirroring`);
-              return;
-            }
-            // One final Checks read after the preceding revalidation passed.
-            if (!unchanged(pick(await listNamed()))) {
-              core.info(`Final pre-create revalidate: "${checkName}" changed or is in flight — not mirroring`);
-              return;
-            }
-
-            let mirroredConclusion = conclusion;
-            let labelError = '';
-            if (conclusion === 'success') {
-              try {
-                const relevant = new Set((process.env.RELEVANT_LABELS || '').split(/[,\n]/).map(s => s.trim()).filter(Boolean));
-                if (!relevant.size) throw new Error('relevant_labels missing');
-                const number = context.payload.pull_request?.number;
-                const { data: pr } = await github.rest.issues.get({ owner, repo, issue_number: number });
-                if (!Array.isArray(pr.labels)) throw new Error('current labels missing');
-                const events = await github.paginate(github.rest.issues.listEvents, { owner, repo, issue_number: number, per_page: 100 });
-                if (!Array.isArray(events)) throw new Error('label events missing');
-                if (!/\/actions\/runs\/\d+/.test(source.details_url || source.html_url || '')) throw new Error('real job provenance missing');
-                const cutoff = Date.parse(source.started_at || source.completed_at || '');
-                if (!Number.isFinite(cutoff)) throw new Error('source verdict timestamp missing');
-                for (const name of relevant) {
-                  const history = events.filter(e => e.label?.name === name && ['labeled', 'unlabeled'].includes(e.event));
-                  if (history.some(e => !Number.isFinite(Date.parse(e.created_at)))) throw new Error(`invalid history for ${name}`);
-                  history.sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at) || (b.id || 0) - (a.id || 0));
-                  const last = history[0];
-                  const present = pr.labels.some(l => (typeof l === 'string' ? l : l.name) === name);
-                  if ((!last && present) || (last && (Date.parse(last.created_at) >= cutoff || (last.event === 'labeled') !== present))) {
-                    throw new Error(`label state cannot be confirmed at source verdict: ${name}`);
-                  }
-                }
-              } catch (error) {
-                mirroredConclusion = 'failure';
-                labelError = `Success refused: ${error.message}. Run the real gate evaluator again.`;
-                core.info(labelError);
+            const healed = new Set();
+            let reason = '';
+            for (let first = true; ; first = false) {
+              if (!first) {
+                if (Date.now() >= deadline) break;
+                await sleep(pollMs);
               }
-            }
-            // Label API reads may overlap a real evaluation. Yield if its check
-            // changed while reading labels, including when we would post failure.
-            if (!unchanged(pick(await listNamed()))) {
-              core.info('Post-label pre-create revalidate: source changed — not mirroring');
+              let latest;
+              try {
+                latest = await snapshot();
+              } catch (error) {
+                core.setFailed(`Cannot read/classify "${checkName}" checks: ${error.message}`);
+                return;
+              }
+              if (!latest) { reason = `no real "${checkName}" verdict on ${sha.slice(0, 7)} yet`; core.info(reason); continue; }
+              if (latest.kind === 'unknown' || (latest.status && latest.status !== 'completed') || !latest.conclusion) {
+                reason = `newest real "${checkName}" (id ${latest.id}) is still ${latest.status || 'queued'}`;
+                core.info(reason);
+                continue;
+              }
+              const c = latest.conclusion;
+              if (c === 'cancelled') {
+                if (healed.has(latest.id)) { reason = `cancelled check ${latest.id} awaiting heal re-run`; continue; }
+                healed.add(latest.id);
+                const capped = await heal(latest);
+                if (capped) { core.setFailed(capped); return; }
+                reason = `cancelled check ${latest.id} healed; waiting`;
+                continue;
+              }
+              if (c !== 'success') {
+                if (!same(await snapshot(), latest)) { reason = 'source changed'; continue; }
+                core.setFailed(`Label ack (${action} \`${label}\`): latest real "${checkName}" is ${c} (source check ${latest.id})`);
+                return;
+              }
+              try {
+                await labelsConfirm(latest);
+              } catch (error) {
+                if (!same(await snapshot(), latest)) { reason = 'source changed'; continue; }
+                core.setFailed(`Success refused: ${error.message}. Run the real gate evaluator again (source check ${latest.id}).`);
+                return;
+              }
+              // Label API reads may overlap a real evaluation: only conclude on an
+              // unchanged newest source.
+              if (!same(await snapshot(), latest)) { reason = 'source changed during label validation'; continue; }
+              core.info(`Label ack (${action} \`${label}\`): mirrored "${checkName}" = success (source check ${latest.id})`);
               return;
             }
-            await github.rest.checks.create({
-              owner,
-              repo,
-              name: checkName,
-              head_sha: sha,
-              status: 'completed',
-              conclusion: mirroredConclusion,
-              output: {
-                title: labelError ? 'Label ack: success refused' : title,
-                summary: labelError ? `${summary}\n\n${labelError}` : summary,
-              },
-            });
-            core.info(`Mirrored "${checkName}" = ${mirroredConclusion} on ${sha.slice(0, 7)} (source ${sourceId})`);
+            core.setFailed(`Timed out after ${waitMin} min waiting for a real "${checkName}" verdict (${reason}). Rerun this job or use /recheck once the gate finishes.`);

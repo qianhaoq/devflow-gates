@@ -6,6 +6,7 @@
 | --- | --- | --- | --- |
 | Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**；方案 B **本 PR 合入后完成** | B：相关 label 真评估 + 无关 label `mirror-required-check`；PR+SHA 共用 `label-{sha}` 主锁串行化，相关标签 evaluate 可 cancel、无关标签 ack 不 cancel；ack 替换排队 evaluate 时由标签事件时间校验拒绝镜像 success（写 failure）；success 前读取当前相关标签和 issue events，变化或无法确认则 post failure；保留创建前校验；cancelled heal 加 attempt>=3 上限、PR 提示及同 SHA in-flight guard | 专业研发 |
 | 临时撤必需检查才能合 | **已约束** | 只允许清幽灵且合后立刻加回；**禁止 `--admin`**；优先 `heal-required-checks.sh` | 专业研发 |
+| label-ack 用 checks.create 造的同名检查落入任意 suite（jobs #13 落 Acceptance suite），suite 重跑被 GitHub 复制（pinhaoyun #28） | **已修**（本 PR） | ack job 本身即必需检查名（caller `name: codex/qa/editorial` + `job_name`），以 job 结论表达最新真实结论；进行中有界轮询后失败；不再 checks.create | 专业研发 |
 | 打无关标签（如 `qa-passed`）触发 codex-gate labeled → 幽灵 | **进行中**（随 B） | codex/qa caller 增加 `*-label-ack`；无关 label 不再 skip-all | 专业研发 |
 | 转仓后 workflow 权限被改成 write / 可批 PR（kilocean） | **待修**/检查单 | **转仓必查**：permissions、branch protection、required checks、App 安装 | 专业研发 |
 | runner 预置 Python 漏 `build` 目录 → pip 缺 `operations` | **已修**/需固化 | runner 镜像/预置含完整 stdlib；CI 用官方 setup-python 或自检 `import operations` | 专业研发 |
