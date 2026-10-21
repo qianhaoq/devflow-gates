@@ -1217,9 +1217,27 @@ const UNL_KW = 'This is a security problem.';
       const r = await runMirror({ unknownJobs: [2], checks: [job(1, 'success'), { ...job(2, null), status: 'queued', conclusion: null }] });
       assert.match(r.failed, /Timed out/);
     });
-    await t('mirror: completed no-step cancelled job is healed, not polled', async () => {
-      const r = await runMirror({ noStepJobs: [2], checks: [job(1, 'success'), job(2, 'cancelled', { started_at: null })] });
-      assert.deepStrictEqual(r.reruns, [{ owner: 'o', repo: 'r', run_id: 4002 }]);
+    await t('mirror: completed no-step (cancelled before start) job is transparent', async () => {
+      for (const older of ['success', 'failure']) {
+        const r = await runMirror({ labels: okLabels, events: okEvents, noStepJobs: [2],
+          checks: [job(1, older), job(2, 'cancelled', { started_at: null })] });
+        assert.deepStrictEqual(r.reruns, []);
+        if (older === 'success') assert.strictEqual(r.failed, null); else assert.match(r.failed, /source check 1/);
+      }
+    });
+    await t('mirror: deferred heal retried after peer finishes; budget only on issued rerun', async () => {
+      let n = 0;
+      const peers = [{ id: 4500, status: 'in_progress', pull_requests: [{ number: 9 }] }];
+      const r = await runMirror({ waitMinutes: '1', workflowRuns: peers, labels: okLabels, events: okEvents,
+        checks: (k) => { n = k; if (k === 3) peers[0].status = 'completed'; return k < 6 ? [job(1, 'cancelled')] : [job(1, 'cancelled'), job(3, 'success')]; } });
+      assert.deepStrictEqual(r.reruns, [{ owner: 'o', repo: 'r', run_id: 4001 }]);
+      assert.strictEqual(r.failed, null);
+    });
+    await t('mirror: second cancellation after an issued heal ⇒ fail, no second rerun', async () => {
+      const r = await runMirror({ waitMinutes: '1',
+        checks: (k) => k < 3 ? [job(1, 'cancelled')] : [job(1, 'cancelled'), job(3, 'cancelled')] });
+      assert.strictEqual(r.reruns.length, 1);
+      assert.match(r.failed, /cancelled again/);
     });
     await t('mirror: classification stops at newest real check', async () => {
       const r = await runMirror({ labels: okLabels, events: okEvents, ackJobs: [9],

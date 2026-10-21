@@ -18,8 +18,10 @@
 #   the real gate's own maximum runtime: a failed ack is NEWER than a
 #   slower real run and would mask its later result.
 # - Latest real verdict cancelled -> cancel-heal re-run of that workflow
-#   (attempt cap 3, PR comment at cap, same-PR in-flight guard), then keep
-#   polling for the re-run's verdict.
+#   (attempt cap 3, PR comment at cap, same-PR in-flight guard; one issued
+#   re-run per ack, deferred heals retried), then keep polling. Jobs that
+#   were cancelled before starting (no steps) are transparent: they never
+#   produced a verdict and this newer ack supersedes them.
 # - Success is mirrored only if current relevant-label state matches the
 #   label event history at the source verdict; uncertainty -> failure.
 # - Sources: same-named Actions jobs that are not acks. Acks are recognised
@@ -132,11 +134,12 @@ jobs:
               const { data: job } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: r.id });
               const steps = job.steps || [];
               // No steps: queued (not started) -> unknown, re-checked next poll.
-              // Completed without steps (cancelled before start) -> treat as
-              // real so the cancelled-heal path re-runs it (re-running a
-              // cancelled ack is harmless: it excludes its own run).
+              // Completed without steps (cancelled before start, e.g. a pending
+              // run replaced by concurrency) -> 'skip': provenance (ack vs real)
+              // is unknowable and it never produced a verdict. This ack's own
+              // check is newer, so it supersedes it; look at older checks.
               if (!steps.length) {
-                if (job.status === 'completed' || r.status === 'completed') { kinds.set(r.id, 'real'); return 'real'; }
+                if (job.status === 'completed' || r.status === 'completed') { kinds.set(r.id, 'skip'); return 'skip'; }
                 return 'unknown';
               }
               const k = steps.some((s) => s.name === ACK_STEP) ? 'ack' : 'real';
@@ -151,7 +154,7 @@ jobs:
               // matter) to keep Jobs API calls bounded on long-lived heads.
               for (const r of [...(list || [])].sort(byNewest)) {
                 const k = await kindOf(r);
-                if (k !== 'ack') return { ...r, kind: k };
+                if (k === 'real' || k === 'unknown') return { ...r, kind: k };
               }
               return null;
             }
@@ -188,7 +191,7 @@ jobs:
                 } catch (error) {
                   core.info(`Could not comment on PR #${number}: ${error.message}`);
                 }
-                return message;
+                return { capped: message };
               }
               const workflowRuns = await github.paginate(github.rest.actions.listWorkflowRuns, {
                 owner, repo, workflow_id: run.workflow_id, per_page: 100,
@@ -203,10 +206,11 @@ jobs:
               }
               await github.rest.actions.reRunWorkflow({ owner, repo, run_id });
               core.info(`Latest "${checkName}" was cancelled — heal re-run of workflow run ${run_id}; waiting for its verdict`);
-              return null;
+              return 'issued';
             }
 
-            const healed = new Set();
+            // One heal re-run per ack; budget is consumed only by an issued rerun.
+            let healedId = null;
             let reason = '';
             for (let first = true; ; first = false) {
               if (!first) {
@@ -228,11 +232,15 @@ jobs:
               }
               const c = latest.conclusion;
               if (c === 'cancelled') {
-                if (healed.has(latest.id)) { reason = `cancelled check ${latest.id} awaiting heal re-run`; continue; }
-                healed.add(latest.id);
-                const capped = await heal(latest);
-                if (capped) { core.setFailed(capped); return; }
-                reason = `cancelled check ${latest.id} healed; waiting`;
+                if (healedId === latest.id) { reason = `cancelled check ${latest.id} awaiting heal re-run`; core.info(reason); continue; }
+                if (healedId !== null) {
+                  core.setFailed(`"${checkName}" cancelled again (check ${latest.id}) after this ack's heal re-run of check ${healedId}; rerun manually or push a new commit.`);
+                  return;
+                }
+                const outcome = await heal(latest);
+                if (outcome && outcome.capped) { core.setFailed(outcome.capped); return; }
+                if (outcome === 'issued') healedId = latest.id;
+                reason = `cancelled check ${latest.id}: heal ${outcome}; waiting`;
                 continue;
               }
               if (c !== 'success') {
