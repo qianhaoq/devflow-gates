@@ -671,7 +671,7 @@ const UNL_KW = 'This is a security problem.';
   const RH = 'feedfacefeedfacefeedfacefeedfacefeedface';
   const SUMMARY_DONE = { user: { login: 'chatgpt-codex-connector[bot]' }, updated_at: '2026-10-16T03:00:00Z', body: `<!-- codex-pull-request-review-summary -->\n**Completed** — reviewed ${RH}` };
   const SUMMARY_RUNNING = { ...SUMMARY_DONE, body: '<!-- codex-pull-request-review-summary -->\n**Running**' };
-  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [], runById, allRuns } = {}) {
+  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [], runById, allRuns, env = {} } = {}) {
     const reran = [];
     const prList = prs || [{ number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: labels.map((name) => ({ name })) }];
     const github = {
@@ -694,7 +694,7 @@ const UNL_KW = 'This is a security problem.';
       },
       graphql: async () => ({ repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false } } } } }),
       paginate: async (fn, args = {}) => {
-        if (fn === github.rest.issues.listComments) return summary ? [summary] : [];
+        if (fn === github.rest.issues.listComments) { const sm = typeof summary === 'function' ? summary() : summary; return sm ? [sm] : []; }
         if (fn === github.rest.issues.listEvents) return labelEvents;
         if (fn === github.rest.pulls.list) return prList;
         if (fn === github.rest.actions.listWorkflowRuns) {
@@ -709,7 +709,7 @@ const UNL_KW = 'This is a security problem.';
     const core = { info(m) { if (process.env.DEBUG_T) console.log('  info:', m); }, warning() {}, setFailed(m) { if (mode !== 'refresh') { failed.push(m); return; } throw new Error(m); }, summary: { addRaw() { return this; }, write: async () => {} } };
     const context = { runId: 1, eventName, repo: { owner: 'o', repo: 'r' }, payload };
     const src = scripts(file)[mode === 'refresh' ? 1 : 0];
-    await new AsyncFunction('github', 'context', 'core', 'process', 'exec', src)(github, context, core, { env: { GATE_MODE: mode, QA_LABEL: 'qa-passed', REFRESH_POLL_MS: '0' } }, {});
+    await new AsyncFunction('github', 'context', 'core', 'process', 'exec', src)(github, context, core, { env: { GATE_MODE: mode, QA_LABEL: 'qa-passed', REFRESH_POLL_MS: '0', RUNNING_POLL_MS: '0', RUNNING_MAX_POLLS: '0', ...env } }, {});
     return reran;
   }
   const run = (id, event, conclusion, created_at, extra = {}) => ({ id, event, head_sha: RH, head_branch: 'crawl/auto', status: 'completed', conclusion, created_at, run_started_at: created_at, run_attempt: 1, ...extra });
@@ -731,6 +731,19 @@ const UNL_KW = 'This is a security problem.';
     const fail2 = [];
     await runRefresh('codex-gate.yml', {}, { eventName: 'workflow_dispatch', payload: { inputs: { pr_number: 'x' } }, mode: 'evaluate', failed: fail2 });
     assert.match(fail2[0] || '', /pr_number is invalid/);
+  });
+  await t('codex-gate evaluate: Running summary stays in_progress and passes once Completed', async () => {
+    const p = { eventName: 'pull_request_target', payload: { pull_request: { number: 9 } }, mode: 'evaluate' };
+    let n = 0;
+    const failed = [];
+    await runRefresh('codex-gate.yml', {}, { ...p, failed, env: { RUNNING_MAX_POLLS: '5' }, summary: () => (++n < 3 ? SUMMARY_RUNNING : SUMMARY_DONE) });
+    assert.deepStrictEqual(failed, []);
+    assert.strictEqual(n, 3);
+    const still = [];
+    let m = 0;
+    await runRefresh('codex-gate.yml', {}, { ...p, failed: still, env: { RUNNING_MAX_POLLS: '2' }, summary: () => { m++; return SUMMARY_RUNNING; } });
+    assert.strictEqual(m, 3, 'bounded polling');
+    assert.match(still[0] || '', /still Running/);
   });
   await t('codex-gate refresh: failed head run re-run only when the gate would now pass', async () => {
     const runs = { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] };
