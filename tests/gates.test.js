@@ -752,6 +752,9 @@ const UNL_KW = 'This is a security problem.';
     await runRefresh('codex-gate.yml', {}, { ...p, failed, env: { RUNNING_MAX_POLLS: '5', WAIT_MINUTES: '9999999' }, summary: () => (++n < 3 ? null : recent) });
     assert.deepStrictEqual(failed, []);
     assert.strictEqual(n, 3, 'polled instead of failing');
+    let m = 0; const f2 = [];
+    await runRefresh('codex-gate.yml', {}, { ...p, failed: f2, env: { RUNNING_MAX_POLLS: '1', WAIT_MINUTES: '9999999' }, summary: () => (++m < 5 ? null : recent) });
+    assert.deepStrictEqual(f2, [], 'polls past RUNNING_MAX_POLLS within wait window');
   });
   await t('codex-gate refresh: failed head run re-run only when the gate would now pass', async () => {
     const runs = { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] };
@@ -798,6 +801,8 @@ const UNL_KW = 'This is a security problem.';
     const runs = { pull_request_review: [run(6, 'pull_request_review', 'success', '2026-10-16T01:10:00Z')] };
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { allRuns: [prt, other] }), [5]);
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { allRuns: [other] }), [], 'other-head failure ignored');
+    const active = { ...run(7, 'pull_request_target', null, '2026-10-16T01:20:00Z', { status: 'in_progress' }), head_sha: 'base000', pull_requests: [{ number: 9, head: { sha: RH } }] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { allRuns: [prt, active] }), [], 'active base-sha peer blocks');
   });
   for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
     await t(`${file} refresh: newest = latest ATTEMPT start (a re-run older run beats a later-created success)`, async () => {
@@ -1286,11 +1291,12 @@ const UNL_KW = 'This is a security problem.';
         assert.strictEqual(r.failed, null, status);
       }
     });
-    await t('mirror (P1-a): deferral behind an in-progress peer is bounded ⇒ fail closed', async () => {
-      const r = await runMirror({ waitMinutes: '60', workflowRuns: [{ id: 4500, status: 'in_progress', pull_requests: [{ number: 9 }] }],
-        checks: [job(1, 'cancelled')] });
-      assert.deepStrictEqual(r.reruns, []);
-      assert.match(r.failed, /deferred 9 times/);
+    await t('mirror (P1-a): long in-progress peer keeps deferring until it finishes (no early fail)', async () => {
+      const peers = [{ id: 4500, status: 'in_progress', pull_requests: [{ number: 9 }] }];
+      const r = await runMirror({ waitMinutes: '1', workflowRuns: peers, labels: okLabels, events: okEvents,
+        checks: (k) => { if (k === 30) peers[0].status = 'completed'; return k < 40 ? [job(1, 'cancelled')] : [job(1, 'cancelled'), job(3, 'success')]; } });
+      assert.strictEqual(r.reruns.length, 1);
+      assert.strictEqual(r.failed, null);
     });
     await t('mirror (P1-a): healed run queued without publishing a replacement check ⇒ bounded fail', async () => {
       const r = await runMirror({ waitMinutes: '60', runStatus: { 4001: 'queued' }, checks: [job(1, 'cancelled')] });

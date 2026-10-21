@@ -228,12 +228,10 @@ jobs:
               // Our own run is in flight too: never count it.
               const peer = workflowRuns.find((r) => r.id !== run_id && r.id !== Number(context.runId) && r.status === 'in_progress'
                 && (r.pull_requests || []).some((p) => p.number === number));
+              // An in_progress peer is not blocked by us: keep deferring until
+              // the ack's own wait deadline (bounded by wait_minutes).
               if (peer) {
-                deferrals += 1;
-                if (deferrals > MAX_DEFERRALS) {
-                  return { capped: `Cancelled "${checkName}" (run ${run_id}) heal deferred ${MAX_DEFERRALS} times behind in-progress run ${peer.id}; failing closed. Rerun this check once it finishes.` };
-                }
-                core.info(`Workflow ${run.workflow_id} has in-progress run ${peer.id} for PR #${number} — deferring re-run of ${run_id} (${deferrals}/${MAX_DEFERRALS})`);
+                core.info(`Workflow ${run.workflow_id} has in-progress run ${peer.id} for PR #${number} — deferring re-run of ${run_id}`);
                 return null;
               }
               await github.rest.actions.reRunWorkflow({ owner, repo, run_id });
@@ -242,12 +240,11 @@ jobs:
             }
 
             // One heal re-run per ack; budget is consumed only by an issued rerun.
-            // Bounded: deferrals behind an in-progress peer, and polls while the
+            // Bounded: deferrals behind an in-progress peer end at the deadline;
+            // polls while the
             // healed run sits queued (it may be waiting on THIS ack's concurrency
             // group; its own newer check then supersedes this one).
-            const MAX_DEFERRALS = 9;
             const MAX_HEAL_QUEUED_POLLS = 6;
-            let deferrals = 0;
             let healQueuedPolls = 0;
             let healedRunId = null;
             let healedId = null;
@@ -271,7 +268,7 @@ jobs:
               if (healedRunId !== null && runIdOf(latest) === healedRunId
                 && (latest.kind === 'unknown' || latest.id === healedId)) {
                 const { data: hr } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: healedRunId });
-                if (hr.status !== 'in_progress' && ++healQueuedPolls > MAX_HEAL_QUEUED_POLLS) {
+                if (['queued', 'pending', 'waiting', 'requested'].includes(hr.status) && ++healQueuedPolls > MAX_HEAL_QUEUED_POLLS) {
                   core.setFailed(`Heal re-run of run ${healedRunId} for "${checkName}" is still ${hr.status} (likely queued behind this ack's concurrency group); failing closed — its newer check will carry the verdict.`);
                   return;
                 }
