@@ -87,16 +87,17 @@ jobs:
             const label = context.payload.label?.name || '';
             const action = context.payload.action || context.eventName;
 
-            // Check runs carry NO created_at in the Checks API, so ranking by
-            // it silently fell back to id order and could pick a stale source.
-            // Rank by started_at, then completed_at (desc), highest id as the
-            // tiebreak: a rerun attempt always starts after the attempt it
-            // replaces, so the newest real attempt wins.
+            // Check runs carry NO created_at in the Checks API (the old
+            // created_at sort silently degraded). Check run ids are allocated
+            // monotonically at creation, and every rerun attempt gets a new
+            // id, so highest id = newest real attempt. Timestamps are only a
+            // tiebreak: started_at is null for checks cancelled before start,
+            // and an older attempt can finish after a newer one.
             function ts(v) { const n = Date.parse(v || ''); return Number.isFinite(n) ? n : 0; }
             function byNewest(a, b) {
-              return (ts(b.started_at) - ts(a.started_at))
-                || (ts(b.completed_at) - ts(a.completed_at))
-                || ((b.id || 0) - (a.id || 0));
+              return ((b.id || 0) - (a.id || 0))
+                || (ts(b.started_at) - ts(a.started_at))
+                || (ts(b.completed_at) - ts(a.completed_at));
             }
             // Mirror outputs (ours, or GitHub's re-run copies of them) are
             // never sources: "Label ack" title, or an API-created check whose

@@ -1241,7 +1241,7 @@ const UNL_KW = 'This is a security problem.';
       const { created } = await runMirror({ relevantLabels: 'qa-passed', checks: [success, { ...success, id: 78, created_at: '2026-10-20T04:00:00Z', completed_at: '2026-10-20T04:00:00Z', output: { title: 'Label ack: mirrored success' } }], events: [{ event: 'unlabeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T03:00:00Z' }] });
       assert.strictEqual(created[0].conclusion, 'failure');
     });
-    await t('mirror: copies latest by started_at (not completed_at)', async () => {
+    await t('mirror: copies latest by id (not completed_at)', async () => {
       // Older green finishes AFTER newer red — newer attempt must win (red).
       const { created } = await runMirror({
         checks: [
@@ -1294,6 +1294,22 @@ const UNL_KW = 'This is a security problem.';
         ] });
         assert.deepStrictEqual(created, []);
         assert.ok(infos.some((m) => /still in_progress/.test(m)));
+      });
+      await t('mirror: newer cancelled-before-start (started_at null) beats older success', async () => {
+        const { created, reruns } = await runMirror({ checks: [
+          job(10, '2026-10-21T03:39:41Z', 'success'),
+          { id: 11, status: 'completed', conclusion: 'cancelled', started_at: null, completed_at: '2026-10-21T03:40:00Z', details_url: 'https://github.com/o/r/actions/runs/4242/job/11' },
+        ] });
+        assert.deepStrictEqual(created, []);
+        assert.deepStrictEqual(reruns, [{ owner: 'o', repo: 'r', run_id: 4242 }]);
+      });
+      await t('mirror: same started_at, older success finishing last does not mask newer failure', async () => {
+        const { created } = await runMirror({ checks: [
+          job(10, '2026-10-21T03:39:41Z', 'success', { completed_at: '2026-10-21T03:45:00Z' }),
+          job(11, '2026-10-21T03:39:41Z', 'failure', { completed_at: '2026-10-21T03:40:00Z' }),
+        ] });
+        assert.strictEqual(created[0].conclusion, 'failure');
+        assert.match(created[0].output.summary, /source check 11/);
       });
       await t('mirror: only mirrors present ⇒ no create', async () => {
         const { created } = await runMirror({ checks: [ack(30, '2026-10-21T03:43:14Z')] });
