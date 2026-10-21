@@ -486,8 +486,14 @@ jobs:
               // rerun may not be able to replace in the required context.
               const pollMs = Math.max(0, Number(process.env.RUNNING_POLL_MS ?? 30000));
               const maxPolls = Math.max(0, Number(process.env.RUNNING_MAX_POLLS ?? 28));
-              for (let i = 0; v.running && (i < maxPolls || v.pending); i++) {
-                core.info(`PR #${prNumber}: Codex review still Running — waiting (poll ${i + 1}/${maxPolls})`);
+              // Wall-clock budget stays below the job's 20-minute timeout so the
+              // check ends red (fail closed), never cancelled. Missing-summary
+              // polls do not consume the Running-poll budget.
+              const budgetEnd = Date.now() + Math.max(0, Number(process.env.EVAL_POLL_BUDGET_MS ?? 17 * 60000));
+              let runningPolls = 0;
+              while (v.running && Date.now() < budgetEnd && (v.pending || runningPolls < maxPolls)) {
+                if (!v.pending) runningPolls += 1;
+                core.info(`PR #${prNumber}: ${v.pending ? 'no Codex summary for this head yet' : 'Codex review still Running'} — waiting (running polls ${runningPolls}/${maxPolls})`);
                 await new Promise((r) => setTimeout(r, pollMs));
                 v = await verdict(prNumber);
               }
@@ -1160,8 +1166,14 @@ jobs:
               // rerun may not be able to replace in the required context.
               const pollMs = Math.max(0, Number(process.env.RUNNING_POLL_MS ?? 30000));
               const maxPolls = Math.max(0, Number(process.env.RUNNING_MAX_POLLS ?? 28));
-              for (let i = 0; v.running && (i < maxPolls || v.pending); i++) {
-                core.info(`PR #${prNumber}: Codex review still Running — waiting (poll ${i + 1}/${maxPolls})`);
+              // Wall-clock budget stays below the job's 20-minute timeout so the
+              // check ends red (fail closed), never cancelled. Missing-summary
+              // polls do not consume the Running-poll budget.
+              const budgetEnd = Date.now() + Math.max(0, Number(process.env.EVAL_POLL_BUDGET_MS ?? 17 * 60000));
+              let runningPolls = 0;
+              while (v.running && Date.now() < budgetEnd && (v.pending || runningPolls < maxPolls)) {
+                if (!v.pending) runningPolls += 1;
+                core.info(`PR #${prNumber}: ${v.pending ? 'no Codex summary for this head yet' : 'Codex review still Running'} — waiting (running polls ${runningPolls}/${maxPolls})`);
                 await new Promise((r) => setTimeout(r, pollMs));
                 v = await verdict(prNumber);
               }

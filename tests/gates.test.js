@@ -755,6 +755,15 @@ const UNL_KW = 'This is a security problem.';
     let m = 0; const f2 = [];
     await runRefresh('codex-gate.yml', {}, { ...p, failed: f2, env: { RUNNING_MAX_POLLS: '1', WAIT_MINUTES: '9999999' }, summary: () => (++m < 5 ? null : recent) });
     assert.deepStrictEqual(f2, [], 'polls past RUNNING_MAX_POLLS within wait window');
+    // missing → Running → Completed: missing polls don't eat the Running budget.
+    let q = 0; const f3 = [];
+    const seq = [null, null, null, null, SUMMARY_RUNNING, SUMMARY_RUNNING, recent];
+    await runRefresh('codex-gate.yml', {}, { ...p, failed: f3, env: { RUNNING_MAX_POLLS: '2', WAIT_MINUTES: '9999999' }, summary: () => seq[Math.min(q++, seq.length - 1)] });
+    assert.deepStrictEqual(f3, []);
+    // Wall-clock budget exhausted ⇒ fails closed (never runs into job timeout).
+    const f4 = [];
+    await runRefresh('codex-gate.yml', {}, { ...p, failed: f4, env: { WAIT_MINUTES: '9999999', EVAL_POLL_BUDGET_MS: '0' }, summary: () => null });
+    assert.match(f4[0] || '', /not posted yet/);
   });
   await t('codex-gate refresh: failed head run re-run only when the gate would now pass', async () => {
     const runs = { workflow_dispatch: [run(5, 'workflow_dispatch', 'failure', '2026-10-16T01:20:00Z')] };
