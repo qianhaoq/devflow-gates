@@ -792,6 +792,13 @@ const UNL_KW = 'This is a security problem.';
     const once = { ...runs, pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:00:00Z', { run_attempt: 2 })] };
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', once), [], 'bounded: once per run');
   });
+  await t('codex-gate refresh (P1-c): failed PRT run carrying the BASE sha is found via PR head association', async () => {
+    const prt = { ...run(5, 'pull_request_target', 'failure', '2026-10-16T01:00:00Z'), head_sha: 'base000', pull_requests: [{ number: 9, head: { sha: RH } }] };
+    const other = { ...run(4, 'pull_request_target', 'failure', '2026-10-16T00:50:00Z'), head_sha: 'base000', pull_requests: [{ number: 9, head: { sha: 'oldhead' } }] };
+    const runs = { pull_request_review: [run(6, 'pull_request_review', 'success', '2026-10-16T01:10:00Z')] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { allRuns: [prt, other] }), [5]);
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { allRuns: [other] }), [], 'other-head failure ignored');
+  });
   for (const file of ['codex-gate.yml', 'qa-gate.yml']) {
     await t(`${file} refresh: newest = latest ATTEMPT start (a re-run older run beats a later-created success)`, async () => {
       const r = await runRefresh(file, { pull_request_target: [
@@ -1284,6 +1291,12 @@ const UNL_KW = 'This is a security problem.';
         checks: [job(1, 'cancelled')] });
       assert.deepStrictEqual(r.reruns, []);
       assert.match(r.failed, /deferred 9 times/);
+    });
+    await t('mirror (P1-a): healed run queued without publishing a replacement check ⇒ bounded fail', async () => {
+      const r = await runMirror({ waitMinutes: '60', runStatus: { 4001: 'queued' }, checks: [job(1, 'cancelled')] });
+      assert.strictEqual(r.reruns.length, 1);
+      assert.match(r.failed, /still queued.*failing closed/);
+      assert.ok(r.reads < 20, `bounded polls (${r.reads})`);
     });
     await t('mirror (P1-a): healed run stuck queued behind this ack ⇒ bounded fail, no mutual wait', async () => {
       const r = await runMirror({ waitMinutes: '60', unknownJobs: [3], runStatus: { 4001: 'queued' },

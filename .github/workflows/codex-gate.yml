@@ -747,7 +747,18 @@ jobs:
                 // red required check. Re-run its failed jobs — newest failed run
                 // only, and only at run_attempt 1, so at most once per head run.
                 if (v.ok) {
-                  const staleFail = evaluated.find((r) => r.conclusion === 'failure' || r.conclusion === 'timed_out');
+                  // headRuns() keys on run.head_sha; a pull_request_target run
+                  // may carry the BASE SHA there. Also sweep workflow runs and
+                  // keep those whose PR association points at THIS head.
+                  const isFail = (r) => r.conclusion === 'failure' || r.conclusion === 'timed_out';
+                  const swept = (await github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner, repo, workflow_id: workflowId, per_page: 100,
+                  }) || []).filter((r) => r.id !== context.runId && r.status === 'completed'
+                    && (r.pull_requests || []).some((p) => p.number === pr.number && p.head?.sha === sha));
+                  const seen = new Set(evaluated.map((r) => r.id));
+                  const pool = [...evaluated, ...swept.filter((r) => !seen.has(r.id) && r.conclusion !== 'skipped')]
+                    .sort((x, y) => (attemptAt(y) - attemptAt(x)) || ((y.id || 0) - (x.id || 0)));
+                  const staleFail = pool.find(isFail);
                   if (staleFail && (staleFail.run_attempt || 1) === 1) {
                     await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: staleFail.id });
                     rerun += 1;
@@ -1403,7 +1414,18 @@ jobs:
                 // red required check. Re-run its failed jobs — newest failed run
                 // only, and only at run_attempt 1, so at most once per head run.
                 if (v.ok) {
-                  const staleFail = evaluated.find((r) => r.conclusion === 'failure' || r.conclusion === 'timed_out');
+                  // headRuns() keys on run.head_sha; a pull_request_target run
+                  // may carry the BASE SHA there. Also sweep workflow runs and
+                  // keep those whose PR association points at THIS head.
+                  const isFail = (r) => r.conclusion === 'failure' || r.conclusion === 'timed_out';
+                  const swept = (await github.paginate(github.rest.actions.listWorkflowRuns, {
+                    owner, repo, workflow_id: workflowId, per_page: 100,
+                  }) || []).filter((r) => r.id !== context.runId && r.status === 'completed'
+                    && (r.pull_requests || []).some((p) => p.number === pr.number && p.head?.sha === sha));
+                  const seen = new Set(evaluated.map((r) => r.id));
+                  const pool = [...evaluated, ...swept.filter((r) => !seen.has(r.id) && r.conclusion !== 'skipped')]
+                    .sort((x, y) => (attemptAt(y) - attemptAt(x)) || ((y.id || 0) - (x.id || 0)));
+                  const staleFail = pool.find(isFail);
                   if (staleFail && (staleFail.run_attempt || 1) === 1) {
                     await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: staleFail.id });
                     rerun += 1;

@@ -265,7 +265,11 @@ jobs:
                 return;
               }
               if (!latest) { reason = `no real "${checkName}" verdict on ${sha.slice(0, 7)} yet`; core.info(reason); continue; }
-              if (healedRunId !== null && latest.kind === 'unknown' && runIdOf(latest) === healedRunId) {
+              // Healed run not yet started: either its new (queued) check is
+              // newest, or it has not published a check yet and the original
+              // cancelled check is still newest. Bounded either way.
+              if (healedRunId !== null && runIdOf(latest) === healedRunId
+                && (latest.kind === 'unknown' || latest.id === healedId)) {
                 const { data: hr } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: healedRunId });
                 if (hr.status !== 'in_progress' && ++healQueuedPolls > MAX_HEAL_QUEUED_POLLS) {
                   core.setFailed(`Heal re-run of run ${healedRunId} for "${checkName}" is still ${hr.status} (likely queued behind this ack's concurrency group); failing closed — its newer check will carry the verdict.`);
