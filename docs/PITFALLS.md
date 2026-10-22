@@ -4,6 +4,7 @@
 
 | 坑 | 状态 | 根治动作 | Owner |
 | --- | --- | --- | --- |
+| label-ack 等待 queued/missing 真检查或 heal 重跑，占用唯一 self-hosted runner，真 gate 排队死锁（pinhaoyun #33，run 39709494291，2026-10-22） | **已修** | queued / unknown / missing 单次快照立即 fail closed、零 sleep；heal 后立即检查，排队或未发布也立即失败；仅 in_progress 有界轮询。禁止提前 success（新 ack suite 会遮蔽真失败）；由真 gate 新检查、refresh/heal 或 `/recheck` 承载结论 | 专业研发 |
 | Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**；方案 B **本 PR 合入后完成** | B：相关 label 真评估 + 无关 label `mirror-required-check`；PR+SHA 共用 `label-{sha}` 主锁串行化，相关标签 evaluate 可 cancel、无关标签 ack 不 cancel；ack 替换排队 evaluate 时由标签事件时间校验拒绝镜像 success（写 failure）；success 前读取当前相关标签和 issue events，变化或无法确认则 post failure；保留创建前校验；cancelled heal 加 attempt>=3 上限、PR 提示及同 SHA in-flight guard | 专业研发 |
 | 临时撤必需检查才能合 | **已约束** | 只允许清幽灵且合后立刻加回；**禁止 `--admin`**；优先 `heal-required-checks.sh` | 专业研发 |
 | label-ack 用 checks.create 造的同名检查落入任意 suite（jobs #13 落 Acceptance suite），suite 重跑被 GitHub 复制（pinhaoyun #28） | **已修**（本 PR） | ack job 本身即必需检查名（caller `name: codex/qa/editorial` + `job_name`），以 job 结论表达最新真实结论；进行中有界轮询后失败；不再 checks.create | 专业研发 |
