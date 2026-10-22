@@ -177,13 +177,13 @@ const UNL_KW = 'This is a security problem.';
   const PREV = '1111111111111111111111111111111111111111';
   // Default head observations: HEAD's run long before any label below.
   const RUNS0 = [[HEAD, '2026-01-15T00:00:00Z']];
-  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt, runs = RUNS0, timeline = [], headRepo = 'o/r', runPrs = [1], dispatch = [], eventsLater }) {
+  async function runQa({ draft, action, labels, events = [], allowed = '', updatedAt, runs = RUNS0, timeline = [], headRepo = 'o/r', runPrs = [1], dispatch = [], eventsLater, prCreatedAt = '2026-01-01T00:00:00Z' }) {
     let evCalls = 0;
     const calls = { removed: [], failed: null, info: [] };
     const mkRun = (event) => ([sha, at, extra = {}], i) => ({ id: i + 1, event, head_sha: sha, head_branch: 'feat', head_repository: { full_name: headRepo }, pull_requests: runPrs.map((number) => ({ number })), created_at: at, ...extra });
     const github = {
       rest: {
-        pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft, head: { sha: HEAD, ref: 'feat', repo: { full_name: headRepo } }, base: { ref: 'main' }, labels: labels.map((name) => ({ name })) } }) },
+        pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft, created_at: prCreatedAt, head: { sha: HEAD, ref: 'feat', repo: { full_name: headRepo } }, base: { ref: 'main' }, labels: labels.map((name) => ({ name })) } }) },
         issues: { removeLabel: async (a) => { calls.removed.push(a.name); }, listEvents: async () => ({}), listEventsForTimeline: async () => ({}) },
         actions: { getWorkflowRun: async () => ({ data: { workflow_id: 7 } }), listWorkflowRuns: async () => ({}) },
         repos: { getCommit: async () => { throw new Error('committer dates must not be consulted'); } },
@@ -331,11 +331,29 @@ const UNL_KW = 'This is a security problem.';
     const c2 = await runQa({ ...exploit, action: 'labeled', headRepo: 'fork/r', runPrs: [] });
     assert.deepStrictEqual(c2.removed, ['qa-passed']);
   });
-  await t('qa-gate: same-repo run without PR association / of another PR does not count', async () => {
-    const c = await runQa({ ...exploit, action: 'labeled', runPrs: [], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
+  await t('qa-gate: unassociated same-repo runs count only since PR creation', async () => {
+    const options = { ...exploit, action: 'labeled', runPrs: [], runs: [[HEAD, '2026-02-01T16:55:00Z']] };
+    for (const prCreatedAt of ['2026-01-01T00:00:00Z', '2026-02-01T16:55:00Z']) {
+      const c = await runQa({ ...options, prCreatedAt });
+      assert.deepStrictEqual(c.removed, []);
+      assert.strictEqual(c.failed, null, c.failed);
+    }
+    for (const prCreatedAt of ['2026-02-01T16:55:01Z', null, 'invalid']) {
+      const c = await runQa({ ...options, prCreatedAt });
+      assert.deepStrictEqual(c.removed, ['qa-passed']);
+      assert.ok(c.failed, c.failed);
+    }
+    const c = await runQa({ ...options, runPrs: [2] });
     assert.deepStrictEqual(c.removed, ['qa-passed']);
-    const c2 = await runQa({ ...exploit, action: 'labeled', runPrs: [2], runs: [[HEAD, '2026-02-01T16:55:00Z']] });
-    assert.deepStrictEqual(c2.removed, ['qa-passed']);
+    assert.ok(c.failed, c.failed);
+  });
+  await t('qa-gate: #102 labeled event keeps QA with an unassociated same-repo PRT observation', async () => {
+    const c = await runQa({ draft: false, action: 'labeled', labels: ['qa-passed'], runPrs: [],
+      runs: [[HEAD, '2026-10-23T16:08:17Z']],
+      events: [at('labeled', 'qianhaoq', '2026-10-23T16:15:55Z')],
+      updatedAt: '2026-10-23T16:15:55Z' });
+    assert.deepStrictEqual(c.removed, []);
+    assert.strictEqual(c.failed, null, c.failed);
   });
   await t('qa-gate: run listing error (e.g. no actions: read) strips and fails closed', async () => {
     const c = await runQa({ ...exploit, action: 'labeled', runs: null });
@@ -406,7 +424,7 @@ const UNL_KW = 'This is a security problem.';
       const calls = { removed: [], failed: null, comments: [], summary: '', info: [] };
       const github = {
         rest: {
-          pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft: false, head: { sha: H, ref: 'feat', repo: { full_name: 'o/r' } }, base: { ref: 'main' }, labels: [{ name: 'qa-passed' }] } }) },
+          pulls: { get: async () => ({ data: { number: 1, state: 'open', merged: false, draft: false, created_at: iso(0), head: { sha: H, ref: 'feat', repo: { full_name: 'o/r' } }, base: { ref: 'main' }, labels: [{ name: 'qa-passed' }] } }) },
           issues: {
             removeLabel: async (a) => { calls.removed.push(a.name); },
             listEvents: async () => ({}), listEventsForTimeline: async () => ({}), listComments: async () => ({}),
@@ -642,11 +660,11 @@ const UNL_KW = 'This is a security problem.';
       });
       stripped(c, /also changes:  shared/);
     });
-    await t('qa-gate keep: run proof from another PR (same branch/SHA) or no PR association → stripped', async () => {
+    await t('qa-gate keep: another PR is rejected; unassociated run since PR creation counts', async () => {
       const c = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 2 });
       stripped(c, /no gate run proves/);
       const c2 = await scenario((f) => ({ H: mergeMain(f) }), { runPr: 0 });
-      stripped(c2, /no gate run proves/);
+      kept(c2);
     });
     await t('qa-gate keep: SHA replayed after sign-off (B → reset to A, QA on A, fast-forward to B) → stripped', async () => {
       // B ran at 1.1, then a run for A at 1.5 (head moved back), label at 2.
