@@ -64,3 +64,15 @@ check suite，但其中只有一个被跳过的 `ci`，没有 `ci / Build & Test
   对 edited 事件完整运行 CI；标题/描述编辑多跑一次的成本可接受。
 - 如加 concurrency，edited 事件用 `cancel-in-progress: false`，只取消旧 run，
   不让最新 suite 变成 cancelled。
+
+## pull_request_target 的空 PR 关联（2026-10-23）
+
+qianhaoq/dota2.ai PR #102 的同仓库 `pull_request_target` runs 全部返回
+`pull_requests: []`。QA Gate 强制要求关联 PR 号，漏掉标签之前已有的 head
+观测，误报「no head observation before the label」并两次移除 qa-passed。
+
+同仓库 head 观测不能强制要求 PR 关联：head_branch 与 PR head.ref、
+head_repository 与 PR head 仓库一致且关联为空时，改用 pulls.get 返回的
+`pr.created_at` 作下界，只接受 `run.created_at >= pr.created_at`，避免复用
+分支带入旧 PR 的观测。PR 创建时间缺失或无法解析时拒绝无关联 run；非空关联
+未包含当前 PR 号时仍拒绝。Fork 行为不变，标签仍须严格晚于有效 head 观测。

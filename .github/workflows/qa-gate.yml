@@ -437,8 +437,13 @@ jobs:
             // author-controlled):
             //   - this caller workflow's pull_request_target runs for this
             //     PR (head branch/repo match; same-repo PRs: pull_requests
-            //     must contain the PR; fork PRs carry no association and
-            //     match on head repo + branch) — every push / label / open
+            //     contains the PR, or is empty and the run was created at or
+            //     after pr.created_at; missing/invalid PR creation time rejects
+            //     unassociated runs). GitHub can omit associations even for
+            //     same-repo PRs; the creation bound excludes older branch reuse.
+            //     Non-empty associations to other PRs are rejected. Fork PRs
+            //     still allow empty associations on head repo + branch alone.
+            //     Every push / label / open
             //     event creates one, and a cancelled run still records the
             //     head it was created for;
             //   - its workflow_dispatch runs ON the PR branch (same-repo PRs);
@@ -458,6 +463,7 @@ jobs:
               const self = `${owner}/${repo}`.toLowerCase();
               const headRepo = String(pr.head.repo?.full_name || '').toLowerCase();
               const isFork = !headRepo || headRepo !== self;
+              const prCreatedAt = Date.parse(pr.created_at || '');
               const runs = [];
               for (const event of isFork ? ['pull_request_target'] : ['pull_request_target', 'workflow_dispatch']) {
                 runs.push(...await github.paginate(github.rest.actions.listWorkflowRuns, {
@@ -475,8 +481,9 @@ jobs:
                   const prs = r.pull_requests || [];
                   if (r.event === 'workflow_dispatch') return !isFork;
                   if (prs.some((p) => p?.number === prNumber)) return true;
-                  // Fork PR runs never carry a PR association.
-                  return isFork && prs.length === 0;
+                  // Empty associations are normal even for same-repo PRT runs.
+                  return prs.length === 0 && (isFork
+                    || (Number.isFinite(prCreatedAt) && Date.parse(r.created_at) >= prCreatedAt));
                 })
                 .map((r) => ({ sha: r.head_sha, t: Date.parse(r.created_at), id: r.id || 0, src: `run ${r.id}` }));
               const pSha = String(context.payload.pull_request?.head?.sha || '');
