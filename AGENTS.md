@@ -49,7 +49,8 @@ in [README.md](README.md).
     irrelevant labels run a caller job `name: <prefix>` calling
     `mirror-required-check.yml` with `job_name`, so the ack job IS the
     required check; its conclusion = latest real same-named verdict
-    (bounded poll while in flight, then fail). Never checks.create
+    (bounded poll only while in_progress, then fail; queued/unknown/missing
+    fails immediately to release the runner, including after heal). Never checks.create
     (API checks land in arbitrary suites and are duplicated on re-runs).
   - No blind periodic re-runs. Refresh jobs re-run a failed gate run only
     when its input changed (Codex: the shared `verdict()` would now pass;

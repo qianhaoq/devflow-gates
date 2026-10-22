@@ -1166,7 +1166,7 @@ const UNL_KW = 'This is a security problem.';
       waitMinutes = '0', selfRun = 9999 } = {}) {
       const src = scripts('mirror-required-check.yml')[0];
       const infos = []; const reruns = []; const comments = []; const created = [];
-      let reads = 0; let failed = null; const classified = [];
+      let reads = 0; let sleeps = 0; let failed = null; const classified = [];
       const github = {
         paginate: async (method, args) => {
           if (method === github.rest.actions.listWorkflowRuns) return workflowRuns;
@@ -1188,7 +1188,7 @@ const UNL_KW = 'This is a security problem.';
               if (skippedJobs.includes(job_id)) return { data: { status: 'completed', conclusion: 'skipped', steps: [] } };
               return { data: { steps: [{ name: 'Set up job' }, { name: ackJobs.includes(job_id) ? ACK_STEP : 'Evaluate' }] } };
             },
-            getWorkflowRun: async ({ run_id }) => ({ data: { id: run_id, workflow_id: 99, run_attempt: runAttempt, status: runStatus[run_id] || 'completed' } }),
+            getWorkflowRun: async ({ run_id }) => ({ data: { id: run_id, workflow_id: 99, run_attempt: runAttempt, status: runStatus[run_id] || (reruns.some((r) => r.run_id === run_id) ? 'in_progress' : 'completed') } }),
             listWorkflowRuns: {},
             reRunWorkflow: async (a) => { reruns.push(a); },
           },
@@ -1197,9 +1197,10 @@ const UNL_KW = 'This is a security problem.';
       const context = { repo: { owner: 'o', repo: 'r' }, runId: selfRun, eventName: 'pull_request_target',
         payload: { action, label: { name: label }, pull_request: sha ? { number: 9, head: { sha } } : null } };
       const core = { info: (m) => infos.push(m), setFailed: (m) => { failed = m; } };
-      await new AsyncFunction('github', 'context', 'core', 'process', src)(github, context, core,
-        { env: { CHECK_NAME: checkName, JOB_NAME: jobName, RELEVANT_LABELS: relevantLabels, WAIT_MINUTES: waitMinutes, POLL_SECONDS: '0' } });
-      return { failed, infos, reruns, comments, created, reads, classified };
+      await new AsyncFunction('github', 'context', 'core', 'process', 'setTimeout', src)(github, context, core,
+        { env: { CHECK_NAME: checkName, JOB_NAME: jobName, RELEVANT_LABELS: relevantLabels, WAIT_MINUTES: waitMinutes, POLL_SECONDS: '0' } },
+        (callback) => { sleeps++; assert.ok(sleeps < 100, 'unexpected excessive polling'); callback(); });
+      return { failed, infos, reruns, comments, created, reads, sleeps, classified };
     }
     const okEvents = [{ event: 'labeled', label: { name: 'qa-passed' }, created_at: '2026-10-20T01:00:00Z' }];
     const okLabels = [{ name: 'qa-passed' }];
@@ -1236,10 +1237,12 @@ const UNL_KW = 'This is a security problem.';
       ] });
       assert.strictEqual(r.failed, null);
     });
-    await t('mirror: only acks / nothing ⇒ fail after bounded wait (no invented green)', async () => {
+    await t('mirror: only acks / nothing ⇒ fail immediately (no invented green)', async () => {
       for (const checks of [[], [job(5, 'success')]]) {
-        const r = await runMirror({ ackJobs: [5], checks });
-        assert.match(r.failed, /Timed out after 0 min.*no real/);
+        const r = await runMirror({ waitMinutes: '30', ackJobs: [5], checks });
+        assert.match(r.failed, /No real.*refuses to occupy the runner/);
+        assert.strictEqual(r.reads, 1);
+        assert.strictEqual(r.sleeps, 0);
       }
     });
     await t('mirror: in-flight real ⇒ waits, then mirrors its verdict', async () => {
@@ -1247,14 +1250,21 @@ const UNL_KW = 'This is a security problem.';
         checks: (n) => n < 3 ? [job(1, 'failure'), { ...job(2, null), status: 'in_progress', conclusion: null }] : [job(1, 'failure'), job(2, 'success')] });
       assert.strictEqual(r.failed, null);
       assert.ok(r.infos.some((m) => /still in_progress/.test(m)));
+      assert.ok(r.sleeps >= 2, 'executing real job is polled');
     });
     await t('mirror: in-flight real beyond wait ⇒ fail, not old verdict', async () => {
       const r = await runMirror({ checks: [job(1, 'success'), { ...job(2, null), status: 'in_progress', conclusion: null }] });
       assert.match(r.failed, /Timed out.*still in_progress/);
     });
-    await t('mirror: queued job without steps is treated as in-flight', async () => {
-      const r = await runMirror({ unknownJobs: [2], checks: [job(1, 'success'), { ...job(2, null), status: 'queued', conclusion: null }] });
-      assert.match(r.failed, /Timed out/);
+    await t('mirror: queued real / unknown check fails fast even with 30 minute budget', async () => {
+      for (const unknownJobs of [[], [2]]) {
+        const r = await runMirror({ waitMinutes: '30', unknownJobs,
+          checks: [job(1, 'success'), job(2, null, { status: 'queued' })] });
+        assert.match(r.failed, /still queued.*refuses to occupy the runner/);
+        assert.strictEqual(r.reads, 1);
+        assert.strictEqual(r.sleeps, 0);
+        assert.ok(!r.infos.some((m) => /mirrored/.test(m)));
+      }
     });
     await t('mirror (jobs#14): stale "summary not yet" failure never re-posted once a newer real success exists', async () => {
       // t1 real PRT gate failed (summary missing) · t2 acks re-posted failure ·
@@ -1307,19 +1317,21 @@ const UNL_KW = 'This is a security problem.';
       assert.strictEqual(r.reruns.length, 1);
       assert.strictEqual(r.failed, null);
     });
-    await t('mirror (P1-a): healed run queued without publishing a replacement check ⇒ bounded fail', async () => {
+    await t('mirror (P1-a): healed run queued without publishing a replacement check ⇒ immediate fail', async () => {
       const r = await runMirror({ waitMinutes: '60', runStatus: { 4001: 'queued' }, checks: [job(1, 'cancelled')] });
       assert.strictEqual(r.reruns.length, 1);
       assert.match(r.failed, /still queued.*failing closed/);
-      assert.ok(r.reads < 20, `bounded polls (${r.reads})`);
+      assert.strictEqual(r.reads, 2, 'one initial and one post-heal snapshot');
+      assert.strictEqual(r.sleeps, 0);
     });
-    await t('mirror (P1-a): healed run stuck queued behind this ack ⇒ bounded fail, no mutual wait', async () => {
+    await t('mirror (P1-a): healed run stuck queued behind this ack ⇒ immediate fail, no mutual wait', async () => {
       const r = await runMirror({ waitMinutes: '60', unknownJobs: [3], runStatus: { 4001: 'queued' },
         checks: (k) => k < 2 ? [job(1, 'cancelled')]
           : [job(1, 'cancelled'), { ...job(3, null), status: 'queued', conclusion: null, details_url: 'https://github.com/o/r/actions/runs/4001/job/3' }] });
       assert.strictEqual(r.reruns.length, 1);
       assert.match(r.failed, /still queued.*failing closed/);
-      assert.ok(r.reads < 20, `bounded polls (${r.reads})`);
+      assert.strictEqual(r.reads, 2, 'one initial and one post-heal snapshot');
+      assert.strictEqual(r.sleeps, 0);
     });
     await t('mirror: deferred heal retried after peer finishes; budget only on issued rerun', async () => {
       let n = 0;

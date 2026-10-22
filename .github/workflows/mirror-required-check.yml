@@ -13,19 +13,22 @@
 # exit non-zero. No checks.create (API-created checks landed in arbitrary
 # github-actions suites and were duplicated by GitHub on suite re-runs).
 #
-# - Newest real attempt in flight / not yet present -> poll up to
-#   wait_minutes, then fail (never invents green). Keep wait_minutes above
+# - Newest real attempt queued / unknown / missing -> fail immediately,
+#   releasing the runner for the real gate, refresh/heal or /recheck. Never
+#   pass before completion: a newer ack suite could mask a real failure.
+# - Only an in_progress real attempt is polled up to wait_minutes, then
+#   fail (never invents green). Keep wait_minutes above
 #   the real gate's own maximum runtime: a failed ack is NEWER than a
 #   slower real run and would mask its later result.
 # - Latest real verdict cancelled -> cancel-heal re-run of that workflow
 #   (attempt cap 3, PR comment at cap, same-PR in-flight guard; one issued
-#   re-run per ack, deferred heals retried), then keep polling. Jobs that
+#   re-run per ack, deferred heals retried), then inspect immediately. Jobs that
 #   were cancelled before starting (no steps) are NOT transparent: unless a
 #   sibling attempt of the same run proves it was an ack, it is a cancelled
 #   real verdict -> heal or fail (fail-closed; never an older success).
 #   Heal defers only behind an in_progress peer (until the deadline); a
 #   queued peer (may wait on this ack) ends the ack fail-closed without a
-#   competing rerun; a healed run stuck queued fails this ack closed.
+#   competing rerun; a healed run queued or not yet published fails immediately.
 # - Success is mirrored only if current relevant-label state matches the
 #   label event history at the source verdict; uncertainty -> failure.
 # - Sources: same-named Actions jobs that are not acks. Acks are recognised
@@ -54,7 +57,7 @@ on:
         required: false
         default: ''
       wait_minutes:
-        description: 'Max minutes to wait for an in-flight/missing real verdict before failing (1-60; exceed the real gate runtime)'
+        description: 'Max minutes to poll an in_progress real verdict (1-60; exceed the real gate runtime); queued/unknown/missing fails immediately'
         required: false
         type: number
         default: 30
@@ -139,7 +142,7 @@ jobs:
               if (kinds.has(r.id)) return kinds.get(r.id);
               const { data: job } = await github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: r.id });
               const steps = job.steps || [];
-              // No steps: queued (not started) -> unknown, re-checked next poll.
+              // No steps: queued (not started) -> unknown, fail closed immediately.
               // Skipped -> never evaluated -> 'skip'. Completed otherwise
               // (cancelled before start, e.g. a pending evaluate replaced by
               // concurrency) -> 'nostep': provenance is resolved in snapshot()
@@ -251,20 +254,17 @@ jobs:
             }
 
             // One heal re-run per ack; budget is consumed only by an issued rerun.
-            // Bounded: deferrals behind an in-progress peer end at the deadline;
-            // polls while the
-            // healed run sits queued (it may be waiting on THIS ack's concurrency
-            // group; its own newer check then supersedes this one).
-            const MAX_HEAL_QUEUED_POLLS = 6;
-            let healQueuedPolls = 0;
+            // Only executing peers may be polled; queued jobs may need our runner.
+            let inspectHealImmediately = false;
             let healedRunId = null;
             let healedId = null;
             let reason = '';
             for (let first = true; ; first = false) {
-              if (!first) {
+              if (!first && !inspectHealImmediately) {
                 if (Date.now() >= deadline) break;
                 await sleep(pollMs);
               }
+              inspectHealImmediately = false;
               let latest;
               try {
                 latest = await snapshot();
@@ -272,23 +272,27 @@ jobs:
                 core.setFailed(`Cannot read/classify "${checkName}" checks: ${error.message}`);
                 return;
               }
-              if (!latest) { reason = `no real "${checkName}" verdict on ${sha.slice(0, 7)} yet`; core.info(reason); continue; }
-              // Healed run not yet started: either its new (queued) check is
-              // newest, or it has not published a check yet and the original
-              // cancelled check is still newest. Bounded either way.
+              const refuseWait = (detail) => core.setFailed(`${detail}; failing closed: refuses to occupy the runner waiting for a queued job or missing verdict. The real gate's own newer check or refresh/heal (or /recheck) will carry the verdict.`);
+              if (!latest) { refuseWait(`No real "${checkName}" verdict on ${sha.slice(0, 7)} yet`); return; }
+              // A rerun may still expose its original cancelled check until it starts.
               if (healedRunId !== null && runIdOf(latest) === healedRunId
                 && (latest.kind === 'unknown' || latest.id === healedId)) {
                 const { data: hr } = await github.rest.actions.getWorkflowRun({ owner, repo, run_id: healedRunId });
-                if (['queued', 'pending', 'waiting', 'requested'].includes(hr.status) && ++healQueuedPolls > MAX_HEAL_QUEUED_POLLS) {
-                  core.setFailed(`Heal re-run of run ${healedRunId} for "${checkName}" is still ${hr.status} (likely queued behind this ack's concurrency group); failing closed — its newer check will carry the verdict.`);
+                if (hr.status !== 'in_progress') {
+                  refuseWait(`Heal re-run of run ${healedRunId} for "${checkName}" is still ${hr.status}`);
                   return;
                 }
               }
-              if (latest.kind === 'unknown' || (latest.status && latest.status !== 'completed') || !latest.conclusion) {
+              if (latest.kind === 'unknown' || (latest.status !== 'completed' && latest.status !== 'in_progress')) {
+                refuseWait(`Newest real "${checkName}" (id ${latest.id}) is still ${latest.status || 'unknown'}`);
+                return;
+              }
+              if (latest.status === 'in_progress') {
                 reason = `newest real "${checkName}" (id ${latest.id}) is still ${latest.status || 'queued'}`;
                 core.info(reason);
                 continue;
               }
+              if (!latest.conclusion) { refuseWait(`Completed check ${latest.id} has no verdict`); return; }
               const c = latest.conclusion;
               if (c === 'cancelled') {
                 if (healedId === latest.id) { reason = `cancelled check ${latest.id} awaiting heal re-run`; core.info(reason); continue; }
@@ -298,7 +302,7 @@ jobs:
                 }
                 const outcome = await heal(latest);
                 if (outcome && outcome.capped) { core.setFailed(outcome.capped); return; }
-                if (outcome === 'issued') { healedId = latest.id; healedRunId = runIdOf(latest); }
+                if (outcome === 'issued') { healedId = latest.id; healedRunId = runIdOf(latest); inspectHealImmediately = true; }
                 reason = `cancelled check ${latest.id}: heal ${outcome}; waiting`;
                 continue;
               }
