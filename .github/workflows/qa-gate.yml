@@ -482,6 +482,10 @@ jobs:
                   if (r.event === 'workflow_dispatch') return !isFork;
                   if (prs.some((p) => p?.number === prNumber)) return true;
                   // Empty associations are normal even for same-repo PRT runs.
+                  // Their head_branch/head_sha are the PR head (verified: dota2.ai
+                  // #102 runs 39811367480.. head_sha 61b4725 = PR head, base 3428368).
+                  // Were head_sha ever the base SHA, headAtSignoff's sha check
+                  // would mismatch and strip (fail closed), never falsely pass.
                   return prs.length === 0 && (isFork
                     || (Number.isFinite(prCreatedAt) && Date.parse(r.created_at) >= prCreatedAt));
                 })
