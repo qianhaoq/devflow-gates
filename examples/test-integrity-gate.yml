@@ -1,0 +1,28 @@
+# Trial — do not add to branch protection or auto-merge required_checks yet.
+# Pin @main to a merged commit SHA before installing in a product repository.
+# Both calls run both jobs: required-name candidates are
+# assert-guard / Assertion Guard and skip-guard / Skip Guard.
+# Additional companion checks: assert-guard / Skip Guard and skip-guard / Assertion Guard.
+name: Test Integrity Gate
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number (dispatch on PR branch for head-attached checks)'
+        required: true
+        type: string
+permissions:
+  contents: read
+  pull-requests: read
+# No concurrency cancellation: every head evaluation completes.
+jobs:
+  assert-guard:
+    uses: qianhaoq/devflow-gates/.github/workflows/test-integrity-gate.yml@main
+    with:
+      mode: enforce
+  skip-guard:
+    uses: qianhaoq/devflow-gates/.github/workflows/test-integrity-gate.yml@main
+    with:
+      mode: enforce

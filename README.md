@@ -517,3 +517,37 @@ shellcheck），并运行 `node tests/gates.test.js` 与
 ## 许可证
 
 [MIT](LICENSE)
+
+## Test Integrity Gate (trial)
+
+[Caller template](examples/test-integrity-gate.yml) runs two API-only heuristics in
+[test-integrity-gate.yml](.github/workflows/test-integrity-gate.yml): **Assertion Guard**
+(assertion removal, vacuous replacements, clear threshold weakening, deleted test/monitor
+files) and **Skip Guard** (skip/todo/xfail/focus, optional test configuration, disabled Python
+assertions). No checkout or PR code execution. Read-only token; no secrets or labels.
+
+Stable check names are `assert-guard / Assertion Guard` and `skip-guard / Skip Guard`.
+Each caller invokes both jobs, so the example also emits the two companion checks.
+No cancellation, label events, self-listeners, or heal companion. Both scanners always run.
+Use `runs_on` for a runner label/JSON array and `mode: observe` to report without failing;
+default and trial callers use `enforce`. Draft and closed PRs pass with information.
+Invalid dispatch PR numbers fail. Dispatch on the PR branch to attach checks there.
+After adding an override, manually re-run the gate (comments do not trigger it).
+
+An author or collaborator with write access can comment:
+
+```text
+## Test Integrity Override
+理由：解释合法删除或修改的原因
+```
+
+A reason must contain at least three characters. An accepted override passes both guards
+and records the reason in each job summary. No skip label. API errors fail loudly;
+missing relevant patches or the API file limit require review/override (observe reports).
+These are heuristics, not proof of test correctness; renamed identifiers and complex
+multiline assertions can need manual review. Keep the pure library and both inline
+copies synchronized; regression tests enforce exact equality.
+
+This is parallel to Diff Quiz, whose trial remains limited to trial repos through
+2026-11-02. **Do not add these checks to branch protection or auto-merge yet.**
+Caller changes for kilocean-translate and qh-personal-agent are separate PRs.
