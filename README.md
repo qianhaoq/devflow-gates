@@ -526,16 +526,10 @@ shellcheck），并运行 `node tests/gates.test.js` 与
 files) and **Skip Guard** (skip/todo/xfail/focus, optional test configuration, disabled Python
 assertions). No checkout or PR code execution. Read-only token; no secrets or labels.
 
-Stable check names are `assert-guard / Assertion Guard` and `skip-guard / Skip Guard`.
-Each caller invokes both jobs, so the example also emits the two companion checks.
-No cancellation, label events, self-listeners, or heal companion. Both scanners always run.
-Use `runs_on` for a runner label/JSON array and `mode: observe` to report without failing;
-default and trial callers use `enforce`. Draft and closed PRs pass with information.
-Invalid dispatch PR numbers fail. Dispatch on the PR branch to attach checks there.
-After adding an override, manually re-run the gate (comments do not trigger it).
-
-An author or collaborator with write access can comment:
-
+Stable check names with the example caller (job id `integrity`):
+`integrity / Assertion Guard` and `integrity / Skip Guard`.
+One reusable call runs both jobs in parallel — do not invoke the reusable twice
+with different caller job ids (that duplicates all checks).
 ```text
 ## Test Integrity Override
 理由：解释合法删除或修改的原因
