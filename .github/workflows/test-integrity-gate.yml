@@ -1,0 +1,337 @@
+# API-only: no checkout, PR execution, labels, or cancellation.
+name: Reusable Test Integrity Gate
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner label or JSON label array (trusted isolated runners only)'
+        type: string
+        default: ubuntu-latest
+      mode:
+        description: 'enforce or observe'
+        type: string
+        default: enforce
+permissions:
+  pull-requests: read
+  contents: read
+jobs:
+  assertion-guard:
+    name: Assertion Guard
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          GATE_MODE: ${{ inputs.mode }}
+        with:
+          script: |
+            // >>> test-integrity-lib
+            'use strict';
+            // Source of truth: mirrored verbatim in both workflow scripts; tests enforce sync.
+            const OVERRIDE_HEADER = '## Test Integrity Override';
+            const ASSERT_RE = /\b(?:expect\s*\(|assert\s*(?:\(|\.|\s)|assert\w*\s*\(|assert_\w*!?\s*\(|XCTAssert\w*\s*\(|should\.|toBe\(|toEqual\(|toStrictEqual\(|toHaveBeenCalled|toMatchSnapshot|assertThat|pytest\.(?:raises|fail)|self\.assert|fail\s*\()/i;
+            function isRelevantPath(p) {
+              return /(?:^|\/)(?:__tests__|tests|test|spec)(?:\/|$)|\.(?:test|spec)\.[jt]sx?$|_test\.py$|(?:^|\/)test_[^/]*\.py$|(?:^|\/)conftest\.py$|\.feature$|(?:^|\/)scripts\/(?:ci-check|check-|invariants)|invariant/i.test(p) || /monitor/i.test(p.split('/').pop());
+            }
+            function isWorkflowPath(p) { return /^\.github\/workflows\/.*\.ya?ml$/.test(p); }
+            function hunks(patch) {
+              const result = []; let h;
+              for (const line of String(patch || '').split('\n')) {
+                if (line.startsWith('@@') || !h) { h = { removed: [], added: [], context: [] }; result.push(h); }
+                if (/^(---|\+\+\+)/.test(line)) continue;
+                if (line.startsWith('-')) h.removed.push(line.slice(1));
+                else if (line.startsWith('+')) h.added.push(line.slice(1));
+                else if (line.startsWith(' ')) h.context.push(line.slice(1));
+              }
+              return result;
+            }
+            // Cancel exact/whitespace-only moves across hunks, not just within one hunk.
+            function fileHunks(patch, python = false) {
+              const groups = hunks(patch);
+              const additions = groups.flatMap(h => h.added.map((line, index) => ({ h, line, index, used: false })));
+              for (const h of groups) h.removed = h.removed.filter(line => {
+                const match = additions.find(a => !a.used && normalized(a.line, python) === normalized(line, python));
+                if (!match) return true;
+                match.used = true; return false;
+              });
+              for (const h of groups) h.added = h.added.filter((_, index) => !additions.some(a => a.h === h && a.index === index && a.used));
+              return groups;
+            }
+            function normalized(s, python = false) {
+              const indent = python ? s.match(/^[ \t]*/)[0] : '';
+              return indent + s.slice(indent.length).replace(/\s+/g, '');
+            }
+            function changed(h, python = false) {
+              const added = [...h.added];
+              const removed = h.removed.filter(line => {
+                const i = added.findIndex(a => normalized(a, python) === normalized(line, python));
+                if (i < 0) return true;
+                added.splice(i, 1); return false;
+              });
+              return { removed, added, context: h.context };
+            }
+            function finding(file, rule, detail, confidence = 'high') { return { path: file.filename, rule, detail: detail.trim().slice(0, 240), confidence }; }
+            function scanAssertionWeaken(files) {
+              const out = [];
+              for (const f of files) {
+                if (!isRelevantPath(f.filename) && !isRelevantPath(f.previous_filename || '')) continue;
+                if (f.status === 'removed' || (isRelevantPath(f.previous_filename || '') && !isRelevantPath(f.filename))) { out.push(finding(f, 'deleted test/monitor file', f.filename)); continue; }
+                for (const raw of fileHunks(f.patch, /\.py$/.test(f.filename))) {
+                  const h = changed(raw, /\.py$/.test(f.filename)), removed = h.removed.filter(l => ASSERT_RE.test(l)), added = h.added.filter(l => ASSERT_RE.test(l));
+                  if (removed.length > added.length) out.push(finding(f, 'removed assertion without replacement', removed[0]));
+                  for (const l of h.added) {
+                    if (/expect\s*\(\s*true\s*\)|expect\s*\(\s*1\s*\)\s*\.toBe\s*\(\s*1\s*\)|assert\s*\(\s*true\s*\)|assert\s+True\b|assert\.ok\s*\(\s*true\s*\)|(?:XCTAssertTrue|assertTrue)\s*\(\s*true|#\s*expect nothing/i.test(l) || (removed.length && /pass\s*#\s*noqa/.test(l)) || (removed.some(r => /\.to(?:Be|Equal|BeGreaterThan)\s*\(/.test(r)) && /expect\([^)]*\)\.toBeTruthy\s*\(\s*\)/.test(l))) out.push(finding(f, 'vacuous assertion', l));
+                  }
+                  // Compare only a single replacement with an identical expression/matcher.
+                  if (removed.length === 1 && added.length === 1) {
+                    const number = /-?\d+(?:\.\d+)?/g;
+                    const a = removed[0], b = added[0], na = [...a.matchAll(number)], nb = [...b.matchAll(number)];
+                    const differences = na.map((n, i) => n[0] !== nb[i]?.[0] ? i : -1).filter(i => i >= 0);
+                    if (na.length === nb.length && differences.length === 1 && normalized(a.replace(number, '#')) === normalized(b.replace(number, '#'))) {
+                      const comparison = /(?:>=?|<=?)/.exec(a);
+                      const index = differences[0], numberIndex = na[index].index;
+                      const numberOnLeft = comparison && numberIndex < comparison.index;
+                      const lower = /toBeGreaterThan(?:OrEqual)?\s*\(/.test(a) || (comparison && (numberOnLeft ? comparison[0].startsWith('<') : comparison[0].startsWith('>')));
+                      const upper = /toBeLessThan(?:OrEqual)?\s*\(/.test(a) || (comparison && (numberOnLeft ? comparison[0].startsWith('>') : comparison[0].startsWith('<')));
+                      if ((lower && +nb[index][0] < +na[index][0]) || (upper && +nb[index][0] > +na[index][0])) out.push(finding(f, 'loosened threshold', `${a.trim()} → ${b.trim()}`));
+                    }
+                    if (/\.toBe\s*\(/.test(a) && /\.toBeGreaterThan\s*\(\s*0\s*\)/.test(b)) out.push(finding(f, 'weaker matcher', b));
+                  }
+                }
+              }
+              return out;
+            }
+            const SKIP_RE = /\b(?:test|it|describe|context|suite)\.(?:skip|todo)\b|\b(?:xit|xdescribe|xtest|pending)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@unittest\.skip|@Ignore\b|\bfdescribe\b|\bfit\s*\(|\.only\b/;
+            function scanSkipEvasion(files) {
+              const out = [];
+              for (const f of files) {
+                const relevant = isRelevantPath(f.filename) || isRelevantPath(f.previous_filename || '');
+                const workflow = isWorkflowPath(f.filename);
+                if (!relevant && !workflow) continue;
+                for (const raw of fileHunks(f.patch, /\.py$/.test(f.filename))) {
+                  const h = changed(raw, /\.py$/.test(f.filename));
+                  const testContext = [...raw.context, ...raw.added, ...raw.removed].some(s => /\b[\w-]*test[\w-]*["']?\s*:/i.test(s));
+                  for (const l of h.added) {
+                    if (workflow && /\bcontinue-on-error\s*:\s*true\b/.test(l) && testContext) out.push(finding(f, 'optional test workflow', l));
+                    if (relevant && /\.py$/.test(f.filename) && ASSERT_RE.test(l) && h.removed.some(r => normalized(r) === normalized(l) && r.match(/^[ \t]*/)[0].length < l.match(/^[ \t]*/)[0].length) && [...raw.context, ...raw.removed, ...raw.added].some(s => /\bif\s+(?:False|0)\s*:/.test(s))) out.push(finding(f, 'disabled assertion block', l));
+                    if (relevant && SKIP_RE.test(l)) out.push(finding(f, 'skip/focus introduced', l));
+                    if (/\.(?:ya?ml|json)$/i.test(f.filename) && /["']?(?:optional|require[d])["']?\s*:\s*(?:true|false)/.test(l) && /(?:optional["']?\s*:\s*true|required["']?\s*:\s*false)/.test(l) && (relevant || [...raw.context, ...raw.added, ...raw.removed].some(s => /\btest[\w-]*["\']?\s*:/i.test(s)))) out.push(finding(f, 'optional test config', l));
+                    if (relevant && /\.py$/.test(f.filename) && /\bif\s+(?:False|0)\s*:/.test(l) && [...h.removed, ...h.context, ...h.added].some(s => ASSERT_RE.test(s))) out.push(finding(f, 'disabled assertion block', l));
+                  }
+                }
+              }
+              return out;
+            }
+            function parseOverrideComment(body) {
+              const match = String(body || '').match(/^## Test Integrity Override\s*\r?\n(?:理由|Reason)\s*[:：]\s*([^]*?)(?=\n## |$)/im);
+              const reason = match?.[1].trim();
+              return reason && reason.length >= 3 ? reason : null;
+            }
+            function summarizeFindings(findings) {
+              return findings.slice(0, 10).map(f => `- [${f.confidence}] ${f.path}: ${f.rule} — ${f.detail}`).join('\n') + (findings.length > 10 ? `\n… ${findings.length - 10} more` : '');
+            }
+            // <<< test-integrity-lib
+            const mode = process.env.GATE_MODE;
+            if (!['enforce', 'observe'].includes(mode)) throw new Error('Invalid mode: use enforce or observe');
+            const rawNumber = context.payload.pull_request?.number ?? context.payload.inputs?.pr_number;
+            if (context.eventName === 'workflow_dispatch' && !/^[1-9]\d*$/.test(String(rawNumber || ''))) {
+              core.setFailed('Invalid pr_number / PR 编号无效'); return;
+            }
+            if (!rawNumber) { await core.summary.addRaw('Nothing to gate').write(); return; }
+            const prNumber = Number(rawNumber);
+            const repo = context.repo;
+            const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: prNumber });
+            if (pr.draft || pr.state !== 'open') {
+              await core.summary.addRaw('✅ Test Integrity: draft/closed PR — informational pass').write(); return;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, { ...repo, issue_number: prNumber, per_page: 100 });
+            for (const comment of comments) {
+              const reason = parseOverrideComment(comment.body);
+              if (!reason || !comment.user?.login || comment.user.type === 'Bot') continue;
+              let authorized = comment.user.login === pr.user.login;
+              if (!authorized) {
+                try {
+                  const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...repo, username: comment.user.login });
+                  authorized = ['admin', 'maintain', 'write'].includes(data.permission);
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+              if (authorized) {
+                await core.summary.addRaw('✅ Test Integrity Override accepted / 试验期人工理由覆盖\n\n').addRaw(reason.slice(0, 1000)).write(); return;
+              }
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
+            // The API caps results at 3000 files and can omit binary/large patches. Never silently bless incomplete coverage.
+            const incomplete = files.length >= 3000 || files.some(f => (isRelevantPath(f.filename) || isRelevantPath(f.previous_filename || '') || isWorkflowPath(f.filename)) && f.status !== 'removed' && !f.patch);
+            const findings = scanAssertionWeaken(files);
+            if (incomplete) findings.push({ path: '(diff)', rule: 'incomplete API diff; manual override required', detail: 'Relevant patch missing or file limit reached', confidence: 'high' });
+            const detail = findings.length ? summarizeFindings(findings) : '✅ Test Integrity: no high-confidence assertion-weaken / skip-evasion findings';
+            await core.summary.addRaw('### Assertion Guard\n\n').addRaw(detail).addRaw(`\n\nMode: ${mode}; PR #${prNumber}; head ${pr.head.sha}`).write();
+            if (findings.some(f => f.confidence === 'high')) {
+              if (mode === 'enforce') core.setFailed('测试完整性检查失败 / Test Integrity findings\n' + detail);
+              else core.warning('Observe mode / 仅观察\n' + detail);
+            }
+  skip-guard:
+    name: Skip Guard
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          GATE_MODE: ${{ inputs.mode }}
+        with:
+          script: |
+            // >>> test-integrity-lib
+            'use strict';
+            // Source of truth: mirrored verbatim in both workflow scripts; tests enforce sync.
+            const OVERRIDE_HEADER = '## Test Integrity Override';
+            const ASSERT_RE = /\b(?:expect\s*\(|assert\s*(?:\(|\.|\s)|assert\w*\s*\(|assert_\w*!?\s*\(|XCTAssert\w*\s*\(|should\.|toBe\(|toEqual\(|toStrictEqual\(|toHaveBeenCalled|toMatchSnapshot|assertThat|pytest\.(?:raises|fail)|self\.assert|fail\s*\()/i;
+            function isRelevantPath(p) {
+              return /(?:^|\/)(?:__tests__|tests|test|spec)(?:\/|$)|\.(?:test|spec)\.[jt]sx?$|_test\.py$|(?:^|\/)test_[^/]*\.py$|(?:^|\/)conftest\.py$|\.feature$|(?:^|\/)scripts\/(?:ci-check|check-|invariants)|invariant/i.test(p) || /monitor/i.test(p.split('/').pop());
+            }
+            function isWorkflowPath(p) { return /^\.github\/workflows\/.*\.ya?ml$/.test(p); }
+            function hunks(patch) {
+              const result = []; let h;
+              for (const line of String(patch || '').split('\n')) {
+                if (line.startsWith('@@') || !h) { h = { removed: [], added: [], context: [] }; result.push(h); }
+                if (/^(---|\+\+\+)/.test(line)) continue;
+                if (line.startsWith('-')) h.removed.push(line.slice(1));
+                else if (line.startsWith('+')) h.added.push(line.slice(1));
+                else if (line.startsWith(' ')) h.context.push(line.slice(1));
+              }
+              return result;
+            }
+            // Cancel exact/whitespace-only moves across hunks, not just within one hunk.
+            function fileHunks(patch, python = false) {
+              const groups = hunks(patch);
+              const additions = groups.flatMap(h => h.added.map((line, index) => ({ h, line, index, used: false })));
+              for (const h of groups) h.removed = h.removed.filter(line => {
+                const match = additions.find(a => !a.used && normalized(a.line, python) === normalized(line, python));
+                if (!match) return true;
+                match.used = true; return false;
+              });
+              for (const h of groups) h.added = h.added.filter((_, index) => !additions.some(a => a.h === h && a.index === index && a.used));
+              return groups;
+            }
+            function normalized(s, python = false) {
+              const indent = python ? s.match(/^[ \t]*/)[0] : '';
+              return indent + s.slice(indent.length).replace(/\s+/g, '');
+            }
+            function changed(h, python = false) {
+              const added = [...h.added];
+              const removed = h.removed.filter(line => {
+                const i = added.findIndex(a => normalized(a, python) === normalized(line, python));
+                if (i < 0) return true;
+                added.splice(i, 1); return false;
+              });
+              return { removed, added, context: h.context };
+            }
+            function finding(file, rule, detail, confidence = 'high') { return { path: file.filename, rule, detail: detail.trim().slice(0, 240), confidence }; }
+            function scanAssertionWeaken(files) {
+              const out = [];
+              for (const f of files) {
+                if (!isRelevantPath(f.filename) && !isRelevantPath(f.previous_filename || '')) continue;
+                if (f.status === 'removed' || (isRelevantPath(f.previous_filename || '') && !isRelevantPath(f.filename))) { out.push(finding(f, 'deleted test/monitor file', f.filename)); continue; }
+                for (const raw of fileHunks(f.patch, /\.py$/.test(f.filename))) {
+                  const h = changed(raw, /\.py$/.test(f.filename)), removed = h.removed.filter(l => ASSERT_RE.test(l)), added = h.added.filter(l => ASSERT_RE.test(l));
+                  if (removed.length > added.length) out.push(finding(f, 'removed assertion without replacement', removed[0]));
+                  for (const l of h.added) {
+                    if (/expect\s*\(\s*true\s*\)|expect\s*\(\s*1\s*\)\s*\.toBe\s*\(\s*1\s*\)|assert\s*\(\s*true\s*\)|assert\s+True\b|assert\.ok\s*\(\s*true\s*\)|(?:XCTAssertTrue|assertTrue)\s*\(\s*true|#\s*expect nothing/i.test(l) || (removed.length && /pass\s*#\s*noqa/.test(l)) || (removed.some(r => /\.to(?:Be|Equal|BeGreaterThan)\s*\(/.test(r)) && /expect\([^)]*\)\.toBeTruthy\s*\(\s*\)/.test(l))) out.push(finding(f, 'vacuous assertion', l));
+                  }
+                  // Compare only a single replacement with an identical expression/matcher.
+                  if (removed.length === 1 && added.length === 1) {
+                    const number = /-?\d+(?:\.\d+)?/g;
+                    const a = removed[0], b = added[0], na = [...a.matchAll(number)], nb = [...b.matchAll(number)];
+                    const differences = na.map((n, i) => n[0] !== nb[i]?.[0] ? i : -1).filter(i => i >= 0);
+                    if (na.length === nb.length && differences.length === 1 && normalized(a.replace(number, '#')) === normalized(b.replace(number, '#'))) {
+                      const comparison = /(?:>=?|<=?)/.exec(a);
+                      const index = differences[0], numberIndex = na[index].index;
+                      const numberOnLeft = comparison && numberIndex < comparison.index;
+                      const lower = /toBeGreaterThan(?:OrEqual)?\s*\(/.test(a) || (comparison && (numberOnLeft ? comparison[0].startsWith('<') : comparison[0].startsWith('>')));
+                      const upper = /toBeLessThan(?:OrEqual)?\s*\(/.test(a) || (comparison && (numberOnLeft ? comparison[0].startsWith('>') : comparison[0].startsWith('<')));
+                      if ((lower && +nb[index][0] < +na[index][0]) || (upper && +nb[index][0] > +na[index][0])) out.push(finding(f, 'loosened threshold', `${a.trim()} → ${b.trim()}`));
+                    }
+                    if (/\.toBe\s*\(/.test(a) && /\.toBeGreaterThan\s*\(\s*0\s*\)/.test(b)) out.push(finding(f, 'weaker matcher', b));
+                  }
+                }
+              }
+              return out;
+            }
+            const SKIP_RE = /\b(?:test|it|describe|context|suite)\.(?:skip|todo)\b|\b(?:xit|xdescribe|xtest|pending)\s*\(|\bpytest\.mark\.(?:skip|skipif|xfail)\b|@unittest\.skip|@Ignore\b|\bfdescribe\b|\bfit\s*\(|\.only\b/;
+            function scanSkipEvasion(files) {
+              const out = [];
+              for (const f of files) {
+                const relevant = isRelevantPath(f.filename) || isRelevantPath(f.previous_filename || '');
+                const workflow = isWorkflowPath(f.filename);
+                if (!relevant && !workflow) continue;
+                for (const raw of fileHunks(f.patch, /\.py$/.test(f.filename))) {
+                  const h = changed(raw, /\.py$/.test(f.filename));
+                  const testContext = [...raw.context, ...raw.added, ...raw.removed].some(s => /\b[\w-]*test[\w-]*["']?\s*:/i.test(s));
+                  for (const l of h.added) {
+                    if (workflow && /\bcontinue-on-error\s*:\s*true\b/.test(l) && testContext) out.push(finding(f, 'optional test workflow', l));
+                    if (relevant && /\.py$/.test(f.filename) && ASSERT_RE.test(l) && h.removed.some(r => normalized(r) === normalized(l) && r.match(/^[ \t]*/)[0].length < l.match(/^[ \t]*/)[0].length) && [...raw.context, ...raw.removed, ...raw.added].some(s => /\bif\s+(?:False|0)\s*:/.test(s))) out.push(finding(f, 'disabled assertion block', l));
+                    if (relevant && SKIP_RE.test(l)) out.push(finding(f, 'skip/focus introduced', l));
+                    if (/\.(?:ya?ml|json)$/i.test(f.filename) && /["']?(?:optional|require[d])["']?\s*:\s*(?:true|false)/.test(l) && /(?:optional["']?\s*:\s*true|required["']?\s*:\s*false)/.test(l) && (relevant || [...raw.context, ...raw.added, ...raw.removed].some(s => /\btest[\w-]*["\']?\s*:/i.test(s)))) out.push(finding(f, 'optional test config', l));
+                    if (relevant && /\.py$/.test(f.filename) && /\bif\s+(?:False|0)\s*:/.test(l) && [...h.removed, ...h.context, ...h.added].some(s => ASSERT_RE.test(s))) out.push(finding(f, 'disabled assertion block', l));
+                  }
+                }
+              }
+              return out;
+            }
+            function parseOverrideComment(body) {
+              const match = String(body || '').match(/^## Test Integrity Override\s*\r?\n(?:理由|Reason)\s*[:：]\s*([^]*?)(?=\n## |$)/im);
+              const reason = match?.[1].trim();
+              return reason && reason.length >= 3 ? reason : null;
+            }
+            function summarizeFindings(findings) {
+              return findings.slice(0, 10).map(f => `- [${f.confidence}] ${f.path}: ${f.rule} — ${f.detail}`).join('\n') + (findings.length > 10 ? `\n… ${findings.length - 10} more` : '');
+            }
+            // <<< test-integrity-lib
+            const mode = process.env.GATE_MODE;
+            if (!['enforce', 'observe'].includes(mode)) throw new Error('Invalid mode: use enforce or observe');
+            const rawNumber = context.payload.pull_request?.number ?? context.payload.inputs?.pr_number;
+            if (context.eventName === 'workflow_dispatch' && !/^[1-9]\d*$/.test(String(rawNumber || ''))) {
+              core.setFailed('Invalid pr_number / PR 编号无效'); return;
+            }
+            if (!rawNumber) { await core.summary.addRaw('Nothing to gate').write(); return; }
+            const prNumber = Number(rawNumber);
+            const repo = context.repo;
+            const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: prNumber });
+            if (pr.draft || pr.state !== 'open') {
+              await core.summary.addRaw('✅ Test Integrity: draft/closed PR — informational pass').write(); return;
+            }
+            const comments = await github.paginate(github.rest.issues.listComments, { ...repo, issue_number: prNumber, per_page: 100 });
+            for (const comment of comments) {
+              const reason = parseOverrideComment(comment.body);
+              if (!reason || !comment.user?.login || comment.user.type === 'Bot') continue;
+              let authorized = comment.user.login === pr.user.login;
+              if (!authorized) {
+                try {
+                  const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ ...repo, username: comment.user.login });
+                  authorized = ['admin', 'maintain', 'write'].includes(data.permission);
+                } catch (error) {
+                  if (error.status !== 404) throw error;
+                }
+              }
+              if (authorized) {
+                await core.summary.addRaw('✅ Test Integrity Override accepted / 试验期人工理由覆盖\n\n').addRaw(reason.slice(0, 1000)).write(); return;
+              }
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, { ...repo, pull_number: prNumber, per_page: 100 });
+            // The API caps results at 3000 files and can omit binary/large patches. Never silently bless incomplete coverage.
+            const incomplete = files.length >= 3000 || files.some(f => (isRelevantPath(f.filename) || isRelevantPath(f.previous_filename || '') || isWorkflowPath(f.filename)) && f.status !== 'removed' && !f.patch);
+            const findings = scanSkipEvasion(files);
+            if (incomplete) findings.push({ path: '(diff)', rule: 'incomplete API diff; manual override required', detail: 'Relevant patch missing or file limit reached', confidence: 'high' });
+            const detail = findings.length ? summarizeFindings(findings) : '✅ Test Integrity: no high-confidence assertion-weaken / skip-evasion findings';
+            await core.summary.addRaw('### Skip Guard\n\n').addRaw(detail).addRaw(`\n\nMode: ${mode}; PR #${prNumber}; head ${pr.head.sha}`).write();
+            if (findings.some(f => f.confidence === 'high')) {
+              if (mode === 'enforce') core.setFailed('测试完整性检查失败 / Test Integrity findings\n' + detail);
+              else core.warning('Observe mode / 仅观察\n' + detail);
+            }

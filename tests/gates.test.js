@@ -1462,6 +1462,112 @@ const UNL_KW = 'This is a security problem.';
     });
   }
 
+  const integrity = require('../scripts/test-integrity-lib');
+  const fixture = (patch, filename = 'tests/sample.test.js', status = 'modified') => [{ filename, status, patch: '@@ -1,2 +1,2 @@\n' + patch }];
+  await t('test-integrity lib mirrored in workflow', () => {
+    const lib = fs.readFileSync(path.join(__dirname, '../scripts/test-integrity-lib.js'), 'utf8').split('module.exports =')[0].trim();
+    const blocks = scripts('test-integrity-gate.yml');
+    assert.strictEqual(blocks.length, 2);
+    for (const script of blocks) {
+      assert.strictEqual(script.split('// >>> test-integrity-lib\n')[1].split('\n// <<< test-integrity-lib')[0].trim(), lib);
+      new AsyncFunction('github', 'context', 'core', 'process', script);
+    }
+  });
+  for (const [name, patch] of [
+    ['vacuous expect', '-expect(value).toBe(42);\n+expect(true).toBe(true);'],
+    ['deleted assert', '-assert value == 42'],
+    ['monitor removal', '-assert health.metric >= 80'],
+    ['threshold', '-assert coverage >= 80\n+assert coverage >= 10'],
+    ['matcher weakening', '-expect(count).toBe(5)\n+expect(count).toBeGreaterThan(0)'],
+    ['rust assertion', '-assert_eq!(count, 5);'],
+    ['python vacuous', '-assert count == 5\n+assert True'],
+  ]) await t(`test-integrity assertion: ${name}`, () => assert.ok(integrity.scanAssertionWeaken(fixture(patch)).length));
+  for (const line of ['test.skip("x")', 'xit("x")', 'pytest.mark.skip', '@unittest.skip("reason")', 'describe.only("x")', 'pytest.mark.xfail', 'pending("x")']) {
+    await t(`test-integrity skip: ${line}`, () => assert.ok(integrity.scanSkipEvasion(fixture('+' + line)).length));
+  }
+  await t('test-integrity disabled Python assertion', () => assert.ok(integrity.scanSkipEvasion(fixture('+if False:\n assert value', 'tests/test_value.py')).length));
+  await t('test-integrity optional test configuration', () => {
+    assert.ok(integrity.scanSkipEvasion(fixture(' test:\n+  optional: true', '.github/workflows/ci.yml')).length);
+    assert.strictEqual(integrity.scanSkipEvasion(fixture(' deploy:\n+  optional: true', '.github/workflows/ci.yml')).length, 0);
+  });
+  await t('test-integrity clean refactor, whitespace and new assertions pass', () => {
+    for (const patch of ['-expect(oldName).toBe(5)\n+expect(newName).toBe(5)', '-expect(x).toBe(5)\n+ expect( x ).toBe( 5 )', '+expect(x).toBe(5)']) assert.deepStrictEqual(integrity.scanAssertionWeaken(fixture(patch)), []);
+    assert.deepStrictEqual(integrity.scanSkipEvasion(fixture('-test.skip("x")\n+test.skip("x")')), []);
+  });
+  await t('test-integrity assertions moved between hunks pass', () => {
+    assert.deepStrictEqual(integrity.scanAssertionWeaken(fixture('-expect(x).toBe(5)\n@@ -20,1 +20,2 @@\n+expect(x).toBe(5)')), []);
+  });
+  await t('test-integrity deleted relevant file and path recognition', () => {
+    assert.ok(integrity.scanAssertionWeaken(fixture('', 'tests/obsolete.py', 'removed')).length);
+    for (const p of ['test_foo.py', 'src/test_foo.py', 'scripts/check-health.js', 'ops/monitor.sh', 'a.spec.tsx', 'x/invariant.js']) assert.ok(integrity.isRelevantPath(p), p);
+    assert.strictEqual(integrity.isRelevantPath('src/app.js'), false);
+  });
+  await t('test-integrity rename out retains both guards', () => {
+    const files = [{ filename: 'src/helper.js', previous_filename: 'tests/helper.test.js', status: 'renamed', patch: '' }];
+    assert.ok(integrity.scanAssertionWeaken(files).some(f => f.rule === 'deleted test/monitor file'));
+    files[0].patch = '+test.skip("hidden")';
+    assert.ok(integrity.scanSkipEvasion(files).some(f => f.rule === 'skip/focus introduced'));
+    files[0].filename = 'tests/renamed.test.js';
+    files[0].patch = '';
+    assert.deepStrictEqual(integrity.scanAssertionWeaken(files), []);
+  });
+  for (const condition of ['False', '0']) await t(`test-integrity Python indentation under existing if ${condition}`, () => {
+    const files = fixture(` if ${condition}:\n     pass\n-assert value\n+    assert value`, 'tests/test_value.py');
+    assert.ok(integrity.scanSkipEvasion(files).some(f => f.rule === 'disabled assertion block'));
+    assert.deepStrictEqual(integrity.scanSkipEvasion(fixture('-assert value == 1\n+assert   value == 1', 'tests/test_value.py')), []);
+  });
+  for (const key of ['test:', '"tests":', 'unit-tests:', "'integration-test':"]) await t(`test-integrity workflow continue-on-error ${key}`, () => {
+    assert.ok(integrity.scanSkipEvasion(fixture(` ${key}\n+  continue-on-error: true`, '.github/workflows/ci.yml')).length);
+    assert.deepStrictEqual(integrity.scanSkipEvasion(fixture(' deploy:\n+  continue-on-error: true', '.github/workflows/ci.yml')), []);
+    assert.deepStrictEqual(integrity.scanSkipEvasion(fixture(` ${key}\n+  continue-on-error: false`, '.github/workflows/ci.yml')), []);
+  });
+  for (const [expression, weak, strong] of [
+    ['coverage[0] >= N', 10, 90], ['N <= coverage[0]', 10, 90],
+    ['coverage >= N', 10, 90], ['N <= coverage', 10, 90],
+    ['coverage > N', 10, 90], ['N < coverage', 10, 90],
+    ['coverage <= N', 90, 10], ['N >= coverage', 90, 10],
+    ['coverage < N', 90, 10], ['N > coverage', 90, 10],
+    ['expect(coverage).toBeGreaterThanOrEqual(N)', 10, 90],
+    ['expect(coverage).toBeLessThanOrEqual(N)', 90, 10],
+  ]) await t(`test-integrity threshold operand order ${expression}`, () => {
+    const before = 'assert ' + expression.replace('N', '80');
+    for (const [value, expected] of [[weak, true], [strong, false]]) {
+      const after = 'assert ' + expression.replace('N', String(value));
+      assert.strictEqual(integrity.scanAssertionWeaken(fixture(`-${before}\n+${after}`)).some(f => f.rule === 'loosened threshold'), expected);
+    }
+  });
+  await t('test-integrity override parse', () => {
+    assert.strictEqual(integrity.parseOverrideComment('## Test Integrity Override\n理由：合法删除旧测试'), '合法删除旧测试');
+    assert.strictEqual(integrity.parseOverrideComment('## Test Integrity Override\n理由：短'), null);
+    assert.strictEqual(integrity.parseOverrideComment('quoted ## Test Integrity Override\n理由：不应接受'), null);
+  });
+  for (const [index, guard] of ['assertion', 'skip'].entries()) {
+    for (const scenario of ['clean', 'finding', 'observe', 'draft', 'override', 'unauthorized', 'invalid', 'missing', 'missing-workflow', 'missing-renamed', 'api-error']) {
+      await t(`test-integrity workflow ${guard}: ${scenario}`, async () => {
+        const failed = [], warnings = []; let listed = false;
+        const summary = { addRaw() { return this; }, async write() {} };
+        const core = { summary, setFailed: s => failed.push(s), warning: s => warnings.push(s) };
+        const pr = { state: 'open', draft: scenario === 'draft', user: { login: 'author' }, head: { sha: 'head' } };
+        const github = { rest: { pulls: { get: async () => ({ data: pr }), listFiles: 'files' }, issues: { listComments: 'comments' }, repos: { getCollaboratorPermissionLevel: async () => ({ data: { permission: 'read' } }) } }, paginate: async method => {
+          if (scenario === 'api-error') throw new Error('API unavailable');
+          if (method === 'comments') return ['override', 'unauthorized'].includes(scenario) ? [{ body: '## Test Integrity Override\n理由：合法的变更', user: { login: scenario === 'override' ? 'author' : 'stranger' } }] : [];
+          listed = true;
+          if (scenario === 'missing-workflow') return [{ filename: '.github/workflows/ci.yml', status: 'modified' }];
+          if (scenario === 'missing-renamed') return [{ filename: 'src/helper.js', previous_filename: 'tests/helper.js', status: 'renamed' }];
+          if (scenario === 'missing') return [{ filename: 'tests/large.py', status: 'modified' }];
+          return scenario === 'clean' ? [] : fixture('-expect(value).toBe(5)\n+test.skip("x")');
+        } };
+        const context = { repo: { owner: 'o', repo: 'r' }, eventName: 'workflow_dispatch', payload: { inputs: { pr_number: scenario === 'invalid' ? 'abc' : '1' } } };
+        const run = () => new AsyncFunction('github', 'context', 'core', 'process', scripts('test-integrity-gate.yml')[index])(github, context, core, { env: { GATE_MODE: scenario === 'observe' ? 'observe' : 'enforce' } });
+        if (scenario === 'api-error') { await assert.rejects(run, /API unavailable/); return; }
+        await run();
+        assert.strictEqual(failed.length > 0, ['finding', 'unauthorized', 'invalid', 'missing', 'missing-workflow', 'missing-renamed'].includes(scenario));
+        if (scenario === 'observe') assert.strictEqual(warnings.length, 1);
+        if (['override', 'draft', 'invalid'].includes(scenario)) assert.strictEqual(listed, false);
+      });
+    }
+  }
+
   if (failures) { console.log(`${failures} failure(s)`); process.exit(1); }
   console.log('all passed');
 })();

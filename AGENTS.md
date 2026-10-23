@@ -6,7 +6,7 @@ in [README.md](README.md).
 ## Layout
 
 - `.github/workflows/*.yml` — reusable workflows (`on: workflow_call`):
-  `ci.yml`, `codex-gate.yml`, `qa-gate.yml`, `understand-gate.yml`, `auto-merge.yml`,
+  `ci.yml`, `codex-gate.yml`, `qa-gate.yml`, `understand-gate.yml`, `test-integrity-gate.yml`, `auto-merge.yml`,
   `post-deploy-smoke.yml`, `acceptance.yml`. `self-lint.yml` is this repo's
   own CI.
 - `examples/` — caller files to copy into product repos.
@@ -21,7 +21,7 @@ in [README.md](README.md).
 - Run before pushing: `actionlint .github/workflows/*.yml examples/*.yml`,
   `node tests/gates.test.js`, `python3 tests/acceptance_test.py`.
 - Check names are API: never rename a called job (`Build & Test`,
-  `Secret Scan`, `Codex Review Gate`, `QA Gate`, `Diff Quiz Gate`, `Auto Merge`,
+  `Secret Scan`, `Codex Review Gate`, `QA Gate`, `Diff Quiz Gate`, `Assertion Guard`, `Skip Guard`, `Auto Merge`,
   `Post-deploy Smoke`, `Acceptance Gate`) without updating every caller's
   branch protection.
 - Anything that executes PR code runs from a `pull_request` caller with
@@ -143,3 +143,5 @@ in [README.md](README.md).
 - **同类 P1 自动修超 3 轮仍未清（写死）**：三轮上限**只**停止自动修循环（不得继续盲推）。**未 Resolve 的 P1 永远挡合入**——重试次数不改变严重度、不降级门禁。交给人/产品开跟进 issue/PR 继续修。**严禁**因重试次数把 P1 标成 observe、won't-fix、或 Resolve 后放行合入。
 
 - 踩坑与根治清单：[docs/PITFALLS.md](docs/PITFALLS.md)
+
+- Test Integrity: keep `scripts/test-integrity-lib.js` verbatim in both marked workflow regions; `tests/gates.test.js` enforces mirror sync.

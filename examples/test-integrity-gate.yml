@@ -1,0 +1,45 @@
+# Trial caller for Test Integrity Gate — copy to
+# YOUR_REPO/.github/workflows/test-integrity-gate.yml and pin the SHA.
+#
+# One reusable call runs BOTH jobs (并排). Check names with job id `integrity`:
+#   - "integrity / Assertion Guard"
+#   - "integrity / Skip Guard"
+#
+# Do NOT add these to branch protection / auto-merge required_checks until
+# the Diff Quiz trial acceptance (2026-11-02) and the checks are stable.
+# No labeled/unlabeled triggers. No self-listen cancel-heal companion (v1).
+#
+# Escape hatch (authorized commenter, reason required):
+#   ## Test Integrity Override
+#   理由：…
+
+name: Test Integrity Gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number (dispatch on PR branch for head-attached checks)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# No concurrency cancel-in-progress: every head evaluation completes.
+
+jobs:
+  integrity:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'pull_request_target'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: qianhaoq/devflow-gates/.github/workflows/test-integrity-gate.yml@main
+    with:
+      # runs_on: '["self-hosted", "linux", "x64"]'
+      mode: enforce
