@@ -689,7 +689,7 @@ const UNL_KW = 'This is a security problem.';
   const RH = 'feedfacefeedfacefeedfacefeedfacefeedface';
   const SUMMARY_DONE = { user: { login: 'chatgpt-codex-connector[bot]' }, updated_at: '2026-10-16T03:00:00Z', body: `<!-- codex-pull-request-review-summary -->\n**Completed** — reviewed ${RH}` };
   const SUMMARY_RUNNING = { ...SUMMARY_DONE, body: '<!-- codex-pull-request-review-summary -->\n**Running**' };
-  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [], runById, allRuns, env = {} } = {}) {
+  async function runRefresh(file, runsByEvent, { summary = SUMMARY_DONE, labels = [], labelEvents = [], eventName = 'schedule', payload = {}, prs, mode = 'refresh', failed = [], runById, allRuns, env = {}, jobsByRun = {} } = {}) {
     const reran = [];
     const prList = prs || [{ number: 9, state: 'open', draft: false, head: { sha: RH, ref: 'crawl/auto' }, labels: labels.map((name) => ({ name })) }];
     const github = {
@@ -701,6 +701,7 @@ const UNL_KW = 'This is a security problem.';
           listWorkflowRuns: async (a) => ({ data: { workflow_runs: runsByEvent[a.event] || [] } }),
           reRunWorkflowFailedJobs: async (a) => { reran.push(a.run_id); },
           reRunWorkflow: async (a) => { reran.push(`all:${a.run_id}`); },
+          listJobsForWorkflowRun: 'listJobsForWorkflowRun',
         },
         pulls: {
           list: async () => ({}),
@@ -720,6 +721,13 @@ const UNL_KW = 'This is a security problem.';
           // The cancel-heal fallback sweeps workflow-wide: no event/head_sha.
           if (!args.event && !args.head_sha) return allRuns || [];
           return runsByEvent[args.event] || [];
+        }
+        // Mock for isAckOnlyRun: return jobs with steps per run.
+        if (fn === 'listJobsForWorkflowRun') {
+          const runJobs = jobsByRun[args.run_id];
+          // Default: real evaluate (has Evaluate step, no ack step).
+          if (!runJobs) return [{ steps: [{ name: 'Evaluate Codex review' }] }];
+          return runJobs;
         }
         return [];
       },
@@ -789,6 +797,27 @@ const UNL_KW = 'This is a security problem.';
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: SUMMARY_RUNNING }), []);
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { summary: null }), []);
     assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { labels: ['skip-codex-gate'] }), []);
+  });
+  await t('codex-gate refresh (duo#19): ack-only run skipped, real evaluate re-run instead', async () => {
+    // duo-two-pane #19: Refresh picked the newest failed run (ack) instead of the
+    // older real evaluate. Re-running ack just mirrors the still-failing evaluate.
+    const ackRun = run(6, 'pull_request_target', 'failure', '2026-10-16T01:30:00Z');  // newer ack
+    const evalRun = run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z'); // older real evaluate
+    const runs = { pull_request_target: [ackRun, evalRun] };
+    // Jobs: ack run has "Label ack mirror..." step, no "Evaluate Codex review".
+    // Evaluate run has "Evaluate Codex review" step.
+    const jobsByRun = {
+      6: [{ steps: [{ name: 'Label ack mirror latest real gate verdict' }] }],  // ack-only
+      5: [{ steps: [{ name: 'Evaluate Codex review' }] }],                       // real evaluate
+    };
+    // Refresh must choose run 5 (real evaluate), not run 6 (ack).
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { jobsByRun }), [5]);
+    // Verify: if both are ack-only, nothing is re-run (no real evaluate found).
+    const allAck = { 6: [{ steps: [{ name: 'Label ack mirror' }] }], 5: [{ steps: [{ name: 'Label ack mirror' }] }] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { jobsByRun: allAck }), []);
+    // Verify: ack step prefix match (step name starts with "Label ack mirror").
+    const prefixAck = { 6: [{ steps: [{ name: 'Label ack mirror something' }] }], 5: [{ steps: [{ name: 'Evaluate Codex review' }] }] };
+    assert.deepStrictEqual(await runRefresh('codex-gate.yml', runs, { jobsByRun: prefixAck }), [5]);
   });
   await t('codex-gate refresh: run_attempt cap (3) stops red→green re-runs', async () => {
     const r = await runRefresh('codex-gate.yml', { pull_request_target: [run(5, 'pull_request_target', 'failure', '2026-10-16T01:20:00Z', { run_attempt: 3 })] });

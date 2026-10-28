@@ -160,6 +160,10 @@ jobs:
               'chatgpt-codex-connector[bot]',
               'chatgpt-codex-connector',
             ]);
+            // Step names used to classify runs as ack-only vs real evaluate.
+            // mirror-required-check.yml uses ACK_STEP; real evaluate uses EVALUATE_STEP.
+            const ACK_STEP = 'Label ack mirror';
+            const EVALUATE_STEP = 'Evaluate Codex review';
             const WAIT_MINUTES = (() => {
               const n = Number(process.env.WAIT_MINUTES || '20');
               return Number.isFinite(n) && n > 0 ? n : 20;
@@ -546,6 +550,32 @@ jobs:
             //     comment, so it is bounded by Codex activity, and a capped green
             //     check must never stay green once the gate would fail.
             const MAX_ATTEMPTS = 3;
+            // Classify a run as ack-only (mirror step, no evaluate step) vs real
+            // evaluate. Re-running an ack-only run is useless: it just mirrors the
+            // still-failing real evaluate. Refresh must skip ack runs and re-run
+            // the real evaluate instead (duo-two-pane #19).
+            const ackOnlyRunCache = new Map();
+            async function isAckOnlyRun(runId) {
+              if (ackOnlyRunCache.has(runId)) return ackOnlyRunCache.get(runId);
+              let result = false;
+              try {
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                  owner, repo, run_id: runId, per_page: 100,
+                });
+                let hasAck = false, hasEval = false;
+                for (const job of jobs || []) {
+                  for (const step of job.steps || []) {
+                    if ((step.name || '').startsWith(ACK_STEP)) hasAck = true;
+                    if (step.name === EVALUATE_STEP) hasEval = true;
+                  }
+                }
+                result = hasAck && !hasEval;
+              } catch (err) {
+                core.info(`isAckOnlyRun(${runId}): ${err.message} — treating as evaluate`);
+              }
+              ackOnlyRunCache.set(runId, result);
+              return result;
+            }
             // Cancel-heal: the workflow_run.id whose CANCELLED completion
             // triggered this refresh (0 for every other trigger). The caller
             // uses a separate companion via workflow_run because a cancelled run cannot run
@@ -771,7 +801,18 @@ jobs:
                   const seen = new Set(evaluated.map((r) => r.id));
                   const pool = [...evaluated, ...swept.filter((r) => !seen.has(r.id) && r.conclusion !== 'skipped')]
                     .sort((x, y) => (attemptAt(y) - attemptAt(x)) || ((y.id || 0) - (x.id || 0)));
-                  const staleFail = pool.find(isFail);
+                  // Skip ack-only runs: re-running them just mirrors the still-failing
+                  // real evaluate. Find the first failed REAL evaluate run.
+                  let staleFail = null;
+                  for (const r of pool) {
+                    if (!isFail(r)) continue;
+                    if (await isAckOnlyRun(r.id)) {
+                      core.info(`PR #${pr.number}: skipping ack-only failed run ${r.id}`);
+                      continue;
+                    }
+                    staleFail = r;
+                    break;
+                  }
                   if (staleFail && (staleFail.run_attempt || 1) === 1) {
                     await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: staleFail.id });
                     rerun += 1;
@@ -784,14 +825,40 @@ jobs:
                 if (capped(latest, MAX_ATTEMPTS)) {
                   core.info(`PR #${pr.number}: run ${latest.id} is at attempt ${latest.run_attempt} (cap ${MAX_ATTEMPTS}) — not re-running; re-run it in the UI or push`);
                 } else {
-                  const v = await verdict(pr.number);
-                  if (v.ok) {
-                    await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: latest.id });
-                    rerun += 1;
-                    core.info(`PR #${pr.number}: gate would now pass — re-running failed jobs of run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
-                    continue;
+                  // Skip ack-only runs: re-running them just mirrors the still-failing
+                  // real evaluate. Find the first failed REAL evaluate run.
+                  if (await isAckOnlyRun(latest.id)) {
+                    core.info(`PR #${pr.number}: latest failed run ${latest.id} is ack-only — looking for real evaluate`);
+                    let realEval = null;
+                    for (const r of evaluated) {
+                      if (r.conclusion !== 'failure' && r.conclusion !== 'timed_out') continue;
+                      if (capped(r, MAX_ATTEMPTS)) continue;
+                      if (await isAckOnlyRun(r.id)) continue;
+                      realEval = r;
+                      break;
+                    }
+                    if (realEval) {
+                      const v = await verdict(pr.number);
+                      if (v.ok) {
+                        await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: realEval.id });
+                        rerun += 1;
+                        core.info(`PR #${pr.number}: gate would now pass — re-running failed jobs of real evaluate run ${realEval.id} (${realEval.event}, head ${sha.slice(0, 7)})`);
+                        continue;
+                      }
+                      core.info(`PR #${pr.number}: gate would still fail (${v.none ? 'closed' : v.msg}) — not re-running run ${realEval.id}`);
+                    } else {
+                      core.info(`PR #${pr.number}: no uncapped real evaluate failure found`);
+                    }
+                  } else {
+                    const v = await verdict(pr.number);
+                    if (v.ok) {
+                      await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: latest.id });
+                      rerun += 1;
+                      core.info(`PR #${pr.number}: gate would now pass — re-running failed jobs of run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
+                      continue;
+                    }
+                    core.info(`PR #${pr.number}: gate would still fail (${v.none ? 'closed' : v.msg}) — not re-running run ${latest.id}`);
                   }
-                  core.info(`PR #${pr.number}: gate would still fail (${v.none ? 'closed' : v.msg}) — not re-running run ${latest.id}`);
                 }
               }
               // A CANCELLED gate run on the head leaves a cancelled check run that
@@ -840,6 +907,10 @@ jobs:
               'chatgpt-codex-connector[bot]',
               'chatgpt-codex-connector',
             ]);
+            // Step names used to classify runs as ack-only vs real evaluate.
+            // mirror-required-check.yml uses ACK_STEP; real evaluate uses EVALUATE_STEP.
+            const ACK_STEP = 'Label ack mirror';
+            const EVALUATE_STEP = 'Evaluate Codex review';
             const WAIT_MINUTES = (() => {
               const n = Number(process.env.WAIT_MINUTES || '20');
               return Number.isFinite(n) && n > 0 ? n : 20;
@@ -1226,6 +1297,32 @@ jobs:
             //     comment, so it is bounded by Codex activity, and a capped green
             //     check must never stay green once the gate would fail.
             const MAX_ATTEMPTS = 3;
+            // Classify a run as ack-only (mirror step, no evaluate step) vs real
+            // evaluate. Re-running an ack-only run is useless: it just mirrors the
+            // still-failing real evaluate. Refresh must skip ack runs and re-run
+            // the real evaluate instead (duo-two-pane #19).
+            const ackOnlyRunCache = new Map();
+            async function isAckOnlyRun(runId) {
+              if (ackOnlyRunCache.has(runId)) return ackOnlyRunCache.get(runId);
+              let result = false;
+              try {
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
+                  owner, repo, run_id: runId, per_page: 100,
+                });
+                let hasAck = false, hasEval = false;
+                for (const job of jobs || []) {
+                  for (const step of job.steps || []) {
+                    if ((step.name || '').startsWith(ACK_STEP)) hasAck = true;
+                    if (step.name === EVALUATE_STEP) hasEval = true;
+                  }
+                }
+                result = hasAck && !hasEval;
+              } catch (err) {
+                core.info(`isAckOnlyRun(${runId}): ${err.message} — treating as evaluate`);
+              }
+              ackOnlyRunCache.set(runId, result);
+              return result;
+            }
             // Cancel-heal: the workflow_run.id whose CANCELLED completion
             // triggered this refresh (0 for every other trigger). The caller
             // uses a separate companion via workflow_run because a cancelled run cannot run
@@ -1451,7 +1548,18 @@ jobs:
                   const seen = new Set(evaluated.map((r) => r.id));
                   const pool = [...evaluated, ...swept.filter((r) => !seen.has(r.id) && r.conclusion !== 'skipped')]
                     .sort((x, y) => (attemptAt(y) - attemptAt(x)) || ((y.id || 0) - (x.id || 0)));
-                  const staleFail = pool.find(isFail);
+                  // Skip ack-only runs: re-running them just mirrors the still-failing
+                  // real evaluate. Find the first failed REAL evaluate run.
+                  let staleFail = null;
+                  for (const r of pool) {
+                    if (!isFail(r)) continue;
+                    if (await isAckOnlyRun(r.id)) {
+                      core.info(`PR #${pr.number}: skipping ack-only failed run ${r.id}`);
+                      continue;
+                    }
+                    staleFail = r;
+                    break;
+                  }
                   if (staleFail && (staleFail.run_attempt || 1) === 1) {
                     await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: staleFail.id });
                     rerun += 1;
@@ -1464,14 +1572,40 @@ jobs:
                 if (capped(latest, MAX_ATTEMPTS)) {
                   core.info(`PR #${pr.number}: run ${latest.id} is at attempt ${latest.run_attempt} (cap ${MAX_ATTEMPTS}) — not re-running; re-run it in the UI or push`);
                 } else {
-                  const v = await verdict(pr.number);
-                  if (v.ok) {
-                    await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: latest.id });
-                    rerun += 1;
-                    core.info(`PR #${pr.number}: gate would now pass — re-running failed jobs of run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
-                    continue;
+                  // Skip ack-only runs: re-running them just mirrors the still-failing
+                  // real evaluate. Find the first failed REAL evaluate run.
+                  if (await isAckOnlyRun(latest.id)) {
+                    core.info(`PR #${pr.number}: latest failed run ${latest.id} is ack-only — looking for real evaluate`);
+                    let realEval = null;
+                    for (const r of evaluated) {
+                      if (r.conclusion !== 'failure' && r.conclusion !== 'timed_out') continue;
+                      if (capped(r, MAX_ATTEMPTS)) continue;
+                      if (await isAckOnlyRun(r.id)) continue;
+                      realEval = r;
+                      break;
+                    }
+                    if (realEval) {
+                      const v = await verdict(pr.number);
+                      if (v.ok) {
+                        await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: realEval.id });
+                        rerun += 1;
+                        core.info(`PR #${pr.number}: gate would now pass — re-running failed jobs of real evaluate run ${realEval.id} (${realEval.event}, head ${sha.slice(0, 7)})`);
+                        continue;
+                      }
+                      core.info(`PR #${pr.number}: gate would still fail (${v.none ? 'closed' : v.msg}) — not re-running run ${realEval.id}`);
+                    } else {
+                      core.info(`PR #${pr.number}: no uncapped real evaluate failure found`);
+                    }
+                  } else {
+                    const v = await verdict(pr.number);
+                    if (v.ok) {
+                      await github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: latest.id });
+                      rerun += 1;
+                      core.info(`PR #${pr.number}: gate would now pass — re-running failed jobs of run ${latest.id} (${latest.event}, head ${sha.slice(0, 7)})`);
+                      continue;
+                    }
+                    core.info(`PR #${pr.number}: gate would still fail (${v.none ? 'closed' : v.msg}) — not re-running run ${latest.id}`);
                   }
-                  core.info(`PR #${pr.number}: gate would still fail (${v.none ? 'closed' : v.msg}) — not re-running run ${latest.id}`);
                 }
               }
               // A CANCELLED gate run on the head leaves a cancelled check run that
