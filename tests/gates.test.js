@@ -1077,6 +1077,10 @@ const UNL_KW = 'This is a security problem.';
       assert.strictEqual(lib.parseOverrideComment('\n\n## Diff Quiz Override\r\nReason: confirmed false positive, no risk'), 'confirmed false positive, no risk');
       assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n'), null);
       assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：\n## Diff Quiz Answer\n1. B'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\r\n理由：\r\n## Diff Quiz Answer\r\n1. B'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：\n已人工确认无风险'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：试验误判\n已人工确认无风险'), '试验误判\n已人工确认无风险');
       assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：…'), null);
       assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由:...'), null);
       assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：...'), null);
@@ -1125,6 +1129,8 @@ const UNL_KW = 'This is a security problem.';
         '## Diff Quiz Override\n理由：...',
         '## Diff Quiz Override\n',
         '## Diff Quiz Override\n理由：',
+        '## Diff Quiz Override\n理由：\n## Diff Quiz Answer\n1. B',
+        '## Diff Quiz Override\n理由：试验误判\n已人工确认无风险',
         'note\n## Diff Quiz Override\n理由：试验误判，已人工确认无风险',
         '## Diff Quiz Override\n理由：试验误判，已人工确认无风险\n' + lib.QUIZ_MARKER,
         lib.formatQuizComment(quiz),
