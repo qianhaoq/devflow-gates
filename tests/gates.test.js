@@ -1073,9 +1073,91 @@ const UNL_KW = 'This is a security problem.';
     });
     await t('understand: parse Answer / Override', async () => {
       assert.deepStrictEqual(lib.parseAnswerComment('## Diff Quiz Answer\n1. A\n2. hello world\n'), { 1: 'A', 2: 'hello world' });
-      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：试验误判，已人工确认无风险'), '理由：试验误判，已人工确认无风险');
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：试验误判，已人工确认无风险'), '试验误判，已人工确认无风险');
+      assert.strictEqual(lib.parseOverrideComment('\n\n## Diff Quiz Override\r\nReason: confirmed false positive, no risk'), 'confirmed false positive, no risk');
       assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：…'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由:...'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：...'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：……'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\nReason: ...'), null);
+      assert.strictEqual(lib.parseOverrideComment('## Diff Quiz Override\n理由：短'), null);
+      assert.strictEqual(lib.parseOverrideComment('quoted ## Diff Quiz Override\n理由：不应接受这段理由'), null);
+      assert.strictEqual(lib.parseOverrideComment('note\n## Diff Quiz Override\n理由：试验误判，已人工确认无风险'), null);
       assert.strictEqual(lib.parseAnswerComment('nope'), null);
+    });
+    await t('understand: quiz comment template is not an override or answer (P0 false-green)', async () => {
+      const body = lib.formatQuizComment({
+        sha: 'abc1234deadbeef',
+        questions: [
+          { type: 'choice', prompt: '改了什么？', choices: [{ id: 'A', text: 'x' }, { id: 'B', text: 'y' }], answer: 'A', rubric: '' },
+          { type: 'short', prompt: '可能破坏什么？', answer: 'cache', rubric: '' },
+        ],
+      });
+      assert.ok(body.includes(lib.QUIZ_MARKER));
+      assert.ok(body.includes('## Diff Quiz Override'));
+      assert.ok(body.includes('理由：…'));
+      assert.ok(body.includes('## Diff Quiz Answer'));
+      assert.strictEqual(lib.parseOverrideComment(body), null);
+      assert.strictEqual(lib.parseAnswerComment(body), null);
+      assert.strictEqual(
+        lib.parseOverrideComment('## Diff Quiz Override\n理由：试验误判，已人工确认无风险\n' + lib.QUIZ_MARKER),
+        null);
+      assert.strictEqual(
+        lib.parseAnswerComment(lib.QUIZ_MARKER + '\n## Diff Quiz Answer\n1. A\n2. hello world\n'),
+        null);
+    });
+    await t('understand: workflow override parser matches lib', () => {
+      const src = scripts('understand-gate.yml')[0];
+      const start = src.indexOf('const QUIZ_MARKER');
+      const end = src.indexOf('const owner = context.repo.owner');
+      assert.ok(start >= 0 && end > start, 'evaluate helpers not found');
+      const gate = new Function(src.slice(start, end) + '\nreturn { parseOverrideComment, parseAnswerComment, formatQuizComment, QUIZ_MARKER };')();
+      const quiz = {
+        sha: 'abc1234deadbeef',
+        questions: [{ type: 'choice', prompt: '改了什么？', choices: [{ id: 'A', text: 'x' }], answer: 'A' }],
+      };
+      const samples = [
+        '## Diff Quiz Override\n理由：试验误判，已人工确认无风险',
+        '## Diff Quiz Override\n理由：…',
+        '## Diff Quiz Override\n理由:...',
+        '## Diff Quiz Override\n理由：...',
+        '## Diff Quiz Override\n',
+        '## Diff Quiz Override\n理由：',
+        'note\n## Diff Quiz Override\n理由：试验误判，已人工确认无风险',
+        '## Diff Quiz Override\n理由：试验误判，已人工确认无风险\n' + lib.QUIZ_MARKER,
+        lib.formatQuizComment(quiz),
+        gate.formatQuizComment(quiz),
+        '## Diff Quiz Answer\n1. B\n',
+      ];
+      for (const sample of samples) {
+        assert.deepStrictEqual(gate.parseOverrideComment(sample), lib.parseOverrideComment(sample));
+        assert.deepStrictEqual(gate.parseAnswerComment(sample), lib.parseAnswerComment(sample));
+      }
+      assert.strictEqual(gate.parseOverrideComment(samples[0]), '试验误判，已人工确认无风险');
+      assert.strictEqual(gate.parseOverrideComment(gate.formatQuizComment(quiz)), null);
+      assert.strictEqual(gate.parseAnswerComment(gate.formatQuizComment(quiz)), null);
+    });
+    await t('understand: bot quiz comment does not schedule refresh', () => {
+      const src = scripts('understand-gate.yml')[1];
+      const start = src.indexOf('function isAnswerOrOverride');
+      const end = src.indexOf('\nlet prs');
+      assert.ok(start >= 0 && end > start, 'refresh isAnswerOrOverride missing');
+      const isAnswerOrOverride = new Function('QUIZ_MARKER', 'ANSWER_HEADER', 'OVERRIDE_HEADER',
+        src.slice(start, end) + '\nreturn isAnswerOrOverride;')(
+        lib.QUIZ_MARKER, '## Diff Quiz Answer', '## Diff Quiz Override');
+      const quiz = lib.formatQuizComment({
+        sha: 'abc',
+        questions: [{ type: 'choice', prompt: 'q', choices: [{ id: 'A', text: 'x' }], answer: 'A' }],
+      });
+      assert.strictEqual(isAnswerOrOverride(quiz), false);
+      assert.strictEqual(isAnswerOrOverride('## Diff Quiz Override\n理由：试验误判，已人工确认无风险'), true);
+      assert.strictEqual(isAnswerOrOverride('## Diff Quiz Answer\n1. B'), true);
+      assert.strictEqual(isAnswerOrOverride('/recheck'), true);
+      const ex = fs.readFileSync(path.join(__dirname, '..', 'examples/understand-gate.yml'), 'utf8');
+      assert.ok(ex.includes("!contains(github.event.comment.body, '<!-- diff-quiz-gate:quiz -->')"),
+        'caller refresh must ignore the quiz comment');
     });
     await t('understand: gradeChoice + extractQuizMeta', async () => {
       assert.strictEqual(lib.gradeChoice('A', 'a'), true);

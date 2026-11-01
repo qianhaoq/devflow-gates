@@ -11,6 +11,7 @@
 # Triggers (no labeled/unlabeled — avoids "is expected" ghost check suites):
 #   - pull_request_target: opened / synchronize / reopened only
 #   - issue_comment → refresh when body has Diff Quiz Answer / Override /recheck
+#     (the bot quiz comment embeds those headers; its marker must not refresh)
 #   - workflow_dispatch(pr_number)
 #
 # ⛔ 禁止自监听（P0 根治）：本文件 name 为 "Diff Quiz Gate"，不得再写
@@ -73,6 +74,7 @@ jobs:
     # caller 只给 read → startup_failure: "only allowed read, requesting write"
     if: >-
       github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+      !contains(github.event.comment.body, '<!-- diff-quiz-gate:quiz -->') &&
       (contains(github.event.comment.body, '## Diff Quiz Answer') ||
        contains(github.event.comment.body, '## Diff Quiz Override') ||
        startsWith(github.event.comment.body, '/recheck'))

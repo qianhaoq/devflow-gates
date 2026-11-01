@@ -67,6 +67,8 @@ function normalizeChoice(s) {
 
 function parseAnswerComment(body) {
   const text = String(body || '');
+  // The quiz comment embeds a sample answer (choice stub "A"). That is not a submission.
+  if (text.includes(QUIZ_MARKER)) return null;
   if (!text.includes(ANSWER_HEADER)) return null;
   const after = text.split(ANSWER_HEADER).slice(1).join(ANSWER_HEADER);
   const answers = {};
@@ -80,11 +82,16 @@ function parseAnswerComment(body) {
 
 function parseOverrideComment(body) {
   const text = String(body || '');
-  if (!text.includes(OVERRIDE_HEADER)) return null;
-  const after = text.split(OVERRIDE_HEADER).slice(1).join(OVERRIDE_HEADER).trim();
-  // Require a non-empty reason (not just whitespace / dashes)
-  const reason = after.replace(/^#+\s*/gm, '').trim();
-  if (!reason || reason.length < 3) return null;
+  // P0: formatQuizComment embeds "## Diff Quiz Override" / "理由：…" as instructions.
+  // A hit inside that comment is never a human override.
+  if (text.includes(QUIZ_MARKER)) return null;
+  // Header must start the comment (optional leading whitespace only).
+  // Require 理由/Reason plus a substantive reason. Ellipsis stubs do not count.
+  const match = text.match(/^\s*## Diff Quiz Override\s*\r?\n(?:理由|Reason)\s*[:：]\s*([^]*?)(?=\n## |$)/i);
+  if (!match) return null;
+  const reason = match[1].trim();
+  const substantive = reason.replace(/[\s.\u2026\u22ef\u2025\u3002\uff0e_\u2014\u2013-]+/g, '');
+  if (substantive.length < 3) return null;
   return reason;
 }
 
