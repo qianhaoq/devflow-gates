@@ -120,14 +120,19 @@ in [README.md](README.md).
   notify **the product bot** and **专业测试** with the PR URL, head SHA, and
   which gates are green.
 
-## Coding 工具顺序（2026-10-20 起）
+## 合并
+
+- **齐绿合入（2026-11-02）**：对本仓 agent/feature PR，必需检查全绿且 P0/P1 清零后，产品 owner 可直接 Approve/squash 或走 auto-merge，**勿等人卡**（不必等钱浩再点）。若 GitHub「至少 1 个写权限 Approve」导致作者无法自 Approve：产品 owner/agent 可 (1) 临时把本仓 `main` 的 `required_approving_review_count` 降到 `0`，(2) squash 合入，(3) **立刻改回 `1`**。禁止 `--admin` 硬过；P0/P1 仍必清。稳态审批数保持 `1`，勿永久改成 `0`。本条不改变上文 gates 行为描述。
+
+## Coding 工具顺序（2026-11-02 起）
 
 **适用范围（写死）**：下列 Codex / `coding` / `/home/box/.../codex-quota.sh` 顺序**仅**适用于已预装这些工具的**本机或 `/home/box` 工作站**。Copilot cloud、仅 Node·npm 的云端 agent、以及任何未预装 Codex/`coding` 的环境：**必须按该环境已有工具执行**；**严禁**把本机/box 工具序、`codex`/`coding` 或 `/home/box` 路径当作云端硬性要求。
 
-1. **（本机/box）默认用 Codex CLI**（ChatGPT 账号登录），模型 `gpt-6.1-sol`（`~/.codex/config.toml`）。
-2. **周额度用完后继续用 credits** 跑 Codex；**credits 也用完**再切：`coding glm`（一般代码）/ `coding kimi`（前端/交互/UI）。
-3. 查额度（仅本机/box）：`/home/box/.coding-plans/codex-quota.sh`（退出码 0=继续 Codex，1=切 glm/kimi，2=未知；`--json`、`--probe`），或 Codex TUI 内 `/status`。云端无此脚本时跳过。
-4. 凭证 `~/.codex/auth.json` 及任何 API key **绝不打印、外传或提交**；`.codex/`、`auth.json` 已在 `.gitignore`。
+1. **（本机/box）优先用 Codex CLI**（ChatGPT 账号登录），模型 `gpt-6.1-sol`（`~/.codex/config.toml`）；出口优先 box（美区）。
+2. **Codex 不可用**（区域 403 / 额度与 credits 耗尽 / 鉴权失败等）再切：`coding glm`（一般代码）/ `coding kimi`（前端/交互/UI）。
+3. **不默认 Cursor Cloud Agent**（Cloud 上 OpenAI/Codex 常不可用；真要开只能选非 OpenAI 模型，一般不必）。
+4. 查额度（仅本机/box）：`/home/box/.coding-plans/codex-quota.sh`（退出码 0=继续 Codex，1=切 glm/kimi，2=未知；`--json`、`--probe`），或 Codex TUI 内 `/status`。云端无此脚本时跳过。
+5. 凭证 `~/.codex/auth.json` 及任何 API key **绝不打印、外传或提交**；`.codex/`、`auth.json` 已在 `.gitignore`。
 
 ## 测试与门禁（禁止弱化凑绿）
 
