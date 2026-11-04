@@ -4,6 +4,7 @@
 
 | 坑 | 状态 | 根治动作 | Owner |
 | --- | --- | --- | --- |
+| auto-merge caller 为 actions: read，却调用需要 actions: write 的 A2 入口 → startup_failure（qh-personal-agent / ai-devflow-weekly，2026-11-04） | **修复提案；下游待上游合并后迁移** | 新增显式 auto-merge-readonly.yml：保留最新检查与评审策略，取消只跳过合入，恢复交给独立 A1；原入口仍 actions: write + A2。测试对比两个入口契约及脚本策略，并 dry-run 全绿/缺失/排队/取消/失败。上游合并后才固定已合并 SHA 迁移调用方；不改 cancel-heal 或部署权限 | 专业研发 |
 | Diff Quiz 出题评论内嵌 `## Diff Quiz Override` + `理由：…`（以及选择题示例 `1. A`），`parseOverrideComment` 用 `includes` 把占位理由当成真人 Override → 检查假绿（约 16/17 SUCCESS 为假 Override，0 次真实 `Diff Quiz passed`） | **已修** | 含 `<!-- diff-quiz-gate:quiz -->` 的评论一律不是 Override/Answer；Override 标题必须在评论开头，且 `理由`/`Reason` 去掉省略号后 ≥3 字。出题评论不得触发 refresh。不因此撤产品仓的 required check | 专业研发 |
 | label-ack 等待 queued/missing 真检查或 heal 重跑，占用唯一 self-hosted runner，真 gate 排队死锁（pinhaoyun #33，run 39709494291，2026-10-22） | **已修** | queued / unknown / missing 单次快照立即 fail closed、零 sleep；heal 后立即检查，排队或未发布也立即失败；仅 in_progress 有界轮询。禁止提前 success（新 ack suite 会遮蔽真失败）；由真 gate 新检查、refresh/heal 或 `/recheck` 承载结论 | 专业研发 |
 | Codex「is expected」幽灵：labeled 事件只出 skipped job、无同名 check | 方案 A **已修**；方案 B **本 PR 合入后完成** | B：相关 label 真评估 + 无关 label `mirror-required-check`；PR+SHA 共用 `label-{sha}` 主锁串行化，相关标签 evaluate 可 cancel、无关标签 ack 不 cancel；ack 替换排队 evaluate 时由标签事件时间校验拒绝镜像 success（写 failure）；success 前读取当前相关标签和 issue events，变化或无法确认则 post failure；保留创建前校验；cancelled heal 加 attempt>=3 上限、PR 提示及同 SHA in-flight guard | 专业研发 |

@@ -399,6 +399,32 @@ concurrency:
   （默认要求）或 `${{ vars.DISABLE_COPILOT_REVIEW == 'false' }}`（默认不要求）。
 - 本工作流自己的检查（名字含 "auto merge"）会被忽略，不会自我死锁。
 
+#### Actions 只读入口（显式选择）
+
+`auto-merge-readonly.yml` 与 `auto-merge.yml` 使用相同输入、检查名
+`Auto Merge`、事件筛选和合入条件；区别仅为 Actions 权限及取消恢复：
+
+| 入口 | 调用方 Actions 权限 | 最新必需检查 cancelled |
+| --- | --- | --- |
+| `auto-merge.yml`（原入口，行为不变） | `actions: write` | 尝试重跑，仍跳过本轮合入（A2） |
+| `auto-merge-readonly.yml` | `actions: read` | 跳过合入并记录恢复委托，不调用 Actions API |
+
+两个入口均要求最新的每个必需检查为 success。missing、queued、in_progress、
+cancelled、failure、skipped 等均阻止合入；更旧的 success 不覆盖新取消。
+“只读”仅指 Actions：合入仍需要 `contents: write`、`pull-requests: write`，
+读取检查需要 `checks: read`，仍必须使用可信隔离 runner。
+
+只读入口的取消恢复由独立命名的 Codex / QA / Understand cancel-heal
+companion（A1）或 `scripts/heal-required-checks.sh` 承担；保留它们原有的
+`actions: write`、尝试次数上限和并发设置。单独的部署 job 若需 dispatch，
+继续在该 job 内保留 `actions: write`，不要扩大合入 job 的 Actions 权限。
+
+迁移顺序：先合并本仓新增入口，确认文件存在于**已合并的完整 SHA**，再在
+下游各开 PR，仅替换 auto-merge job 的 workflow 路径和固定 SHA，并保留
+`actions: read`；其他门禁 pin、required_checks、cancel-heal 和部署 job 不变。
+不得引用尚未合并的修复分支 SHA。`workflow_run` 使用默认分支上的 caller，
+所以两侧 PR 合并前只算修复提案，不能宣称端到端恢复。
+
 ### 5. `.github/workflows/post-deploy-smoke.yml` — 部署后冒烟
 
 | 输入 | 类型 | 默认 | 说明 |
