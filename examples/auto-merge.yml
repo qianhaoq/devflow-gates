@@ -29,6 +29,12 @@
 # workflow_dispatch(pr_number) / workflow_run whose triggering event was
 # `pull_request` (head SHA identifies the PR). Everything else shares
 # the `auto-merge-sweep` group.
+#
+# Opt-in Actions read-only mode: after auto-merge-readonly.yml is merged,
+# select that file at a full merged commit SHA and change ONLY this
+# caller's actions permission to read. Cancelled checks still block merge;
+# keep the independent cancel-heal companions' actions: write permissions.
+# Deployment dispatch jobs keep their own job-scoped actions: write.
 
 name: Auto Merge
 

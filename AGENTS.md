@@ -90,6 +90,12 @@ in [README.md](README.md).
     that run (`actions: write`, cap 3) and skip merging this round,
     failure → ordinary red. An OLDER success never overrides the newest
     run (same rule as branch protection).
+    The opt-in `auto-merge-readonly.yml` entry point uses `actions: read`:
+    it keeps the same classification and skips merging on cancelled,
+    missing, pending or failed required checks, but delegates cancellation
+    recovery to the independent A1 companions or the manual heal script.
+    Keep both evaluators synchronized (the gate tests enforce parity).
+    The original `auto-merge.yml` and its A2 recovery remain unchanged.
   - If a merge is still stuck on expected/cancelled, run
     `./scripts/heal-required-checks.sh owner/repo PR` first — do NOT
     temporarily remove branch protection. The extreme fallback (manual

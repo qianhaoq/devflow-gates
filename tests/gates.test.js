@@ -56,7 +56,7 @@ const UNL = 'This handles the edge case wrongly when the list is empty.';
 const UNL_KW = 'This is a security problem.';
 
 (async () => {
-  for (const file of ['codex-gate.yml', 'auto-merge.yml']) {
+  for (const file of ['codex-gate.yml', 'auto-merge.yml', 'auto-merge-readonly.yml']) {
     const def = classifier(file, {});
     const on = classifier(file, { BLOCK_UNLABELED: 'true' });
     const off = classifier(file, { BLOCK_UNLABELED: 'false' });
@@ -170,6 +170,122 @@ const UNL_KW = 'This is a security problem.';
     assert.strictEqual(required.workflowRunIdFromCheck({}), null);
     assert.strictEqual(required.workflowRunIdFromCheck(null), null);
   });
+
+  // Two permission contracts, one merge policy. Keep the independent read-only
+  // entry point synchronized without changing the existing A2 recovery path.
+  await t('auto-merge readonly: same workflow contract except Actions permission and recovery', () => {
+    const files = ['auto-merge.yml', 'auto-merge-readonly.yml'];
+    const parsed = JSON.parse(require('child_process').execFileSync('python3', ['-c',
+      'import json,sys,yaml; print(json.dumps([yaml.safe_load(open(p)) for p in sys.argv[1:]]))',
+      ...files.map(f => path.join(__dirname, '..', '.github/workflows', f)),
+    ], { encoding: 'utf8' }));
+    const [legacy, readonly] = parsed;
+    assert.strictEqual(legacy.permissions.actions, 'write');
+    assert.strictEqual(readonly.permissions.actions, 'read');
+    assert.deepStrictEqual(readonly.permissions, { ...legacy.permissions, actions: 'read' });
+    assert.strictEqual(readonly.jobs['auto-merge'].name, 'Auto Merge');
+    assert.strictEqual(readonly.jobs['auto-merge']['timeout-minutes'], 10);
+    for (const w of parsed) {
+      delete w.name;
+      delete w.permissions.actions;
+      delete w.jobs['auto-merge'].steps[0].with.script;
+    }
+    assert.deepStrictEqual(readonly, legacy, 'inputs, events, job, env and action must stay identical');
+    const stripRecovery = src => src
+      .replace(/async function healCancelledCheck\([\s\S]*?(?=async function candidatePrNumbers)/, '')
+      .split('\n').filter(l => l.trim() && !l.trim().startsWith('//')).join('\n');
+    assert.strictEqual(stripRecovery(scripts(files[1])[0]), stripRecovery(scripts(files[0])[0]),
+      'merge policy must stay identical outside cancellation recovery');
+    assert.ok(!scripts(files[1])[0].includes('github.rest.actions'), 'read-only entry point never calls Actions API');
+  });
+
+  async function runAutoMerge(file, { checks, pr = {}, threads = [], attempt = 1, healError = false } = {}) {
+    const merged = [], reruns = [], actionCalls = [], infos = [], warnings = [], failed = [];
+    const sha = 'c0ffee0000000000000000000000000000000000';
+    const pull = { number: 1, state: 'open', draft: false, merged: false, title: 'Test PR',
+      base: { ref: 'main' }, head: { sha }, labels: [], ...pr };
+    const github = {
+      rest: {
+        repos: { get: async () => ({ data: { default_branch: 'main' } }) },
+        pulls: { get: async () => ({ data: pull }),
+          merge: async args => { merged.push(args); }, listReviewComments: () => {} },
+        checks: { listForRef: () => {} },
+        actions: new Proxy({
+          getWorkflowRun: async () => ({ data: { run_attempt: attempt } }),
+          reRunWorkflow: async args => { if (healError) throw new Error('409 already healing'); reruns.push(args.run_id); },
+        }, { get(target, key) { actionCalls.push(key); return target[key]; } }),
+      },
+      paginate: async api => {
+        if (api === github.rest.checks.listForRef) return checks || [];
+        if (api === github.rest.pulls.listReviewComments) return [];
+        throw new Error('Unexpected pagination');
+      },
+      graphql: async () => ({ repository: { pullRequest: { reviewThreads: {
+        nodes: threads, pageInfo: { hasNextPage: false },
+      } } } }),
+    };
+    await new AsyncFunction('github', 'context', 'core', 'process', scripts(file)[0])(
+      github, { repo: { owner: 'o', repo: 'r' }, eventName: 'workflow_dispatch', payload: { inputs: { pr_number: '1' } } },
+      { info: m => infos.push(m), warning: m => warnings.push(m), setFailed: m => failed.push(m) },
+      { env: { REQUIRED_CHECKS: 'ci / Build & Test\ncodex / Codex Review Gate', MERGE_METHOD: 'squash' } });
+    assert.deepStrictEqual(failed, []);
+    assert.deepStrictEqual(warnings, healError ? warnings.filter(m => m.includes('could not heal')) : [],
+      'unexpected evaluator errors must not masquerade as a blocked merge');
+    return { merged, reruns, actionCalls, infos, sha };
+  }
+  const amCheck = (name, id, status = 'completed', conclusion = 'success') => ({ name, id, status, conclusion,
+    created_at: `2026-10-17T01:00:${String(id).padStart(2, '0')}Z`,
+    details_url: 'https://github.com/o/r/actions/runs/42/job/77' });
+  const greenChecks = () => [amCheck('ci / Build & Test', 1), amCheck('codex / Codex Review Gate', 2)];
+  for (const file of ['auto-merge.yml', 'auto-merge-readonly.yml']) {
+    for (const state of ['missing', 'queued', 'in_progress', 'failure', 'timed_out', 'skipped', 'cancelled']) {
+      await t(`${file}: full evaluator blocks ${state}, including older success`, async () => {
+        const checks = greenChecks();
+        if (state === 'missing') checks.pop();
+        else checks.push(amCheck('codex / Codex Review Gate', 3,
+          ['queued', 'in_progress'].includes(state) ? state : 'completed',
+          ['queued', 'in_progress'].includes(state) ? null : state));
+        const r = await runAutoMerge(file, { checks });
+        assert.deepStrictEqual(r.merged, []);
+        const heals = file === 'auto-merge.yml' && state === 'cancelled';
+        assert.deepStrictEqual(r.reruns, heals ? [42] : []);
+        assert.deepStrictEqual(r.actionCalls, heals ? ['getWorkflowRun', 'reRunWorkflow'] : []);
+        if (file === 'auto-merge-readonly.yml' && state === 'cancelled') {
+          assert.ok(r.infos.some(m => m.includes('recovery delegated')));
+        }
+      });
+    }
+    await t(`${file}: all latest required checks green permits SHA-bound merge`, async () => {
+      const checks = [amCheck('codex / Codex Review Gate', 0, 'completed', 'cancelled'), ...greenChecks()];
+      const r = await runAutoMerge(file, { checks });
+      assert.strictEqual(r.merged.length, 1);
+      assert.strictEqual(r.merged[0].sha, r.sha);
+      assert.strictEqual(r.merged[0].merge_method, 'squash');
+      assert.deepStrictEqual(r.actionCalls, []);
+    });
+    for (const pr of [{ draft: true }, { state: 'closed' }, { base: { ref: 'other' } },
+      { labels: [{ name: 'no-auto-merge' }] }, { labels: [{ name: 'skip-codex-gate' }] }]) {
+      await t(`${file}: PR eligibility still blocks ${JSON.stringify(pr)}`, async () => {
+        const r = await runAutoMerge(file, { checks: greenChecks(), pr });
+        assert.deepStrictEqual(r.merged, []);
+        assert.deepStrictEqual(r.actionCalls, []);
+      });
+    }
+    await t(`${file}: green checks cannot override unresolved P1 review`, async () => {
+      const r = await runAutoMerge(file, { checks: greenChecks(), threads: [{ isResolved: false,
+        comments: { nodes: [{ author: { login: 'chatgpt-codex-connector' }, body: 'P1: regression' }] } }] });
+      assert.deepStrictEqual(r.merged, []);
+    });
+  }
+  for (const scenario of [{ attempt: 3 }, { attempt: 4 }, { healError: true }]) {
+    await t(`auto-merge legacy: cancelled recovery still respects ${JSON.stringify(scenario)}`, async () => {
+      const r = await runAutoMerge('auto-merge.yml', { ...scenario,
+        checks: [...greenChecks(), amCheck('codex / Codex Review Gate', 3, 'completed', 'cancelled')] });
+      assert.deepStrictEqual(r.merged, []);
+      assert.deepStrictEqual(r.reruns, []);
+      assert.deepStrictEqual(r.actionCalls, scenario.healError ? ['getWorkflowRun', 'reRunWorkflow'] : ['getWorkflowRun']);
+    });
+  }
 
   // QA gate dry-run.
   const qa = scripts('qa-gate.yml')[0];
